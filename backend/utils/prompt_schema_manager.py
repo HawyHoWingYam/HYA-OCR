@@ -12,6 +12,7 @@ Prompt and Schema Management System
 
 import json
 import logging
+import os
 from typing import Optional, Dict, Tuple, Union
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -235,13 +236,32 @@ class PromptSchemaManager:
         thread_pool_size = performance_config.get("thread_pool_size", 4)
         self.executor = ThreadPoolExecutor(max_workers=thread_pool_size)
         
-        # 本地备份路径
+        # 本地备份路径（可通过环境变量覆盖，兼容多系统路径）
         backup_config = self.config.get("local_backup", {})
-        backup_path = backup_config.get("path", "uploads/prompt_schema_backup")
-        self.local_backup_path = Path(backup_path)
-        
+        backup_path = Path(str(backup_config.get("path", "uploads/prompt_schema_backup")))
+        storage_root_env = os.getenv("LOCAL_STORAGE_ROOT")
+        storage_root = Path(storage_root_env) if storage_root_env else backup_path
+        self.local_backup_path = storage_root.expanduser().resolve()
+
+        def _resolve_local_path(env_key: str, default_path: Path) -> Path:
+            value = os.getenv(env_key)
+            candidate = Path(value) if value else default_path
+            return candidate.expanduser().resolve()
+
+        self.prompt_local_path = _resolve_local_path(
+            "PROMPT_LOCAL_PATH", self.local_backup_path / "prompts"
+        )
+        self.schema_local_path = _resolve_local_path(
+            "SCHEMA_LOCAL_PATH", self.local_backup_path / "schemas"
+        )
+
         if backup_config.get("enabled", True):
-            self.local_backup_path.mkdir(parents=True, exist_ok=True)
+            for path in {
+                self.local_backup_path,
+                self.prompt_local_path,
+                self.schema_local_path,
+            }:
+                path.mkdir(parents=True, exist_ok=True)
         
         # 更新验证器配置
         validation_config = self.config.get("validation", {})
@@ -277,7 +297,8 @@ class PromptSchemaManager:
     
     def _get_local_path(self, company_code: str, doc_type_code: str, filename: str, file_type: str) -> Path:
         """生成本地文件路径"""
-        return self.local_backup_path / company_code / doc_type_code / file_type / filename
+        base_dir = self.prompt_local_path if file_type == "prompt" else self.schema_local_path
+        return base_dir / company_code / doc_type_code / filename
     
     def _save_local_backup(self, company_code: str, doc_type_code: str, filename: str, 
                           file_type: str, content: Union[str, dict]) -> bool:
@@ -680,12 +701,18 @@ class PromptSchemaManager:
             s3_status = self.s3_manager.get_health_status() if self.s3_manager else {"status": "disabled"}
             cache_stats = self.cache.get_stats() if self.cache else {"status": "disabled"}
             
+            prompt_files = sum(1 for p in self.prompt_local_path.rglob("*") if p.is_file()) if self.prompt_local_path.exists() else 0
+            schema_files = sum(1 for p in self.schema_local_path.rglob("*") if p.is_file()) if self.schema_local_path.exists() else 0
+
             return {
                 "status": "healthy",
                 "s3_storage": s3_status,
                 "cache": cache_stats,
                 "local_backup_path": str(self.local_backup_path),
-                "backup_files_count": len(list(self.local_backup_path.rglob("*"))) if self.local_backup_path.exists() else 0
+                "prompt_local_path": str(self.prompt_local_path),
+                "schema_local_path": str(self.schema_local_path),
+                "prompt_files_count": prompt_files,
+                "schema_files_count": schema_files,
             }
             
         except Exception as e:
@@ -718,33 +745,35 @@ class PromptSchemaManager:
                 result["prompts"].extend(prompts)
                 result["schemas"].extend(schemas)
             
-            # 补充本地备份中的文件
-            if self.local_backup_path.exists():
-                for company_dir in self.local_backup_path.iterdir():
-                    if company_dir.is_dir() and (not company_code or company_dir.name == company_code):
-                        for doc_type_dir in company_dir.iterdir():
-                            if doc_type_dir.is_dir():
-                                # 检查prompts
-                                prompt_dir = doc_type_dir / "prompt"
-                                if prompt_dir.exists():
-                                    for prompt_file in prompt_dir.glob("*.txt"):
-                                        result["prompts"].append({
-                                            "key": f"{company_dir.name}/{doc_type_dir.name}/{prompt_file.name}",
-                                            "source": "local_backup",
-                                            "size": prompt_file.stat().st_size,
-                                            "last_modified": datetime.fromtimestamp(prompt_file.stat().st_mtime)
-                                        })
-                                
-                                # 检查schemas
-                                schema_dir = doc_type_dir / "schema"
-                                if schema_dir.exists():
-                                    for schema_file in schema_dir.glob("*.json"):
-                                        result["schemas"].append({
-                                            "key": f"{company_dir.name}/{doc_type_dir.name}/{schema_file.name}",
-                                            "source": "local_backup",
-                                            "size": schema_file.stat().st_size,
-                                            "last_modified": datetime.fromtimestamp(schema_file.stat().st_mtime)
-                                        })
+            def _iter_company_dirs(base_dir: Path):
+                if not base_dir.exists():
+                    return []
+                entries = []
+                for company_dir in base_dir.iterdir():
+                    if not company_dir.is_dir() or (company_code and company_dir.name != company_code):
+                        continue
+                    for doc_type_dir in company_dir.iterdir():
+                        if doc_type_dir.is_dir():
+                            entries.append((company_dir, doc_type_dir))
+                return entries
+
+            for company_dir, doc_type_dir in _iter_company_dirs(self.prompt_local_path):
+                for prompt_file in doc_type_dir.glob("*.txt"):
+                    result["prompts"].append({
+                        "key": f"{company_dir.name}/{doc_type_dir.name}/{prompt_file.name}",
+                        "source": "local_backup",
+                        "size": prompt_file.stat().st_size,
+                        "last_modified": datetime.fromtimestamp(prompt_file.stat().st_mtime)
+                    })
+
+            for company_dir, doc_type_dir in _iter_company_dirs(self.schema_local_path):
+                for schema_file in doc_type_dir.glob("*.json"):
+                    result["schemas"].append({
+                        "key": f"{company_dir.name}/{doc_type_dir.name}/{schema_file.name}",
+                        "source": "local_backup",
+                        "size": schema_file.stat().st_size,
+                        "last_modified": datetime.fromtimestamp(schema_file.stat().st_mtime)
+                    })
             
             return result
             
