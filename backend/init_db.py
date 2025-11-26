@@ -164,6 +164,37 @@ def create_indexes(database_url: str):
         return False
 
 
+def migrate_schema(database_url: str):
+    """
+    轻量级模式迁移：
+    - 为 document_types 表添加 template_json_path 列（如果不存在）
+    方便在已存在数据库上平滑升级，而无需完整 Alembic 迁移。
+    """
+    try:
+        logger.info("执行数据库模式迁移（如果需要）...")
+        engine = create_engine(database_url)
+
+        migration_sql = """
+        ALTER TABLE document_types
+        ADD COLUMN IF NOT EXISTS template_json_path VARCHAR(500);
+        """
+
+        with engine.connect() as conn:
+            try:
+                conn.execute(text(migration_sql))
+                conn.commit()
+                logger.info("✅ 模式迁移完成：document_types.template_json_path 已存在或已创建")
+            except SQLAlchemyError as e:
+                logger.warning(f"⚠️ 模式迁移失败或已存在：{e}")
+
+        engine.dispose()
+        return True
+
+    except Exception as e:
+        logger.error(f"❌ 执行模式迁移时出错: {e}")
+        return False
+
+
 def insert_initial_data(database_url: str):
     """插入初始数据"""
     try:
@@ -330,6 +361,10 @@ def main():
         if not create_database_tables(database_url):
             logger.error("❌ 创建数据库表失败，退出初始化")
             sys.exit(1)
+
+        # 执行轻量级模式迁移（例如新增列）
+        if not migrate_schema(database_url):
+            logger.warning("⚠️ 模式迁移失败，继续执行，但某些新功能可能不可用")
 
         # 添加约束
         if not add_check_constraints(database_url):
