@@ -15,7 +15,7 @@ from functools import wraps
 
 # 導入配置管理器
 try:
-    from config_loader import config_loader, get_api_key_manager
+    from config_loader import config_loader, get_api_key_manager, get_model_tier_manager
 
     CONFIG_AVAILABLE = True
 except ImportError:
@@ -29,9 +29,12 @@ def get_api_key_and_model() -> tuple[str, str]:
     """獲取 API key 和模型名稱"""
     if CONFIG_AVAILABLE:
         try:
-            api_key = get_api_key_manager().get_least_used_key()
-            app_config = config_loader.get_app_config()
-            model_name = app_config.get("model_name", "gemini-2.5-flash-preview-05-20")
+            api_key_manager = get_api_key_manager()
+            api_key = api_key_manager.get_least_used_key()
+
+            # 使用模型分層管理器獲取當前模型
+            model_tier_manager = get_model_tier_manager()
+            model_name = model_tier_manager.get_current_model()
             return api_key, model_name
         except Exception as e:
             logger.error(f"Failed to get API key from config loader: {e}")
@@ -42,7 +45,18 @@ def get_api_key_and_model() -> tuple[str, str]:
         or os.getenv("GEMINI_API_KEY")
         or os.getenv("API_KEY")
     )
-    model_name = os.getenv("MODEL_NAME", "gemini-2.5-flash-preview-05-20")
+    # 模型名稱優先從 GEMINI_MODEL_TIERS 的第一個獲取，否則回退到 MODEL_NAME
+    model_name = None
+    raw_tiers = os.getenv("GEMINI_MODEL_TIERS", "")
+    if raw_tiers:
+        for name in raw_tiers.split(","):
+            name = name.strip()
+            if name:
+                model_name = name
+                break
+
+    if not model_name:
+        model_name = os.getenv("MODEL_NAME", "gemini-2.5-flash-preview-05-20")
 
     if not api_key:
         raise ValueError("No Gemini API key found in environment variables or config")
@@ -142,6 +156,35 @@ def api_error_handler(func):
                             logger.info(f"📊 API Key 使用統計: {usage_stats}")
                         except Exception as key_error:
                             logger.warning(f"⚠️  無法標記 API Key 錯誤: {key_error}")
+
+                        # 如果是配額/速率相關的錯誤，同時嘗試切換模型 tier
+                        quota_signals = [
+                            "quota",
+                            "rate limit",
+                            "429",
+                            "exceeded",
+                            "generativelanguage.googleapis.com/generate_content_free_tier_requests",
+                        ]
+                        if any(sig in error_msg for sig in quota_signals):
+                            try:
+                                model_tier_manager = get_model_tier_manager()
+                                old_model = model_tier_manager.get_current_model()
+                                new_model = model_tier_manager.move_to_next_tier(
+                                    reason="quota_or_rate_limit"
+                                )
+                                if new_model and new_model != old_model:
+                                    logger.info(
+                                        f"🔄 模型 Tier 切換: {old_model} -> {new_model}"
+                                    )
+                                    # 更新函數參數中的 model_name（如有）
+                                    if "model_name" in kwargs:
+                                        kwargs["model_name"] = new_model
+                                    elif len(args) >= 5:
+                                        args = list(args)
+                                        args[4] = new_model
+                                        args = tuple(args)
+                            except Exception as model_err:
+                                logger.warning(f"⚠️  模型 tier 切換失敗: {model_err}")
 
                     if attempt < max_retries - 1:
                         wait_time = (2**attempt) + 1  # 指數退避

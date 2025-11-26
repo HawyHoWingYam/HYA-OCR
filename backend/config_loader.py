@@ -11,7 +11,7 @@ from typing import List, Dict, Any, Optional
 from botocore.exceptions import ClientError, NoCredentialsError
 from dotenv import load_dotenv
 
-# 加載 .env 文件 - 支持按環境加載 (優先級: .env.<ENV> -> .env)
+# 加載 .env / backend.env 文件 - 支持按環境加載 (優先級: .env.<ENV> -> backend.env -> .env)
 env_name = os.getenv("ENVIRONMENT") or os.getenv("DATABASE_ENV")
 candidate_paths = []
 if env_name:
@@ -26,8 +26,10 @@ if env_name:
         f".env.{env_name}",
     ])
 
-# 回退到通用 .env
+# 回退到通用 backend.env / .env
 candidate_paths.extend([
+    # Backend 專用環境文件（與 config_loader.py 同層）
+    os.path.join(os.path.dirname(__file__), "backend.env"),
     # Centralized project env directory (primary location)
     os.path.join(os.path.dirname(__file__), "..", "..", "env", ".env"),
     # Project root env directory
@@ -465,6 +467,87 @@ def get_api_key_manager():
     return api_key_manager
 
 
+class ModelTierManager:
+    """Gemini 模型分層管理器，支持按 tier 自動降級/切換"""
+
+    def __init__(self):
+        # 從環境變量讀取多個模型名稱（逗號分隔）
+        raw_tiers = os.getenv("GEMINI_MODEL_TIERS", "")
+        tiers: List[str] = []
+        if raw_tiers:
+            for name in raw_tiers.split(","):
+                name = name.strip()
+                if name:
+                    tiers.append(name)
+
+        # 如果沒有明確配置 tier，回退到 app_config 的 model_name 或環境變量 MODEL_NAME
+        if not tiers:
+            try:
+                app_config = config_loader.get_app_config()
+                default_model = app_config.get("model_name")
+            except Exception:
+                default_model = None
+
+            if not default_model:
+                default_model = os.getenv("MODEL_NAME")
+
+            if default_model:
+                tiers = [default_model]
+
+        # 最終保底值，避免完全沒有模型名稱
+        if not tiers:
+            tiers = ["gemini-2.5-flash-preview-05-20"]
+
+        self.tiers: List[str] = tiers
+        self.current_index: int = 0
+
+        logger.info(
+            f"ModelTierManager initialized with tiers: {', '.join(self.tiers)} "
+            f"(current={self.get_current_model()})"
+        )
+
+    def get_current_model(self) -> str:
+        """獲取當前使用的模型名稱"""
+        return self.tiers[self.current_index]
+
+    def move_to_next_tier(self, reason: str = "") -> Optional[str]:
+        """
+        切換到下一個模型 tier，用於配額超限等情況。
+
+        返回新的模型名稱；如果已經是最後一層，返回 None。
+        """
+        if self.current_index >= len(self.tiers) - 1:
+            logger.warning(
+                f"No higher model tier available for fallback (reason={reason}). "
+                f"Current model: {self.get_current_model()}"
+            )
+            return None
+
+        old_model = self.get_current_model()
+        self.current_index += 1
+        new_model = self.get_current_model()
+        logger.warning(
+            f"Model tier fallback triggered (reason={reason}): {old_model} -> {new_model}"
+        )
+        return new_model
+
+    def reset_to_primary(self) -> str:
+        """重置為主模型 tier（索引 0）"""
+        self.current_index = 0
+        return self.get_current_model()
+
+
+# 全局 Model Tier 管理器 (延遲初始化)
+model_tier_manager = None
+
+def get_model_tier_manager() -> ModelTierManager:
+    """獲取模型分層管理器 (延遲初始化)"""
+    global model_tier_manager
+    if model_tier_manager is None:
+        model_tier_manager = ModelTierManager()
+    return model_tier_manager
+
+
 # 驗證配置
 def validate_and_log_config():
     """驗證並記錄配置狀態"""
@@ -486,6 +569,11 @@ def validate_and_log_config():
     logger.info(
         f"  - Gemini API Keys: {len(config_loader.get_gemini_api_keys())} configured"
     )
+    try:
+        mtm = get_model_tier_manager()
+        logger.info(f"  - Model tiers: {', '.join(mtm.tiers)} (current={mtm.get_current_model()})")
+    except Exception as e:
+        logger.warning(f"  - Model tiers: initialization failed: {e}")
 
 
 if __name__ == "__main__":
