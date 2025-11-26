@@ -21,7 +21,9 @@ PyMuPDF==1.23.20
 
 # Data processing
 pandas==2.1.4
-numpy==1.25.2
+# NOTE: 1.25.x 不支援 Python 3.12，會觸發舊版 setuptools/pkg_resources 中的 ImpImporter 錯誤
+# 1.26.4 開始官方提供 Python 3.12 wheels，避免本地編譯失敗
+numpy==1.26.4
 
 # AWS Services
 boto3==1.35.80
