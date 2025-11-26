@@ -4,6 +4,7 @@ import { useState, useEffect } from 'react';
 import { useRouter, useParams } from 'next/navigation';
 import Link from 'next/link';
 import { DocumentType } from '@/lib/api';
+import { applyOrderUpdateToOrder } from '@/lib/orderUpdateHelpers';
 
 interface Company {
   company_id: number;
@@ -92,6 +93,9 @@ interface Order {
   total_items: number;
   completed_items: number;
   failed_items: number;
+  total_attachments: number;
+  completed_attachments: number;
+  failed_attachments: number;
   mapping_file_path?: string | null;
   mapping_keys?: string[] | null;
   primary_doc_type_id: number | null;
@@ -267,12 +271,8 @@ export default function OrderDetailsPage() {
           if (msg && msg.type === 'order_update' && msg.order_id === orderId) {
             // Shallow merge into current order state if available
             setOrder((prev) => {
-              const next = prev ? { ...prev } as any : {};
-              if (msg.status) next.status = msg.status;
-              if (msg.final_report_paths) next.final_report_paths = msg.final_report_paths;
-              if (typeof msg.remap_item_count !== 'undefined') (next as any).remap_item_count = msg.remap_item_count;
-              if (typeof msg.can_remap !== 'undefined') (next as any).can_remap = msg.can_remap;
-              return next as any;
+              if (!prev) return prev;
+              return applyOrderUpdateToOrder(prev, msg);
             });
             if (msg.status && msg.status !== 'PROCESSING' && msg.status !== 'MAPPING') {
               ws.close();
@@ -392,7 +392,7 @@ export default function OrderDetailsPage() {
     }
   };
 
-  // Upload primary file for an item
+  // Upload primary file for an item (single file; used for the first/primary document)
   const uploadPrimaryFile = async (itemId: number, file: File) => {
     setUploadingFiles(prev => ({ ...prev, [itemId]: true }));
 
@@ -416,6 +416,98 @@ export default function OrderDetailsPage() {
       setError('Failed to upload primary file');
     } finally {
       setUploadingFiles(prev => ({ ...prev, [itemId]: false }));
+    }
+  };
+
+  // Upload multiple files for an item:
+  // - First file becomes the primary file (if none exists yet)
+  // - Remaining files are uploaded as attachments
+  const uploadPrimaryAndAttachments = async (item: OrderItem, files: FileList) => {
+    if (!files || files.length === 0) return;
+
+    const [first, ...rest] = Array.from(files);
+    setUploadingFiles(prev => ({ ...prev, [item.item_id]: true }));
+
+    try {
+      // If there's no primary file yet, use the first file as primary; otherwise treat all as attachments
+      if (!item.primary_file) {
+        await uploadPrimaryFile(item.item_id, first);
+      } else {
+        // If primary already exists, push the first file into attachments as well
+        rest.unshift(first);
+      }
+
+      if (rest.length > 0) {
+        const formData = new FormData();
+        for (const f of rest) {
+          formData.append('files', f);
+        }
+
+        const response = await fetch(`/api/orders/${orderId}/items/${item.item_id}/files`, {
+          method: 'POST',
+          body: formData,
+        });
+
+        if (!response.ok) {
+          const errorData = await response.json().catch(() => ({}));
+          throw new Error(errorData.detail || 'Failed to upload attachment files');
+        }
+      }
+
+      // Reload order to show updated files
+      loadOrder();
+    } catch (error) {
+      console.error('Error uploading primary/attachment files:', error);
+      setError(error instanceof Error ? error.message : 'Failed to upload files');
+    } finally {
+      setUploadingFiles(prev => ({ ...prev, [item.item_id]: false }));
+    }
+  };
+
+  // Replace existing primary + attachment files with a new multi-file set
+  const replacePrimaryAndAttachments = async (item: OrderItem, files: FileList) => {
+    if (!files || files.length === 0) return;
+
+    setUploadingFiles(prev => ({ ...prev, [item.item_id]: true }));
+
+    try {
+      // 1) Delete existing primary file if present
+      if (item.primary_file) {
+        const resp = await fetch(`/api/orders/${orderId}/items/${item.item_id}/primary-file`, {
+          method: 'DELETE',
+        });
+        if (!resp.ok) {
+          const data = await resp.json().catch(() => ({}));
+          throw new Error(data.detail || 'Failed to delete primary file before replace');
+        }
+      }
+
+      // 2) Delete all existing attachments for this item
+      if (item.attachments && item.attachments.length > 0) {
+        for (const att of item.attachments) {
+          const resp = await fetch(`/api/orders/${orderId}/items/${item.item_id}/files/${att.file_id}`, {
+            method: 'DELETE',
+          });
+          if (!resp.ok) {
+            const data = await resp.json().catch(() => ({}));
+            throw new Error(data.detail || `Failed to delete attachment ${att.filename}`);
+          }
+        }
+      }
+
+      // 3) Upload new multi-file set as if first-time upload
+      const emptyItem: OrderItem = {
+        ...item,
+        primary_file: null,
+        attachments: [],
+        attachment_count: 0,
+      };
+      await uploadPrimaryAndAttachments(emptyItem, files);
+    } catch (error) {
+      console.error('Error replacing primary/attachment files:', error);
+      setError(error instanceof Error ? error.message : 'Failed to replace files');
+    } finally {
+      setUploadingFiles(prev => ({ ...prev, [item.item_id]: false }));
     }
   };
 
@@ -914,12 +1006,25 @@ export default function OrderDetailsPage() {
     }
   };
 
-  const downloadItemResult = async (itemId: number, format: 'json' | 'csv', itemName: string) => {
-    const downloadKey = `${itemId}-${format}`;
+  const downloadItemResult = async (
+    itemId: number,
+    format: 'json' | 'csv',
+    itemName: string,
+    scope: 'primary' | 'item' = 'item'
+  ) => {
+    // Use different keys for primary vs aggregated item downloads so their states don't conflict
+    const keyPrefix = scope === 'primary' ? 'primary' : 'item';
+    const downloadKey = `${keyPrefix}-${itemId}-${format}`;
     setDownloadingFiles(prev => ({ ...prev, [downloadKey]: true }));
 
     try {
-      const response = await fetch(`/api/orders/${orderId}/items/${itemId}/download/${format}`);
+      // Route to the appropriate backend endpoint based on requested scope
+      const path =
+        scope === 'primary'
+          ? `/api/orders/${orderId}/items/${itemId}/primary/download/${format}`
+          : `/api/orders/${orderId}/items/${itemId}/download/${format}`;
+
+      const response = await fetch(path);
 
       if (!response.ok) {
         const errorData = await response.json().catch(() => ({}));
@@ -937,9 +1042,28 @@ export default function OrderDetailsPage() {
       let filename = `order_${orderId}_item_${itemId}_${itemName || 'result'}.${format}`;
 
       if (contentDisposition) {
-        const filenameMatch = contentDisposition.match(/filename[^;=\n]*=((['"]).*?\2|[^;\n]*)/);
-        if (filenameMatch) {
-          filename = filenameMatch[1].replace(/['"]/g, '');
+        // Prefer RFC 5987 filename* (supports UTF-8 and URL-encoding)
+        const starMatch = contentDisposition.match(/filename\*\s*=\s*([^;]+)/i);
+        if (starMatch) {
+          let value = starMatch[1].trim().replace(/^['"]|['"]$/g, '');
+
+          // Strip UTF-8 prefix if present: utf-8''<urlencoded-filename>
+          if (value.toLowerCase().startsWith("utf-8''")) {
+            value = value.substring("utf-8''".length);
+          }
+
+          try {
+            filename = decodeURIComponent(value);
+          } catch {
+            // Fallback: use raw value if decode fails
+            filename = value;
+          }
+        } else {
+          // Fallback to legacy filename= parsing
+          const filenameMatch = contentDisposition.match(/filename[^;=\n]*=((['"]).*?\2|[^;\n]*)/i);
+          if (filenameMatch) {
+            filename = filenameMatch[1].replace(/['"]/g, '');
+          }
         }
       }
 
@@ -1462,22 +1586,54 @@ export default function OrderDetailsPage() {
       <div className="bg-white rounded-lg shadow p-6 mb-8">
         <h2 className="text-lg font-semibold mb-4">Order Summary</h2>
         <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+          {/* Item-level stats */}
           <div>
             <div className="text-sm text-gray-500">Total Items</div>
             <div className="text-2xl font-bold">{order.total_items}</div>
           </div>
           <div>
-            <div className="text-sm text-gray-500">Completed</div>
+            <div className="text-sm text-gray-500">Items Completed</div>
             <div className="text-2xl font-bold text-green-600">{order.completed_items}</div>
           </div>
           <div>
-            <div className="text-sm text-gray-500">Failed</div>
+            <div className="text-sm text-gray-500">Items Failed</div>
             <div className="text-2xl font-bold text-red-600">{order.failed_items}</div>
           </div>
           <div>
-            <div className="text-sm text-gray-500">Progress</div>
+            <div className="text-sm text-gray-500">Item Progress</div>
             <div className="text-2xl font-bold">
               {order.total_items > 0 ? Math.round((order.completed_items / order.total_items) * 100) : 0}%
+            </div>
+          </div>
+        </div>
+
+        <div className="mt-4 grid grid-cols-2 md:grid-cols-4 gap-4">
+          {/* Attachment-level stats */}
+          <div>
+            <div className="text-sm text-gray-500">Total Attachments</div>
+            <div className={`text-2xl font-bold ${order.total_attachments === 0 ? 'text-gray-400' : ''}`}>
+              {order.total_attachments}
+            </div>
+          </div>
+          <div>
+            <div className="text-sm text-gray-500">Attachments Completed</div>
+            <div className={`text-2xl font-bold ${order.total_attachments === 0 ? 'text-gray-300' : 'text-green-600'}`}>
+              {order.completed_attachments}
+            </div>
+          </div>
+          <div>
+            <div className="text-sm text-gray-500">Attachments Failed</div>
+            <div className={`text-2xl font-bold ${order.total_attachments === 0 ? 'text-gray-300' : 'text-red-600'}`}>
+              {order.failed_attachments}
+            </div>
+          </div>
+          <div>
+            <div className="text-sm text-gray-500">Attachment Progress</div>
+            <div className={`text-2xl font-bold ${order.total_attachments === 0 ? 'text-gray-300' : ''}`}>
+              {order.total_attachments > 0
+                ? Math.round((order.completed_attachments / order.total_attachments) * 100)
+                : 0
+              }%
             </div>
           </div>
         </div>
@@ -1576,7 +1732,7 @@ export default function OrderDetailsPage() {
                   {item.primary_file ? (
                     <div className="border-b pb-3">
                       <h4 className="font-medium text-gray-700 mb-2">📄 Primary File</h4>
-                      <div className="flex justify-between items-center bg-blue-50 p-2 rounded">
+                          <div className="flex justify-between items-center bg-blue-50 p-2 rounded">
                         <div className="flex-1">
                           <p className="text-sm font-medium">{item.primary_file.filename}</p>
                           <p className="text-xs text-gray-500">{(item.primary_file.file_size / 1024).toFixed(1)}KB</p>
@@ -1587,20 +1743,20 @@ export default function OrderDetailsPage() {
                               <div className="flex items-center border-l pl-2 gap-1">
                                 <span className="text-xs text-gray-500 font-medium">Primary:</span>
                                 <button
-                                  onClick={() => downloadItemResult(item.item_id, 'json', item.item_name)}
-                                  disabled={downloadingFiles[`${item.item_id}-json`]}
+                                  onClick={() => downloadItemResult(item.item_id, 'json', item.item_name, 'primary')}
+                                  disabled={downloadingFiles[`primary-${item.item_id}-json`]}
                                   className="bg-blue-100 hover:bg-blue-200 disabled:bg-gray-200 text-blue-700 disabled:text-gray-500 px-2 py-1 rounded text-xs font-medium"
                                   title="Download primary JSON"
                                 >
-                                  {downloadingFiles[`${item.item_id}-json`] ? '...' : '📄 JSON'}
+                                  {downloadingFiles[`primary-${item.item_id}-json`] ? '...' : '📄 JSON'}
                                 </button>
                                 <button
-                                  onClick={() => downloadItemResult(item.item_id, 'csv', item.item_name)}
-                                  disabled={downloadingFiles[`${item.item_id}-csv`]}
+                                  onClick={() => downloadItemResult(item.item_id, 'csv', item.item_name, 'primary')}
+                                  disabled={downloadingFiles[`primary-${item.item_id}-csv`]}
                                   className="bg-green-100 hover:bg-green-200 disabled:bg-gray-200 text-green-700 disabled:text-gray-500 px-2 py-1 rounded text-xs font-medium"
                                   title="Download primary CSV"
                                 >
-                                  {downloadingFiles[`${item.item_id}-csv`] ? '...' : '📊 CSV'}
+                                  {downloadingFiles[`primary-${item.item_id}-csv`] ? '...' : '📊 CSV'}
                                 </button>
                               </div>
                             </>
@@ -1612,9 +1768,12 @@ export default function OrderDetailsPage() {
                                   const input = document.createElement('input');
                                   input.type = 'file';
                                   input.accept = '.pdf,.jpg,.jpeg,.png';
+                                  input.multiple = true;
                                   input.onchange = (e) => {
-                                    const file = (e.target as HTMLInputElement).files?.[0];
-                                    if (file) uploadPrimaryFile(item.item_id, file);
+                                    const selectedFiles = (e.target as HTMLInputElement).files;
+                                    if (selectedFiles && selectedFiles.length > 0) {
+                                      replacePrimaryAndAttachments(item, selectedFiles);
+                                    }
                                   };
                                   input.click();
                                 }}
@@ -1648,9 +1807,12 @@ export default function OrderDetailsPage() {
                             const input = document.createElement('input');
                             input.type = 'file';
                             input.accept = '.pdf,.jpg,.jpeg,.png';
+                            input.multiple = true;
                             input.onchange = (e) => {
-                              const file = (e.target as HTMLInputElement).files?.[0];
-                              if (file) uploadPrimaryFile(item.item_id, file);
+                              const selectedFiles = (e.target as HTMLInputElement).files;
+                              if (selectedFiles && selectedFiles.length > 0) {
+                                uploadPrimaryAndAttachments(item, selectedFiles);
+                              }
                             };
                             input.click();
                           }}
@@ -1838,7 +2000,7 @@ export default function OrderDetailsPage() {
                   </div>
                 )}
 
-                {/* Download Results Section - Show whenever OCR outputs exist (even if mapping fails) */}
+                {/* Download Results Section - item-level combined results (primary + attachments) */}
                 {(item.ocr_result_json_path || item.ocr_result_csv_path) && (
                   <div className="mt-4 pt-3 border-t border-gray-200">
                     <div className="text-sm font-medium text-gray-700 mb-2">Download Results:</div>
@@ -1847,23 +2009,23 @@ export default function OrderDetailsPage() {
                         {/* Keep JSON button for primary only */}
                         {item.ocr_result_json_path && (
                           <button
-                            onClick={() => downloadItemResult(item.item_id, 'json', item.item_name)}
-                            disabled={downloadingFiles[`${item.item_id}-json`]}
+                            onClick={() => downloadItemResult(item.item_id, 'json', item.item_name, 'item')}
+                            disabled={downloadingFiles[`item-${item.item_id}-json`]}
                             className="bg-blue-100 hover:bg-blue-200 disabled:bg-gray-200 text-blue-700 disabled:text-gray-500 py-1 px-3 rounded text-sm font-medium"
-                            title="Download JSON results"
+                            title="Download combined JSON results"
                           >
-                            {downloadingFiles[`${item.item_id}-json`] ? 'Downloading...' : '📄 JSON'}
+                            {downloadingFiles[`item-${item.item_id}-json`] ? 'Downloading...' : '📄 JSON'}
                           </button>
                         )}
                         {/* CSV button for primary */}
                         {item.ocr_result_csv_path && (
                           <button
-                            onClick={() => downloadItemResult(item.item_id, 'csv', item.item_name)}
-                            disabled={downloadingFiles[`${item.item_id}-csv`]}
+                            onClick={() => downloadItemResult(item.item_id, 'csv', item.item_name, 'item')}
+                            disabled={downloadingFiles[`item-${item.item_id}-csv`]}
                             className="bg-green-100 hover:bg-green-200 disabled:bg-gray-200 text-green-700 disabled:text-gray-500 py-1 px-3 rounded text-sm font-medium"
-                            title="Download primary CSV results"
+                            title="Download combined CSV results"
                           >
-                            {downloadingFiles[`${item.item_id}-csv`] ? 'Downloading...' : '📊 CSV'}
+                            {downloadingFiles[`item-${item.item_id}-csv`] ? 'Downloading...' : '📊 CSV'}
                           </button>
                         )}
                       </div>

@@ -4,6 +4,7 @@ import { useState, useEffect } from 'react';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { DocumentType } from '@/lib/api';
+import { applyOrderUpdateToOrder } from '@/lib/orderUpdateHelpers';
 
 interface Order {
   order_id: number;
@@ -12,6 +13,9 @@ interface Order {
   total_items: number;
   completed_items: number;
   failed_items: number;
+  total_attachments: number;
+  completed_attachments: number;
+  failed_attachments: number;
   mapping_file_path: string | null;
   mapping_keys: string[] | null;
   final_report_paths: any | null;
@@ -125,6 +129,47 @@ export default function OrdersPage() {
     return () => clearInterval(refreshInterval);
   }, [currentPage, statusFilter]);
 
+  // WebSocket for real-time order summary updates
+  useEffect(() => {
+    let ws: WebSocket | null = null;
+    try {
+      const httpBase =
+        process.env.NEXT_PUBLIC_API_URL ||
+        (process as any).env?.API_BASE_URL ||
+        'http://localhost:8000';
+      const apiUrl = new URL(httpBase);
+      const wsProtocol = apiUrl.protocol === 'https:' ? 'wss:' : 'ws:';
+      const wsUrl = `${wsProtocol}//${apiUrl.host}/ws/orders/summary`;
+      ws = new WebSocket(wsUrl);
+
+      ws.onmessage = (event) => {
+        try {
+          const msg = JSON.parse(event.data);
+          if (!msg || msg.type !== 'order_update' || typeof msg.order_id !== 'number') {
+            return;
+          }
+          setOrders((prev) =>
+            prev.map((order) => applyOrderUpdateToOrder(order, msg))
+          );
+        } catch {
+          // ignore malformed messages
+        }
+      };
+    } catch {
+      // ignore WS failures; HTTP polling remains as fallback
+    }
+
+    return () => {
+      if (ws) {
+        try {
+          ws.close();
+        } catch {
+          // ignore
+        }
+      }
+    };
+  }, []);
+
   useEffect(() => {
     loadDocumentTypes();
   }, []);
@@ -213,6 +258,11 @@ export default function OrdersPage() {
   const getProgressPercentage = (order: Order) => {
     if (order.total_items === 0) return 0;
     return Math.round((order.completed_items / order.total_items) * 100);
+  };
+
+  const getAttachmentProgress = (order: Order) => {
+    if (!order.total_attachments || order.total_attachments === 0) return 0;
+    return Math.round((order.completed_attachments / order.total_attachments) * 100);
   };
 
   const selectedPrimaryDocType =
@@ -311,16 +361,24 @@ export default function OrdersPage() {
                       </span>
                     </td>
                     <td className="px-6 py-4 whitespace-nowrap">
-                      <div className="flex items-center">
-                        <div className="text-sm text-gray-900">
-                          {order.completed_items}/{order.total_items}
+                      <div className="flex flex-col text-sm">
+                        <div className="flex items-center mb-1">
+                          <span className="text-gray-900">
+                            {order.completed_items}/{order.total_items}
+                          </span>
+                          {order.status === 'PROCESSING' && order.total_items > 0 && (
+                            <div className="ml-2 w-16 bg-gray-200 rounded-full h-2">
+                              <div
+                                className="bg-blue-600 h-2 rounded-full transition-all duration-300"
+                                style={{ width: `${getProgressPercentage(order)}%` }}
+                              ></div>
+                            </div>
+                          )}
                         </div>
-                        {order.status === 'PROCESSING' && order.total_items > 0 && (
-                          <div className="ml-2 w-16 bg-gray-200 rounded-full h-2">
-                            <div
-                              className="bg-blue-600 h-2 rounded-full transition-all duration-300"
-                              style={{ width: `${getProgressPercentage(order)}%` }}
-                            ></div>
+                        {order.total_attachments > 0 && (
+                          <div className="text-xs text-gray-500">
+                            Attach: {order.completed_attachments}/{order.total_attachments} (
+                            {getAttachmentProgress(order)}%)
                           </div>
                         )}
                       </div>
@@ -330,6 +388,16 @@ export default function OrdersPage() {
                         <div>Total: {order.total_items}</div>
                         {order.failed_items > 0 && (
                           <div className="text-red-600">Failed: {order.failed_items}</div>
+                        )}
+                        {order.total_attachments > 0 && (
+                          <div className="text-xs text-gray-500 mt-1">
+                            Attachments: {order.total_attachments}{" "}
+                            {order.failed_attachments > 0 && (
+                              <span className="text-red-600">
+                                (Failed: {order.failed_attachments})
+                              </span>
+                            )}
+                          </div>
                         )}
                       </div>
                     </td>

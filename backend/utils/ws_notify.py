@@ -11,6 +11,7 @@ except Exception:  # pragma: no cover - optional import for type hinting
 
 
 _order_ws: Dict[int, Set[WebSocket]] = {}
+_orders_summary_ws: Set[WebSocket] = set()
 _lock = asyncio.Lock()
 
 
@@ -49,3 +50,32 @@ async def broadcast(order_id: int, payload: dict) -> None:
                         if not conns:
                             _order_ws.pop(oid, None)
 
+
+async def register_summary(ws: WebSocket) -> None:
+    async with _lock:
+        _orders_summary_ws.add(ws)
+
+
+async def unregister_summary(ws: WebSocket) -> None:
+    async with _lock:
+        if ws in _orders_summary_ws:
+            _orders_summary_ws.remove(ws)
+
+
+async def broadcast_summary(payload: dict) -> None:
+    """Broadcast a payload to all listeners of the orders summary channel."""
+    targets: Set[WebSocket] = set()
+    async with _lock:
+        targets = set(_orders_summary_ws)
+    if not targets:
+        return
+    dead: Set[WebSocket] = set()
+    for ws in targets:
+        try:
+            await ws.send_json(payload)
+        except Exception:
+            dead.add(ws)
+    if dead:
+        async with _lock:
+            for ws in dead:
+                _orders_summary_ws.discard(ws)

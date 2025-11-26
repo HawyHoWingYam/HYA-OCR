@@ -62,7 +62,7 @@ def clean_schema_for_gemini(schema):
 class S3StorageManager:
     """AWS S3文件存储管理器 - 使用单存储桶多文件夹结构"""
 
-    def __init__(self, bucket_name: str, region: str = "ap-southeast-1", enable_legacy_compatibility: bool = True):
+    def __init__(self, bucket_name: str, region: str, enable_legacy_compatibility: bool = True):
         """
         初始化S3存储管理器
 
@@ -87,6 +87,39 @@ class S3StorageManager:
         
         self._s3_client = None
         self._s3_resource = None
+
+    @staticmethod
+    def _sanitize_metadata(metadata: Optional[dict]) -> Optional[dict]:
+        """
+        Ensure S3 Metadata values are ASCII-only strings.
+
+        S3 object metadata only accepts ASCII characters. This helper will:
+        - Cast all values to str
+        - Strip or replace non-ASCII characters
+        - Log a warning when sanitization happens
+        """
+        if not metadata:
+            return None
+
+        safe_meta: dict = {}
+        for key, value in metadata.items():
+            if value is None:
+                continue
+            s = str(value)
+            try:
+                s.encode("ascii")
+            except UnicodeEncodeError:
+                sanitized = s.encode("ascii", "ignore").decode("ascii")
+                if not sanitized:
+                    sanitized = "non_ascii"
+                logger.warning(
+                    f"S3 metadata value for key '{key}' contains non-ASCII characters "
+                    f"and will be sanitized. Original='{s}', Sanitized='{sanitized}'"
+                )
+                s = sanitized
+            safe_meta[str(key)] = s
+
+        return safe_meta or None
 
     @property
     def s3_client(self):
@@ -185,14 +218,18 @@ class S3StorageManager:
 
             # 添加元数据
             if metadata:
-                upload_args["Metadata"] = metadata
+                safe_meta = self._sanitize_metadata(metadata)
+                if safe_meta:
+                    upload_args["Metadata"] = safe_meta
 
             # 执行上传
             if hasattr(file_content, "read"):
                 # 文件对象 - upload_fileobj 需要单独的参数格式
                 extra_args = {"ContentType": content_type}
                 if metadata:
-                    extra_args["Metadata"] = metadata
+                    safe_meta = self._sanitize_metadata(metadata)
+                    if safe_meta:
+                        extra_args["Metadata"] = safe_meta
 
                 self.s3_client.upload_fileobj(
                     file_content,
@@ -244,7 +281,9 @@ class S3StorageManager:
             }
 
             if metadata:
-                upload_args["Metadata"] = metadata
+                safe_meta = self._sanitize_metadata(metadata)
+                if safe_meta:
+                    upload_args["Metadata"] = safe_meta
 
             self.s3_client.put_object(**upload_args)
             logger.info(
@@ -699,6 +738,8 @@ class S3StorageManager:
             if metadata:
                 upload_metadata.update(metadata)
 
+            upload_metadata = self._sanitize_metadata(upload_metadata) or {}
+
             # 上传内容
             self.s3_client.put_object(
                 Bucket=self.bucket_name,
@@ -859,6 +900,8 @@ class S3StorageManager:
             schema_content = json.dumps(schema_data, ensure_ascii=False, indent=2)
 
             # 上传内容
+            upload_metadata = self._sanitize_metadata(upload_metadata) or {}
+
             self.s3_client.put_object(
                 Bucket=self.bucket_name,
                 Key=full_key,
@@ -1518,6 +1561,8 @@ class S3StorageManager:
                 encoding = None
                 
             # Upload to S3
+            upload_metadata = self._sanitize_metadata(upload_metadata) or {}
+
             put_args = {
                 "Bucket": self.bucket_name,
                 "Key": s3_path,
@@ -1898,21 +1943,29 @@ _s3_manager = None
 
 
 def get_s3_manager() -> Optional[S3StorageManager]:
-    """获取全局S3存储管理器实例"""
+    """获取全局S3存储管理器实例。
+    僅當 STORAGE_BACKEND=s3 時才初始化，否則返回 None。
+    缺少必要變數將拋出異常以避免靜默回退。
+    """
     global _s3_manager
 
     if _s3_manager is None:
         try:
-            # 从环境变量获取S3设置
-            bucket_name = os.getenv("S3_BUCKET_NAME")
-            region = os.getenv("AWS_DEFAULT_REGION", "ap-southeast-1")
+            backend = os.getenv("STORAGE_BACKEND", "").lower()
+            if backend != "s3":
+                return None
 
-            if bucket_name:
-                _s3_manager = S3StorageManager(bucket_name, region)
-                _s3_manager.ensure_bucket_exists()
-                logger.info(f"✅ S3存储管理器初始化成功：bucket={bucket_name}")
-            else:
-                logger.warning("⚠️ 未配置S3存储桶名称，将使用本地文件存储")
+            bucket_name = os.getenv("S3_BUCKET_NAME")
+            region = os.getenv("AWS_DEFAULT_REGION")
+
+            if not bucket_name:
+                raise ValueError("S3_BUCKET_NAME must be set when STORAGE_BACKEND=s3")
+            if not region:
+                raise ValueError("AWS_DEFAULT_REGION must be set when STORAGE_BACKEND=s3")
+
+            _s3_manager = S3StorageManager(bucket_name, region)
+            _s3_manager.ensure_bucket_exists()
+            logger.info(f"✅ S3存储管理器初始化成功：bucket={bucket_name}")
 
         except Exception as e:
             logger.error(f"❌ S3存储管理器初始化失败：{e}")
@@ -1922,5 +1975,5 @@ def get_s3_manager() -> Optional[S3StorageManager]:
 
 
 def is_s3_enabled() -> bool:
-    """检查是否启用了S3存储"""
-    return get_s3_manager() is not None
+    """检查是否启用了S3存储（由 STORAGE_BACKEND 控制）"""
+    return os.getenv("STORAGE_BACKEND", "").lower() == "s3"

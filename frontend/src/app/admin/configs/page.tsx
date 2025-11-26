@@ -1,7 +1,7 @@
 'use client';
 
 import { useState, useEffect } from 'react';
-import { DocumentType, Company } from '@/lib/api';
+import { DocumentType, Company, uploadFile } from '@/lib/api';
 import SmartDeleteDialog from '@/components/ui/SmartDeleteDialog';
 
 interface ConfigType {
@@ -40,16 +40,6 @@ async function updateConfig(id: number, data: { prompt_path: string; schema_path
 async function deleteConfig(id: number): Promise<void> {
   const res = await fetch(`${API_BASE_URL}/configs/${id}`, { method: 'DELETE' });
   if (!res.ok) throw new Error('Failed to delete configuration');
-}
-
-async function uploadFile(file: File, path: string): Promise<string> {
-  const formData = new FormData();
-  formData.append('file', file);
-  formData.append('path', path);
-  const res = await fetch(`${API_BASE_URL}/upload`, { method: 'POST', body: formData });
-  if (!res.ok) throw new Error('Failed to upload file');
-  const data = await res.json();
-  return data.file_path;
 }
 
 export default function ConfigsPage() {

@@ -100,6 +100,12 @@ def add_check_constraints(database_url: str):
             ADD CONSTRAINT check_api_status 
             CHECK (status IN ('success', 'error', 'success_with_fallback', 'timeout', 'rate_limited'))
             """,
+            # API Usage 链接约束：至少 job_id 或 item_id 其中之一不为空
+            """
+            ALTER TABLE api_usage
+            ADD CONSTRAINT ck_api_usage_job_or_item
+            CHECK (job_id IS NOT NULL OR item_id IS NOT NULL)
+            """,
         ]
 
         with engine.connect() as conn:

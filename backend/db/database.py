@@ -223,6 +223,71 @@ def _ensure_mapping_schema(engine):
                     for stmt in statements:
                         connection.execute(text(stmt))
                 logger.info("Ensured company_doc_mapping_defaults columns exist.")
+
+        # Ensure api_usage table supports both legacy jobs and new order items
+        if inspector.has_table("api_usage"):
+            api_columns = {col["name"]: col for col in inspector.get_columns("api_usage")}
+            api_statements = []
+
+            # Add item_id column if missing (link to ocr_order_items)
+            if "item_id" not in api_columns:
+                if dialect == "postgresql":
+                    api_statements.append(
+                        "ALTER TABLE api_usage "
+                        "ADD COLUMN item_id INTEGER NULL "
+                        "REFERENCES ocr_order_items(item_id) ON DELETE SET NULL"
+                    )
+                else:
+                    # SQLite and other dialects – add nullable column without FK
+                    api_statements.append(
+                        "ALTER TABLE api_usage ADD COLUMN item_id INTEGER NULL"
+                    )
+
+            # Make job_id nullable for dual-system support
+            job_col = api_columns.get("job_id")
+            if job_col is not None and not job_col.get("nullable", True):
+                if dialect == "postgresql":
+                    api_statements.append(
+                        "ALTER TABLE api_usage ALTER COLUMN job_id DROP NOT NULL"
+                    )
+                else:
+                    logger.warning(
+                        "api_usage.job_id is NOT NULL but automatic migration to nullable "
+                        "is only implemented for PostgreSQL. "
+                        "Please adjust schema manually if needed for dialect '%s'.",
+                        dialect,
+                    )
+
+            if api_statements:
+                with engine.begin() as connection:
+                    for stmt in api_statements:
+                        connection.execute(text(stmt))
+                logger.info("Ensured api_usage schema supports job_id/item_id linkage.")
+
+            # Add check constraint to enforce at least one linkage (job or item)
+            if dialect == "postgresql":
+                try:
+                    with engine.begin() as connection:
+                        connection.execute(
+                            text(
+                                "ALTER TABLE api_usage "
+                                "ADD CONSTRAINT ck_api_usage_job_or_item "
+                                "CHECK (job_id IS NOT NULL OR item_id IS NOT NULL)"
+                            )
+                        )
+                    logger.info("Ensured ck_api_usage_job_or_item check constraint exists.")
+                except Exception as e:
+                    # Constraint may already exist – ignore duplicate errors
+                    if "already exists" in str(e) or "duplicate" in str(e):
+                        logger.info(
+                            "Check constraint ck_api_usage_job_or_item already exists on api_usage."
+                        )
+                    else:
+                        logger.warning(
+                            "Failed to add ck_api_usage_job_or_item constraint on api_usage: %s",
+                            e,
+                        )
+
     except Exception as err:
         logger.error(f"Failed to ensure mapping schema: {err}")
 

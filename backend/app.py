@@ -60,6 +60,10 @@ from db.models import (
     MappingTemplate,
     CompanyDocMappingDefault,
     OrderItemType,
+    OcrSchedule,
+    OcrScheduledFile,
+    ScheduleMode,
+    ScheduledFileStatus,
 )
 from main import extract_text_from_image, extract_text_from_pdf
 from utils.excel_converter import json_to_excel, json_to_csv
@@ -81,14 +85,15 @@ from utils.order_processor import (
     start_order_ocr_only_processing,
     start_order_mapping_only_processing,
     escape_excel_formulas,
+    OrderProcessor,
 )
-from utils.order_processor import OrderProcessor
 from utils.mapping_config import (
     MappingItemType,
     normalise_mapping_config,
     normalise_mapping_override,
 )
 from utils.mapping_config_resolver import MappingConfigResolver
+from utils.order_stats import compute_order_attachment_stats
 
 # Cost allocation imports
 from cost_allocation.dynamic_mapping_processor import process_dynamic_mapping_file
@@ -146,10 +151,50 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 
+# Optional CloudWatch Logs integration via watchtower
+try:
+    cw_log_group = os.getenv("CLOUDWATCH_LOG_GROUP")
+    if cw_log_group:
+        try:
+            import watchtower  # type: ignore
+            import socket
+            import boto3
+
+            region = os.getenv("AWS_DEFAULT_REGION", "ap-southeast-1")
+            hostname = os.getenv("HOSTNAME") or socket.gethostname()
+            env_name = os.getenv("ENVIRONMENT", "production")
+            stream_name = f"{hostname}-{env_name}"
+
+            session = boto3.Session(region_name=region)
+            cw_handler = watchtower.CloudWatchLogHandler(
+                boto3_session=session,
+                log_group=cw_log_group,
+                stream_name=stream_name,
+                create_log_group=False,
+            )
+            cw_handler.setLevel(logging.INFO)
+            root_logger = logging.getLogger()
+            root_logger.addHandler(cw_handler)
+            root_logger.info(
+                f"✅ CloudWatch logging enabled: group={cw_log_group}, stream={stream_name}, region={region}"
+            )
+        except Exception as _cw_exc:
+            logging.getLogger(__name__).warning(
+                f"⚠️ Failed to initialize CloudWatch logging: {_cw_exc}"
+            )
+except Exception:
+    # Never fail app startup due to logging setup
+    pass
+
 # WebSocket connections store
 active_connections = {}
 
-from utils.ws_notify import register as ws_register, unregister as ws_unregister
+from utils.ws_notify import (
+    register as ws_register,
+    unregister as ws_unregister,
+    register_summary as ws_register_summary,
+    unregister_summary as ws_unregister_summary,
+)
 
 @app.websocket("/ws/orders/{order_id}")
 async def ws_orders(websocket: WebSocket, order_id: int):
@@ -167,7 +212,24 @@ async def ws_orders(websocket: WebSocket, order_id: int):
         except Exception:
             pass
 
-# Background Scheduler for OneDrive Sync
+
+@app.websocket("/ws/orders/summary")
+async def ws_orders_summary(websocket: WebSocket):
+    await websocket.accept()
+    try:
+        await ws_register_summary(websocket)
+        while True:
+            # Keep connection alive; ignore incoming messages
+            await websocket.receive_text()
+    except Exception:
+        pass
+    finally:
+        try:
+            await ws_unregister_summary(websocket)
+        except Exception:
+            pass
+
+# Background Scheduler for OneDrive Sync and OCR schedules
 # Initialize only if APScheduler is available
 scheduler = BackgroundScheduler() if APSCHEDULER_AVAILABLE else None
 
@@ -180,6 +242,74 @@ def run_onedrive_sync():
         sync_func()
     except Exception as e:
         logger.error(f"❌ Scheduled sync failed: {str(e)}")
+
+
+def run_ocr_schedules_job():
+    """Wrapper for OCR schedule runner task."""
+    try:
+        logger.info("🔄 Running scheduled OCR schedules...")
+        from utils.ocr_schedule_runner import run_ocr_schedules
+
+        run_ocr_schedules()
+    except Exception as e:
+        logger.error(f"❌ OCR schedule runner failed: {str(e)}")
+
+
+def _calculate_interval_seconds(period_unit: str, period_value: int, runs_per_period: int) -> int:
+    """Normalise period configuration into a base interval in seconds."""
+    if runs_per_period <= 0:
+        raise ValueError("runs_per_period must be positive")
+
+    unit_map = {
+        "second": 1,
+        "seconds": 1,
+        "minute": 60,
+        "minutes": 60,
+        "hour": 3600,
+        "hours": 3600,
+        "day": 86400,
+        "days": 86400,
+    }
+    if period_unit not in unit_map:
+        raise ValueError(f"Unsupported period_unit: {period_unit}")
+
+    period_seconds = period_value * unit_map[period_unit]
+    if period_seconds <= 0:
+        raise ValueError("period_seconds must be positive")
+
+    # Spread runs evenly across the period
+    interval = max(1, period_seconds // runs_per_period)
+    return interval
+
+
+def _serialize_ocr_schedule(s: OcrSchedule) -> dict:
+    """Serialize OcrSchedule to an API-friendly dict."""
+    return {
+        "schedule_id": s.schedule_id,
+        "name": s.name,
+        "enabled": s.enabled,
+        "company_id": s.company_id,
+        "doc_type_id": s.doc_type_id,
+        "material_root_path": s.material_root_path,
+        "history_root_path": s.history_root_path,
+        "output_root_path": s.output_root_path,
+        "failed_subfolder_name": s.failed_subfolder_name,
+        "schedule_mode": s.schedule_mode.value if s.schedule_mode else None,
+        "start_at": s.start_at.isoformat() if s.start_at else None,
+        "interval_seconds": s.interval_seconds,
+        "period_unit": s.period_unit,
+        "period_value": s.period_value,
+        "runs_per_period": s.runs_per_period,
+        "window_start_time": s.window_start_time,
+        "window_end_time": s.window_end_time,
+        "allowed_weekdays": s.allowed_weekdays,
+        "max_files_per_cycle": s.max_files_per_cycle,
+        "last_run_at": s.last_run_at.isoformat() if s.last_run_at else None,
+        "next_run_at": s.next_run_at.isoformat() if s.next_run_at else None,
+        "created_by_user_id": s.created_by_user_id,
+        "created_at": s.created_at.isoformat() if s.created_at else None,
+        "updated_at": s.updated_at.isoformat() if s.updated_at else None,
+    }
 
 
 # Health check endpoint
@@ -206,21 +336,23 @@ def health_check():
         health_status["services"]["database"] = {"status": "unhealthy", "error": str(e)}
         health_status["status"] = "unhealthy"
 
-    # 檢查上傳目錄
+    # 檢查上傳目錄（僅本地存儲）
     try:
-        uploads_path = "uploads"
-        if os.path.exists(uploads_path) and os.access(uploads_path, os.W_OK):
-            health_status["services"]["storage"] = {
-                "status": "healthy",
-                "message": "Uploads directory accessible",
-            }
-        else:
-            health_status["services"]["storage"] = {
-                "status": "unhealthy",
-                "message": "Uploads directory not accessible",
-            }
-            if health_status["status"] == "healthy":
-                health_status["status"] = "degraded"
+        from utils.s3_storage import is_s3_enabled
+        if not is_s3_enabled():
+            uploads_path = os.getenv("LOCAL_UPLOAD_DIR")
+            if uploads_path and os.path.exists(uploads_path) and os.access(uploads_path, os.W_OK):
+                health_status["services"]["storage"] = {
+                    "status": "healthy",
+                    "message": f"Uploads directory accessible: {uploads_path}",
+                }
+            else:
+                health_status["services"]["storage"] = {
+                    "status": "unhealthy",
+                    "message": "Local storage in use but LOCAL_UPLOAD_DIR is missing or not writable",
+                }
+                if health_status["status"] == "healthy":
+                    health_status["status"] = "degraded"
     except Exception as e:
         health_status["services"]["storage"] = {"status": "unhealthy", "error": str(e)}
         if health_status["status"] == "healthy":
@@ -312,35 +444,269 @@ def health_check():
     return JSONResponse(content=health_status, status_code=status_code)
 
 
+# OCR Schedules API
+
+@app.get("/ocr-schedules", response_model=List[dict])
+def list_ocr_schedules(db: Session = Depends(get_db)):
+    schedules = db.query(OcrSchedule).all()
+    return [_serialize_ocr_schedule(s) for s in schedules]
+
+
+@app.post("/ocr-schedules", response_model=dict)
+def create_ocr_schedule(schedule_data: dict, db: Session = Depends(get_db)):
+    """Create a new OCR schedule.
+
+    Expected payload (minimum):
+    - name: str
+    - start_date: 'YYYY-MM-DD'
+    - start_time: 'HH:MM'
+    - period_unit: 'second' | 'minute' | 'hour' | 'day'
+    - period_value: int
+    - runs_per_period: int
+    - material_root_path, history_root_path, output_root_path: OneDrive paths
+    - optional: schedule_mode, window_*, allowed_weekdays, max_files_per_cycle
+    """
+    try:
+        name = schedule_data["name"]
+        start_date = schedule_data["start_date"]
+        start_time = schedule_data["start_time"]
+        period_unit = schedule_data["period_unit"]
+        period_value = int(schedule_data["period_value"])
+        runs_per_period = int(schedule_data["runs_per_period"])
+    except KeyError as e:
+        raise HTTPException(status_code=400, detail=f"Missing required field: {e.args[0]}")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="period_value and runs_per_period must be integers")
+
+    try:
+        start_at = datetime.fromisoformat(f"{start_date}T{start_time}:00")
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid start_date/start_time format")
+
+    try:
+        interval_seconds = _calculate_interval_seconds(period_unit, period_value, runs_per_period)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    schedule_mode_str = schedule_data.get("schedule_mode", "INTERVAL")
+    try:
+        schedule_mode = ScheduleMode[schedule_mode_str]
+    except KeyError:
+        raise HTTPException(status_code=400, detail=f"Invalid schedule_mode: {schedule_mode_str}")
+
+    schedule = OcrSchedule(
+        name=name,
+        enabled=bool(schedule_data.get("enabled", True)),
+        company_id=schedule_data.get("company_id"),
+        doc_type_id=schedule_data.get("doc_type_id"),
+        material_root_path=schedule_data["material_root_path"],
+        history_root_path=schedule_data["history_root_path"],
+        output_root_path=schedule_data["output_root_path"],
+        failed_subfolder_name=schedule_data.get("failed_subfolder_name", "_Failed"),
+        schedule_mode=schedule_mode,
+        start_at=start_at,
+        interval_seconds=interval_seconds,
+        period_unit=period_unit,
+        period_value=period_value,
+        runs_per_period=runs_per_period,
+        window_start_time=schedule_data.get("window_start_time"),
+        window_end_time=schedule_data.get("window_end_time"),
+        allowed_weekdays=schedule_data.get("allowed_weekdays"),
+        max_files_per_cycle=schedule_data.get("max_files_per_cycle"),
+        created_by_user_id=schedule_data.get("created_by_user_id"),
+    )
+
+    # Initial next_run_at is the start_at; scheduler will respect this.
+    schedule.next_run_at = start_at
+
+    db.add(schedule)
+    db.commit()
+    db.refresh(schedule)
+
+    return _serialize_ocr_schedule(schedule)
+
+
+@app.put("/ocr-schedules/{schedule_id}", response_model=dict)
+def update_ocr_schedule(schedule_id: int, schedule_data: dict, db: Session = Depends(get_db)):
+    schedule = db.query(OcrSchedule).filter(OcrSchedule.schedule_id == schedule_id).first()
+    if not schedule:
+        raise HTTPException(status_code=404, detail="OCR schedule not found")
+
+    # Update simple scalar fields if present
+    for field in [
+        "name",
+        "enabled",
+        "company_id",
+        "doc_type_id",
+        "material_root_path",
+        "history_root_path",
+        "output_root_path",
+        "failed_subfolder_name",
+        "window_start_time",
+        "window_end_time",
+        "allowed_weekdays",
+        "max_files_per_cycle",
+        "created_by_user_id",
+    ]:
+        if field in schedule_data:
+            setattr(schedule, field, schedule_data[field])
+
+    # Optionally update schedule_mode and period configuration
+    if "schedule_mode" in schedule_data:
+        mode_str = schedule_data["schedule_mode"]
+        try:
+            schedule.schedule_mode = ScheduleMode[mode_str]
+        except KeyError:
+            raise HTTPException(status_code=400, detail=f"Invalid schedule_mode: {mode_str}")
+
+    period_unit = schedule_data.get("period_unit", schedule.period_unit)
+    period_value = schedule_data.get("period_value", schedule.period_value)
+    runs_per_period = schedule_data.get("runs_per_period", schedule.runs_per_period)
+
+    if period_unit and period_value and runs_per_period:
+        try:
+            period_value_int = int(period_value)
+            runs_per_period_int = int(runs_per_period)
+            schedule.interval_seconds = _calculate_interval_seconds(
+                period_unit, period_value_int, runs_per_period_int
+            )
+            schedule.period_unit = period_unit
+            schedule.period_value = period_value_int
+            schedule.runs_per_period = runs_per_period_int
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    # Optionally update start_at
+    start_date = schedule_data.get("start_date")
+    start_time = schedule_data.get("start_time")
+    if start_date and start_time:
+        try:
+            schedule.start_at = datetime.fromisoformat(f"{start_date}T{start_time}:00")
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid start_date/start_time format")
+
+    # Reset next_run_at if requested or if start_at changed
+    if schedule_data.get("reset_next_run", False) or (start_date and start_time):
+        schedule.next_run_at = schedule.start_at or datetime.utcnow()
+
+    db.commit()
+    db.refresh(schedule)
+    return _serialize_ocr_schedule(schedule)
+
+
+@app.post("/ocr-schedules/{schedule_id}/run-now", response_model=dict)
+def trigger_ocr_schedule(schedule_id: int, db: Session = Depends(get_db)):
+    schedule = db.query(OcrSchedule).filter(OcrSchedule.schedule_id == schedule_id).first()
+    if not schedule:
+        raise HTTPException(status_code=404, detail="OCR schedule not found")
+
+    now = datetime.utcnow()
+    schedule.next_run_at = now
+    db.commit()
+
+    return {
+        "message": "Schedule marked to run as soon as possible",
+        "schedule": _serialize_ocr_schedule(schedule),
+    }
+
+
+@app.get("/ocr-schedules/{schedule_id}/files", response_model=List[dict])
+def list_ocr_schedule_files(
+    schedule_id: int,
+    status: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+):
+    schedule = db.query(OcrSchedule).filter(OcrSchedule.schedule_id == schedule_id).first()
+    if not schedule:
+        raise HTTPException(status_code=404, detail="OCR schedule not found")
+
+    query = db.query(OcrScheduledFile).filter(OcrScheduledFile.schedule_id == schedule_id)
+    if status:
+        try:
+            status_enum = ScheduledFileStatus[status]
+        except KeyError:
+            raise HTTPException(status_code=400, detail=f"Invalid status: {status}")
+        query = query.filter(OcrScheduledFile.status == status_enum)
+
+    files = query.order_by(OcrScheduledFile.created_at.desc()).all()
+
+    results = []
+    for f in files:
+        results.append(
+            {
+                "id": f.id,
+                "schedule_id": f.schedule_id,
+                "month_str": f.month_str,
+                "onedrive_path": f.onedrive_path,
+                "filename": f.filename,
+                "status": f.status.value if f.status else None,
+                "error_message": f.error_message,
+                "attempt_count": f.attempt_count,
+                "ocr_json_path": f.ocr_json_path,
+                "output_excel_path": f.output_excel_path,
+                "excel_row_index": f.excel_row_index,
+                "created_at": f.created_at.isoformat() if f.created_at else None,
+                "updated_at": f.updated_at.isoformat() if f.updated_at else None,
+            }
+        )
+
+    return results
+
+
 # Startup and Shutdown Events for Scheduler
 @app.on_event("startup")
 async def startup_event():
     """Initialize scheduler on startup"""
     try:
-        # Check if OneDrive sync is enabled
-        onedrive_enabled = os.getenv('ONEDRIVE_SYNC_ENABLED', 'false').lower() == 'true'
+        if not APSCHEDULER_AVAILABLE or scheduler is None:
+            logger.warning(
+                "⚠️ APScheduler not installed. Background jobs (OneDrive sync / OCR schedules) are disabled. "
+                "Install with: pip install -r backend/requirements.txt (use your app's virtualenv pip)"
+            )
+            return
+
+        # OneDrive daily sync toggle
+        onedrive_env = os.getenv("ONEDRIVE_SYNC_ENABLED")
+        onedrive_enabled = bool(onedrive_env and onedrive_env.lower() == "true")
 
         if onedrive_enabled:
-            # Check if APScheduler is available
-            if not APSCHEDULER_AVAILABLE:
-                logger.error("❌ APScheduler not installed! OneDrive sync requires: pip install -r GeminiOCR/backend/requirements.txt")
-                return
-
-            # Schedule OneDrive sync daily at 2 AM
             scheduler.add_job(
                 run_onedrive_sync,
                 CronTrigger(hour=2, minute=0),
-                id='onedrive_daily_sync',
-                name='OneDrive Daily Sync',
-                replace_existing=True
+                id="onedrive_daily_sync",
+                name="OneDrive Daily Sync",
+                replace_existing=True,
             )
-            scheduler.start()
-            logger.info("✅ APScheduler started - OneDrive sync scheduled for 2:00 AM daily")
+            logger.info("✅ OneDrive sync scheduled for 2:00 AM daily")
         else:
-            if not APSCHEDULER_AVAILABLE:
-                logger.warning("⚠️ APScheduler not installed. OneDrive sync is disabled. Install with: pip install -r GeminiOCR/backend/requirements.txt")
-            else:
-                logger.info("ℹ️ OneDrive sync disabled (ONEDRIVE_SYNC_ENABLED not set to 'true')")
+            logger.info(
+                "ℹ️ OneDrive sync disabled (ONEDRIVE_SYNC_ENABLED not set to 'true')"
+            )
+
+        # OCR schedule runner toggle
+        ocr_env = os.getenv("OCR_SCHEDULE_ENABLED")
+        ocr_enabled = bool(ocr_env and ocr_env.lower() == "true")
+
+        if ocr_enabled:
+            scheduler.add_job(
+                run_ocr_schedules_job,
+                # Default: check every 5 minutes for due work
+                CronTrigger(minute="*/5"),
+                id="ocr_schedules_runner",
+                name="OCR Schedules Runner",
+                replace_existing=True,
+            )
+            logger.info(
+                "✅ OCR schedule runner enabled - will poll for due schedules every 5 minutes"
+            )
+        else:
+            logger.info(
+                "ℹ️ OCR schedule runner disabled (OCR_SCHEDULE_ENABLED not set to 'true')"
+            )
+
+        # Start the shared scheduler
+        scheduler.start()
+        logger.info("✅ APScheduler started")
 
     except Exception as e:
         logger.error(f"❌ Failed to start scheduler: {str(e)}")
@@ -584,11 +950,7 @@ async def upload_document_type_template(
     if not doc_type:
         raise HTTPException(status_code=404, detail="Document type not found")
 
-    if not is_s3_enabled():
-        raise HTTPException(
-            status_code=400,
-            detail="S3 storage must be enabled to upload templates",
-        )
+    use_s3 = is_s3_enabled()
 
     try:
         raw_bytes = await template_file.read()
@@ -640,45 +1002,63 @@ async def upload_document_type_template(
         len(computed_expressions),
     )
 
-    s3_manager = get_s3_manager()
-    if not s3_manager:
-        raise HTTPException(status_code=500, detail="S3 storage manager is not configured")
-
     safe_version = sanitize_template_version(template_json.get("version", "latest"))
-    object_key = build_template_object_name(doc_type_id, safe_version)
 
-    metadata = {
-        "doc_type_id": str(doc_type_id),
-        "template_name": str(template_json.get("template_name", ""))[:50],
-        "template_version": safe_version,
-    }
+    if use_s3:
+        s3_manager = get_s3_manager()
+        if not s3_manager:
+            raise HTTPException(status_code=500, detail="S3 storage manager is not configured")
 
-    logger.info(
-        "Uploading template for doc_type %s to s3://%s/%s",
-        doc_type_id,
-        s3_manager.bucket_name,
-        f"{s3_manager.upload_prefix}{object_key}",
-    )
+        object_key = build_template_object_name(doc_type_id, safe_version)
 
-    try:
-        upload_success = s3_manager.upload_file(
-            file_content=raw_bytes,
-            key=object_key,
-            content_type="application/json",
-            metadata=metadata,
-        )
-    except Exception as exc:
-        logger.error(
-            "Unexpected error uploading template for doc_type %s: %s",
+        metadata = {
+            "doc_type_id": str(doc_type_id),
+            "template_name": str(template_json.get("template_name", ""))[:50],
+            "template_version": safe_version,
+        }
+
+        logger.info(
+            "Uploading template for doc_type %s to s3://%s/%s",
             doc_type_id,
-            exc,
+            s3_manager.bucket_name,
+            f"{s3_manager.upload_prefix}{object_key}",
         )
-        raise HTTPException(status_code=500, detail="Failed to upload template to S3") from exc
 
-    if not upload_success:
-        raise HTTPException(status_code=500, detail="Failed to upload template to S3")
+        try:
+            upload_success = s3_manager.upload_file(
+                file_content=raw_bytes,
+                key=object_key,
+                content_type="application/json",
+                metadata=metadata,
+            )
+        except Exception as exc:
+            logger.error(
+                "Unexpected error uploading template for doc_type %s: %s",
+                doc_type_id,
+                exc,
+            )
+            raise HTTPException(status_code=500, detail="Failed to upload template to S3") from exc
 
-    template_uri = f"s3://{s3_manager.bucket_name}/{s3_manager.upload_prefix}{object_key}"
+        if not upload_success:
+            raise HTTPException(status_code=500, detail="Failed to upload template to S3")
+
+        template_uri = f"s3://{s3_manager.bucket_name}/{s3_manager.upload_prefix}{object_key}"
+    else:
+        base_dir = os.getenv("LOCAL_UPLOAD_DIR")
+        if not base_dir:
+            raise HTTPException(status_code=500, detail="LOCAL_UPLOAD_DIR not set for local storage")
+        template_dir = os.path.join(base_dir, "templates", "document_types", str(doc_type_id))
+        os.makedirs(template_dir, exist_ok=True)
+        template_filename = f"template_{safe_version}.json"
+        template_path = os.path.join(template_dir, template_filename)
+        try:
+            with open(template_path, "w", encoding="utf-8") as f:
+                json.dump(template_json, f, ensure_ascii=False, indent=2)
+            template_uri = template_path
+            logger.info("Template for doc_type %s saved locally at %s", doc_type_id, template_uri)
+        except Exception as exc:
+            logger.error("Failed to save local template for doc_type %s: %s", doc_type_id, exc)
+            raise HTTPException(status_code=500, detail="Failed to save template to local storage") from exc
     previous_path = doc_type.template_json_path
 
     try:
@@ -1125,6 +1505,7 @@ def download_config_file(config_id: int, file_type: str, db: Session = Depends(g
         raise HTTPException(status_code=500, detail="Configuration missing company or document type")
     
     logger.info(f"📥 S3-only download request - Config ID: {config_id}, Type: {file_type}, Company: {company.company_code}, DocType: {doc_type.type_code}")
+    compat_enabled = os.getenv('S3_READ_COMPAT_ENABLED', 'true').lower() == 'true'
     
     try:
         # Always try S3 download first
@@ -1233,43 +1614,45 @@ def download_config_file(config_id: int, file_type: str, db: Session = Depends(g
             f"{company.company_id}_{doc_type.doc_type_id}",    # 1_11 (minimal)
         ]
         
-        # === STRATEGY 3: Current name-based paths ===
+        # === STRATEGY 3: Current name-based paths (compat only) ===
         name_based_paths = []
-        
-        # Company variants
-        company_variants = [
-            company.company_code if company.company_code else "unknown",
-            company.company_code.lower() if company.company_code else "unknown",
-            company.company_code.upper() if company.company_code else "unknown",
-            company.company_name.lower().replace(" ", "_") if company.company_name else "unknown",
-            "hana",  # Common fallback
-        ]
-        
-        # Document type variants  
-        doc_type_variants = [
-            doc_type.type_code if doc_type.type_code else "unknown",
-            doc_type.type_name if doc_type.type_name else "unknown", 
-            # Handle common transformations
-            doc_type.type_code.replace("[Admin]", "[Finance]") if doc_type.type_code and "[Admin]" in doc_type.type_code else None,
-            doc_type.type_code.replace("[Finance]", "[Admin]") if doc_type.type_code and "[Finance]" in doc_type.type_code else None,
-            doc_type.type_code.replace("[Production]", "[Admin]") if doc_type.type_code and "[Production]" in doc_type.type_code else None,
-            # Remove prefixes and clean up
-            doc_type.type_code.replace("[Admin]_", "").replace("[Finance]_", "").replace("[Production]_", "") if doc_type.type_code else None,
-            # Common patterns
-            "[Finance]_hkbn_billing",  # Known working pattern
-            "hkbn_billing", "admin_hkbn_billing", "finance_hkbn_billing",
-        ]
-        
-        # Remove None and duplicates
-        doc_type_variants = list(set([v for v in doc_type_variants if v]))
-        
-        # Build all name-based combinations
-        for company_variant in set(company_variants):
-            for doc_type_variant in doc_type_variants:
-                name_based_paths.append(f"{company_variant}/{doc_type_variant}")
+        if compat_enabled:
+            # Company variants
+            company_variants = [
+                company.company_code if company.company_code else "unknown",
+                company.company_code.lower() if company.company_code else "unknown",
+                company.company_code.upper() if company.company_code else "unknown",
+                company.company_name.lower().replace(" ", "_") if company.company_name else "unknown",
+                "hana",  # Common fallback
+            ]
+
+            # Document type variants
+            doc_type_variants = [
+                doc_type.type_code if doc_type.type_code else "unknown",
+                doc_type.type_name if doc_type.type_name else "unknown",
+                # Handle common transformations
+                doc_type.type_code.replace("[Admin]", "[Finance]") if doc_type.type_code and "[Admin]" in doc_type.type_code else None,
+                doc_type.type_code.replace("[Finance]", "[Admin]") if doc_type.type_code and "[Finance]" in doc_type.type_code else None,
+                doc_type.type_code.replace("[Production]", "[Admin]") if doc_type.type_code and "[Production]" in doc_type.type_code else None,
+                # Remove prefixes and clean up
+                doc_type.type_code.replace("[Admin]_", "").replace("[Finance]_", "").replace("[Production]_", "") if doc_type.type_code else None,
+                # Common patterns
+                "[Finance]_hkbn_billing",  # Known working pattern
+                "hkbn_billing", "admin_hkbn_billing", "finance_hkbn_billing",
+            ]
+
+            # Remove None and duplicates
+            doc_type_variants = list(set([v for v in doc_type_variants if v]))
+
+            # Build all name-based combinations
+            for company_variant in set(company_variants):
+                for doc_type_variant in doc_type_variants:
+                    name_based_paths.append(f"{company_variant}/{doc_type_variant}")
         
         # === STRATEGY 4: Enhanced wildcard search in S3 with disambiguation ===
         def try_wildcard_search():
+            if not compat_enabled:
+                return None, None
             logger.info(f"🔍 Attempting enhanced wildcard search for config_id={config_id}")
             # List all files and find matches by filename pattern
             all_prompts = s3_manager.list_prompts() if file_type == "prompt" else []
@@ -1367,7 +1750,7 @@ def download_config_file(config_id: int, file_type: str, db: Session = Depends(g
                     break
         
         # Try alternative filenames if primary filename fails - with unique identifiers
-        if file_content is None:
+        if file_content is None and compat_enabled:
             alternative_filenames = [
                 # Config-specific filenames (most unique)
                 f"config_{config_id}_{file_type}.{'txt' if file_type == 'prompt' else 'json'}",  # config_6_prompt.txt
@@ -1412,7 +1795,7 @@ def download_config_file(config_id: int, file_type: str, db: Session = Depends(g
                             break
         
         # Last resort: wildcard search
-        if file_content is None:
+        if file_content is None and compat_enabled:
             logger.info("🔍 Attempting wildcard search as last resort")
             file_content, successful_path = try_wildcard_search()
             if successful_path:
@@ -1442,24 +1825,33 @@ def download_config_file(config_id: int, file_type: str, db: Session = Depends(g
         # Only try S3 metadata if database didn't provide original filename
         if (original_filename == filename and successful_path):
             try:
-                # Extract the S3 key from successful_path and get file info
-                s3_key = successful_path
-                if s3_key.startswith('companies/'):
-                    # For ID-based paths, use company file manager to get proper folder
-                    folder_type = "prompts" if file_type == "prompt" else "schemas"
-                    file_info = s3_manager.get_file_info(s3_key.replace("companies/", ""), folder_type)
+                # Normalise successful_path into a pure S3 key (no folder prefixing mistakes)
+                key_only = successful_path
+                if key_only.startswith('s3://'):
+                    parts = key_only[5:].split('/', 1)
+                    key_only = parts[1] if len(parts) == 2 else key_only
+
+                # When the key is ID-based (companies/...), query head_object directly
+                if key_only.startswith('companies/'):
+                    head = s3_manager.s3_client.head_object(Bucket=s3_manager.bucket_name, Key=key_only)
+                    metadata = head.get('Metadata', {})
                 else:
-                    # For legacy paths, use the path directly
-                    folder_type = "prompts" if file_type == "prompt" else "schemas"
-                    file_info = s3_manager.get_file_info(s3_key, folder_type)
-                
-                if file_info and "metadata" in file_info:
-                    metadata = file_info["metadata"]
-                    if "original_filename" in metadata:
-                        original_filename = metadata["original_filename"]
-                        logger.info(f"📁 Retrieved original filename from S3 metadata: {original_filename}")
-                    else:
-                        logger.info("⚠️ No original_filename in S3 metadata, using stored filename")
+                    # For legacy foldered keys (prompts/, schemas/, upload/, results/ ...)
+                    # get_file_info expects a key relative to the folder argument.
+                    folder_type = 'prompts' if file_type == 'prompt' else 'schemas'
+                    rel_key = key_only
+                    for prefix in (f'{folder_type}/', 'upload/', 'uploads/', 'results/', 'exports/'):
+                        if rel_key.startswith(prefix):
+                            rel_key = rel_key[len(prefix):]
+                            break
+                    info = s3_manager.get_file_info(rel_key, folder=folder_type)
+                    metadata = info.get('metadata', {}) if info else {}
+
+                if metadata and 'original_filename' in metadata:
+                    original_filename = metadata['original_filename']
+                    logger.info(f"📁 Retrieved original filename from S3 metadata: {original_filename}")
+                else:
+                    logger.info("⚠️ No original_filename in S3 metadata, using stored filename")
             except Exception as e:
                 logger.warning(f"⚠️ Failed to retrieve original filename from S3 metadata: {e}")
         
@@ -1494,7 +1886,7 @@ def download_config_file(config_id: int, file_type: str, db: Session = Depends(g
 async def upload_file(file: UploadFile = File(...), path: str = Form(...)):
     
     try:
-        # Check if this is a prompt or schema file for S3 upload
+        # Check if this is a prompt or schema file for config upload
         path_parts = path.split('/')
         
         # NEW ID-BASED FORMAT: document_type/{doc_type_id}/{company_id}/prompt|schema/{filename}
@@ -1537,54 +1929,66 @@ async def upload_file(file: UploadFile = File(...), path: str = Form(...)):
                     config_id = int(filename.split('_')[1])
                 except (IndexError, ValueError):
                     logger.warning(f"Could not parse config_id from filename: {filename}")
-            
-            # Get S3 manager for direct ID-based upload
-            s3_manager = get_s3_manager()
-            if not s3_manager:
-                raise HTTPException(status_code=500, detail="S3 storage not available")
-            
-            # Read file content
+
+            use_s3 = is_s3_enabled()
+
+            # Read file content once
             file_content = await file.read()
-            
-            # Use new ID-based upload methods
+            original_filename = file.filename if hasattr(file, 'filename') else filename
+            stored_path = None
+
             if file_type == "prompt":
                 # For prompt files, decode to text
                 content_text = file_content.decode('utf-8')
                 
-                # Use original filename from the upload, not the path filename
-                original_filename = file.filename if hasattr(file, 'filename') else filename
-                
-                # Prepare metadata with original filename
-                upload_metadata = {
-                    "original_filename": original_filename,
-                    "upload_source": "admin_config"
-                }
-                
-                if config_id:
-                    # Use ID-based method with config_id and original filename
-                    s3_path = s3_manager.upload_prompt_by_id(
-                        company_id=company_id,
-                        doc_type_id=doc_type_id,
-                        config_id=config_id,
-                        prompt_content=content_text,
-                        filename=original_filename,  # Use original filename instead
-                        metadata=upload_metadata
-                    )
-                else:
-                    # Use generic company file method with original filename
-                    s3_path = s3_manager.upload_company_file(
-                        company_id=company_id,
-                        file_type=FileType.PROMPT,
-                        content=content_text,
-                        filename=original_filename,  # Use original filename instead
-                        doc_type_id=doc_type_id,
-                        metadata=upload_metadata
-                    )
+                if use_s3:
+                    # S3 上传
+                    s3_manager = get_s3_manager()
+                    if not s3_manager:
+                        raise HTTPException(status_code=500, detail="S3 storage not available")
+
+                    upload_metadata = {
+                        "original_filename": original_filename,
+                        "upload_source": "admin_config"
+                    }
                     
-                if s3_path:
-                    full_s3_path = f"s3://{s3_manager.bucket_name}/{s3_path}"
+                    if config_id:
+                        # Use ID-based method with config_id and original filename
+                        s3_path = s3_manager.upload_prompt_by_id(
+                            company_id=company_id,
+                            doc_type_id=doc_type_id,
+                            config_id=config_id,
+                            prompt_content=content_text,
+                            filename=original_filename,
+                            metadata=upload_metadata
+                        )
+                    else:
+                        # Use generic company file method with original filename
+                        s3_path = s3_manager.upload_company_file(
+                            company_id=company_id,
+                            file_type=FileType.PROMPT,
+                            content=content_text,
+                            filename=original_filename,
+                            doc_type_id=doc_type_id,
+                            metadata=upload_metadata
+                        )
+                        
+                    if not s3_path:
+                        raise HTTPException(status_code=500, detail="Failed to upload prompt to S3")
+
+                    stored_path = f"s3://{s3_manager.bucket_name}/{s3_path}"
                 else:
-                    raise HTTPException(status_code=500, detail="Failed to upload prompt to S3")
+                    # 本地存储
+                    base_dir = os.getenv("LOCAL_UPLOAD_DIR")
+                    if not base_dir:
+                        raise HTTPException(status_code=500, detail="LOCAL_UPLOAD_DIR not set for local storage")
+                    local_dir = os.path.join(base_dir, "configs", str(company_id), str(doc_type_id), "prompts")
+                    os.makedirs(local_dir, exist_ok=True)
+                    local_path = os.path.join(local_dir, original_filename)
+                    with open(local_path, "w", encoding="utf-8") as f:
+                        f.write(content_text)
+                    stored_path = local_path
+                    logger.info(f"Prompt config saved locally at {stored_path}")
                 
             else:  # schema
                 # For schema files, parse JSON
@@ -1594,46 +1998,58 @@ async def upload_file(file: UploadFile = File(...), path: str = Form(...)):
                 except json.JSONDecodeError as e:
                     raise HTTPException(status_code=400, detail=f"Invalid JSON format: {str(e)}")
                 
-                # Use original filename from the upload, not the path filename
-                original_filename = file.filename if hasattr(file, 'filename') else filename
-                
-                # Prepare metadata with original filename
-                upload_metadata = {
-                    "original_filename": original_filename,
-                    "upload_source": "admin_config"
-                }
-                
-                if config_id:
-                    # Use ID-based method with config_id and original filename
-                    s3_path = s3_manager.upload_schema_by_id(
-                        company_id=company_id,
-                        doc_type_id=doc_type_id,
-                        config_id=config_id,
-                        schema_data=schema_data,
-                        filename=original_filename,  # Use original filename instead
-                        metadata=upload_metadata
-                    )
+                if use_s3:
+                    s3_manager = get_s3_manager()
+                    if not s3_manager:
+                        raise HTTPException(status_code=500, detail="S3 storage not available")
+
+                    upload_metadata = {
+                        "original_filename": original_filename,
+                        "upload_source": "admin_config"
+                    }
+                    
+                    if config_id:
+                        # Use ID-based method with config_id and original filename
+                        s3_path = s3_manager.upload_schema_by_id(
+                            company_id=company_id,
+                            doc_type_id=doc_type_id,
+                            config_id=config_id,
+                            schema_data=schema_data,
+                            filename=original_filename,
+                            metadata=upload_metadata
+                        )
+                    else:
+                        # Use generic company file method with original filename
+                        s3_path = s3_manager.upload_company_file(
+                            company_id=company_id,
+                            file_type=FileType.SCHEMA,
+                            content=content_text,
+                            filename=original_filename,
+                            doc_type_id=doc_type_id,
+                            metadata=upload_metadata
+                        )
+                    
+                    if not s3_path:
+                        raise HTTPException(status_code=500, detail="Failed to upload schema to S3")
+
+                    stored_path = f"s3://{s3_manager.bucket_name}/{s3_path}"
                 else:
-                    # Use generic company file method with original filename
-                    s3_path = s3_manager.upload_company_file(
-                        company_id=company_id,
-                        file_type=FileType.SCHEMA,
-                        content=content_text,
-                        filename=original_filename,  # Use original filename instead
-                        doc_type_id=doc_type_id,
-                        metadata=upload_metadata
-                    )
-                
-                if s3_path:
-                    full_s3_path = f"s3://{s3_manager.bucket_name}/{s3_path}"
-                else:
-                    raise HTTPException(status_code=500, detail="Failed to upload schema to S3")
+                    # 本地存储
+                    base_dir = os.getenv("LOCAL_UPLOAD_DIR")
+                    if not base_dir:
+                        raise HTTPException(status_code=500, detail="LOCAL_UPLOAD_DIR not set for local storage")
+                    local_dir = os.path.join(base_dir, "configs", str(company_id), str(doc_type_id), "schemas")
+                    os.makedirs(local_dir, exist_ok=True)
+                    local_path = os.path.join(local_dir, original_filename)
+                    with open(local_path, "w", encoding="utf-8") as f:
+                        json.dump(schema_data, f, ensure_ascii=False, indent=2)
+                    stored_path = local_path
+                    logger.info(f"Schema config saved locally at {stored_path}")
             
-            logger.info(f"✅ Successfully uploaded {file_type} using clean path structure: {full_s3_path}")
-            logger.info(f"🎯 Clean S3 path format: companies/{company_id}/{file_type}s/{doc_type_id}/{config_id if config_id else 'temp'}/{original_filename}")
+            logger.info(f"✅ Successfully uploaded {file_type} config using backend={'s3' if use_s3 else 'local'}: {stored_path}")
             
             # Auto-update configuration with file path if config_id exists
-            if config_id:
+            if config_id and stored_path:
                 try:
                     db = next(get_db())
                     try:
@@ -1642,17 +2058,16 @@ async def upload_file(file: UploadFile = File(...), path: str = Form(...)):
                         ).first()
                         
                         if config:
-                            # Store clean S3 path and original filename
-                            original_filename = file.filename if hasattr(file, 'filename') else filename
+                            original_filename_for_db = original_filename
                             
                             if file_type == "prompt":
-                                config.prompt_path = full_s3_path
-                                config.original_prompt_filename = original_filename
-                                logger.info(f"📝 Updated config {config_id} with clean prompt_path: {full_s3_path} and original_filename: {original_filename}")
+                                config.prompt_path = stored_path
+                                config.original_prompt_filename = original_filename_for_db
+                                logger.info(f"📝 Updated config {config_id} with prompt_path: {stored_path}")
                             else:  # schema
-                                config.schema_path = full_s3_path
-                                config.original_schema_filename = original_filename
-                                logger.info(f"📝 Updated config {config_id} with clean schema_path: {full_s3_path} and original_filename: {original_filename}")
+                                config.schema_path = stored_path
+                                config.original_schema_filename = original_filename_for_db
+                                logger.info(f"📝 Updated config {config_id} with schema_path: {stored_path}")
                             
                             db.commit()
                         else:
@@ -1663,20 +2078,20 @@ async def upload_file(file: UploadFile = File(...), path: str = Form(...)):
                     logger.error(f"❌ Failed to update config {config_id} with file path: {e}")
                     # Don't fail the upload if config update fails
             
-            return {"file_path": full_s3_path}
+            return {"file_path": stored_path}
         
         else:
-            # For other file types, use local storage (backward compatibility)
+            # For other file types, always use local storage (explicit path from env)
             logger.info(f"Uploading non-prompt/schema file to local storage: {path}")
             
-            # Create directories if they don't exist
-            directory = os.path.join("uploads", os.path.dirname(path))
+            base_dir = os.getenv("LOCAL_UPLOAD_DIR")
+            if not base_dir:
+                raise HTTPException(status_code=500, detail="LOCAL_UPLOAD_DIR not set for local storage")
+            directory = os.path.join(base_dir, os.path.dirname(path))
             os.makedirs(directory, exist_ok=True)
 
-            # Generate full file path
-            file_path = os.path.join("uploads", path)
+            file_path = os.path.join(base_dir, path)
 
-            # Save file
             with open(file_path, "wb") as buffer:
                 shutil.copyfileobj(file.file, buffer)
 
@@ -1696,6 +2111,7 @@ async def upload_file(file: UploadFile = File(...), path: str = Form(...)):
 # Get job status endpoint
 @app.get("/jobs/{job_id}", response_model=dict)
 def get_job_status(job_id: int, db: Session = Depends(get_db)):
+    logger.warning(f"[DEPRECATED_API] /jobs/{{job_id}} is deprecated and scheduled for removal. job_id={job_id}")
     job = db.query(ProcessingJob).filter(ProcessingJob.job_id == job_id).first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -1755,6 +2171,8 @@ async def list_jobs(
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
 ):
+    logger.warning("[DEPRECATED_API] /jobs is deprecated and scheduled for removal.")
+
     # Create a regular function (not async) to run in the executor
     def get_jobs():
         # Create a new session to avoid sharing with busy sessions
@@ -2156,8 +2574,14 @@ async def validate_prompt_schema(company_code: str, doc_type_code: str):
 @app.on_event("startup")
 async def startup_db_client():
     try:
-        # Create necessary directories
-        os.makedirs("uploads", exist_ok=True)
+        # Create necessary directories when using local storage
+        from utils.s3_storage import is_s3_enabled
+        if not is_s3_enabled():
+            base_dir = os.getenv("LOCAL_UPLOAD_DIR")
+            if not base_dir:
+                logger.error("LOCAL_UPLOAD_DIR not set but STORAGE_BACKEND=local")
+            else:
+                os.makedirs(base_dir, exist_ok=True)
 
         # Try connecting to database
         next(get_db())
@@ -2373,6 +2797,7 @@ async def get_api_usage_summary(db: Session = Depends(get_db)):
 @app.get("/download-by-path")
 def download_file_by_path(path: str):
     """Download a file by its full path."""
+    logger.warning(f"[DEPRECATED_API] /download-by-path is deprecated and scheduled for removal. path={path}")
     if not os.path.exists(path):
         raise HTTPException(status_code=404, detail=f"File not found on disk: {path}")
 
@@ -2407,6 +2832,7 @@ def download_file_by_path(path: str):
 def get_s3_download_url(s3_path: str, expires_in: int = 3600):
     """Generate a presigned URL for direct S3 download."""
     try:
+        logger.warning(f"[DEPRECATED_API] /download-s3-url is deprecated and scheduled for removal. s3_path={s3_path}")
         s3_manager = get_s3_manager()
         if not s3_manager:
             raise HTTPException(status_code=500, detail="S3 storage not available")
@@ -2428,6 +2854,7 @@ def get_s3_download_url(s3_path: str, expires_in: int = 3600):
 def download_s3_file(s3_path: str):
     """Download a file from S3 by its S3 path or URI."""
     try:
+        logger.warning(f"[DEPRECATED_API] /download-s3 is deprecated and scheduled for removal. s3_path={s3_path}")
         s3_manager = get_s3_manager()
         if not s3_manager:
             raise HTTPException(status_code=500, detail="S3 storage not available")
@@ -2649,6 +3076,9 @@ class OrderResponse(BaseModel):
     total_items: int
     completed_items: int
     failed_items: int
+    total_attachments: int
+    completed_attachments: int
+    failed_attachments: int
     primary_doc_type_id: Optional[int]
     primary_doc_type: Optional[dict]
     mapping_file_path: Optional[str]
@@ -2854,6 +3284,9 @@ def list_orders(
 
         order_data = []
         for order in orders:
+            # Compute attachment statistics per order
+            attachment_stats = compute_order_attachment_stats(order, db)
+
             mapping_summary = [
                 {
                     "item_id": item.item_id,
@@ -2872,6 +3305,9 @@ def list_orders(
                 "total_items": order.total_items,
                 "completed_items": order.completed_items,
                 "failed_items": order.failed_items,
+                "total_attachments": attachment_stats["total_attachments"],
+                "completed_attachments": attachment_stats["completed_attachments"],
+                "failed_attachments": attachment_stats["failed_attachments"],
                 "mapping_file_path": order.mapping_file_path,
                 "mapping_keys": order.mapping_keys,
                 "final_report_paths": order.final_report_paths,
@@ -2911,6 +3347,10 @@ def get_order(order_id: int, db: Session = Depends(get_db)):
         items = items_query.all()
 
         items_data = []
+        total_attachments = 0
+        completed_attachments = 0
+        failed_attachments = 0
+
         for item in items:
             # Get files for this item - separated into primary and attachments
             file_links = db.query(OrderItemFile).filter(OrderItemFile.item_id == item.item_id).all()
@@ -2935,6 +3375,14 @@ def get_order(order_id: int, db: Session = Depends(get_db)):
                     file_data["upload_order"] = link.upload_order
                     attachments.append(file_data)
 
+            attachment_count = len(attachments)
+            total_attachments += attachment_count
+            if attachment_count > 0:
+                if item.status == OrderItemStatus.COMPLETED:
+                    completed_attachments += attachment_count
+                elif item.status == OrderItemStatus.FAILED:
+                    failed_attachments += attachment_count
+
             items_data.append({
                 "item_id": item.item_id,
                 "order_id": item.order_id,
@@ -2942,10 +3390,10 @@ def get_order(order_id: int, db: Session = Depends(get_db)):
                 "doc_type_id": item.doc_type_id,
                 "item_name": item.item_name,
                 "status": item.status.value,
-                 "item_type": item.item_type.value if item.item_type else OrderItemType.SINGLE_SOURCE.value,
+                "item_type": item.item_type.value if item.item_type else OrderItemType.SINGLE_SOURCE.value,
                 "primary_file": primary_file,
                 "attachments": attachments,
-                "attachment_count": len(attachments),
+                "attachment_count": attachment_count,
                 "company_name": item.company.company_name if item.company else None,
                 "doc_type_name": item.document_type.type_name if item.document_type else None,
                 "ocr_result_json_path": item.ocr_result_json_path,
@@ -2989,6 +3437,9 @@ def get_order(order_id: int, db: Session = Depends(get_db)):
                 }
                 for item in order.items
             ],
+            "total_attachments": total_attachments,
+            "completed_attachments": completed_attachments,
+            "failed_attachments": failed_attachments,
             "created_at": order.created_at.isoformat(),
             "updated_at": order.updated_at.isoformat()
         }
@@ -4012,6 +4463,169 @@ def download_attachment_json(
         raise HTTPException(status_code=500, detail=f"Error downloading JSON: {str(e)}")
 
 
+# ========== PRIMARY FILE RESULT DOWNLOAD ENDPOINTS ==========
+
+@app.get("/orders/{order_id}/items/{item_id}/primary/download/json")
+def download_primary_file_json(
+    order_id: int,
+    item_id: int,
+    db: Session = Depends(get_db)
+):
+    """Download JSON result for the primary file of a specific order item.
+
+    This reads the same per-file JSON used by attachment downloads, so that:
+    primary-file JSON + all attachment JSONs == aggregated item results JSON.
+    """
+    try:
+        # Verify order exists
+        order = db.query(OcrOrder).filter(OcrOrder.order_id == order_id).first()
+        if not order:
+            raise HTTPException(status_code=404, detail="Order not found")
+
+        # Verify item exists and belongs to order
+        item = db.query(OcrOrderItem).filter(
+            OcrOrderItem.item_id == item_id,
+            OcrOrderItem.order_id == order_id
+        ).first()
+        if not item:
+            raise HTTPException(status_code=404, detail="Order item not found")
+
+        if not item.primary_file_id:
+            raise HTTPException(status_code=404, detail="Item has no primary file")
+
+        s3_manager = get_s3_manager()
+        if not s3_manager:
+            raise HTTPException(status_code=500, detail="S3 storage not available")
+
+        # Prefer per-file JSON for the primary file, consistent with attachment endpoints
+        stored_path = f"upload/results/orders/{item_id // 1000}/items/{item_id}/files/file_{item.primary_file_id}_result.json"
+        file_content = s3_manager.download_file_by_stored_path(stored_path)
+
+        # Fallback to legacy primary-only JSON if per-file JSON is missing (older jobs)
+        if not file_content:
+            if not item.ocr_result_json_path:
+                raise HTTPException(status_code=404, detail="Primary JSON result not found or not yet processed")
+
+            file_content = s3_manager.download_file_by_stored_path(item.ocr_result_json_path)
+            stored_path = item.ocr_result_json_path
+
+            if not file_content:
+                raise HTTPException(status_code=404, detail="Primary JSON result not found or not yet processed")
+
+        # Create temporary file for download
+        import tempfile
+        import os
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".json") as temp_file:
+            temp_file.write(file_content)
+            temp_file_path = temp_file.name
+
+        filename = f"order_{order_id}_item_{item_id}_primary.json"
+        response = FileResponse(
+            path=temp_file_path,
+            filename=filename,
+            media_type="application/json",
+        )
+        response.headers["X-File-Source"] = "S3"
+        response.headers["X-Result-Scope"] = "primary_file_only"
+        response.headers["X-Result-Path"] = stored_path
+        return response
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to download primary file JSON for item {item_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to download JSON file: {str(e)}")
+
+
+@app.get("/orders/{order_id}/items/{item_id}/primary/download/csv")
+def download_primary_file_csv(
+    order_id: int,
+    item_id: int,
+    db: Session = Depends(get_db)
+):
+    """Download CSV result for the primary file of a specific order item.
+
+    This converts the primary file's per-file JSON to CSV using the same deep
+    flattening as other CSV exports, so that primary CSV + all attachment CSVs
+    align with the aggregated item CSV.
+    """
+    try:
+        # Verify order exists
+        order = db.query(OcrOrder).filter(OcrOrder.order_id == order_id).first()
+        if not order:
+            raise HTTPException(status_code=404, detail="Order not found")
+
+        # Verify item exists and belongs to order
+        item = db.query(OcrOrderItem).filter(
+            OcrOrderItem.item_id == item_id,
+            OcrOrderItem.order_id == order_id
+        ).first()
+        if not item:
+            raise HTTPException(status_code=404, detail="Order item not found")
+
+        if not item.primary_file_id:
+            raise HTTPException(status_code=404, detail="Item has no primary file")
+
+        s3_manager = get_s3_manager()
+        if not s3_manager:
+            raise HTTPException(status_code=500, detail="S3 storage not available")
+
+        # Prefer per-file JSON for the primary file, consistent with attachment endpoints
+        stored_path = f"upload/results/orders/{item_id // 1000}/items/{item_id}/files/file_{item.primary_file_id}_result.json"
+        file_content = s3_manager.download_file_by_stored_path(stored_path)
+
+        # Fallback to legacy primary-only JSON if per-file JSON is missing (older jobs)
+        if not file_content:
+            if not item.ocr_result_json_path:
+                raise HTTPException(status_code=404, detail="Primary JSON result not found or not yet processed")
+
+            file_content = s3_manager.download_file_by_stored_path(item.ocr_result_json_path)
+            stored_path = item.ocr_result_json_path
+
+            if not file_content:
+                raise HTTPException(status_code=404, detail="Primary JSON result not found or not yet processed")
+
+        # Parse JSON and convert to CSV
+        try:
+            json_data = json.loads(file_content.decode('utf-8'))
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse primary JSON for CSV for item {item_id}: {str(e)}")
+            raise HTTPException(status_code=500, detail="Invalid JSON format in primary result")
+
+        csv_content = convert_json_to_csv(json_data)
+        if not csv_content:
+            raise HTTPException(status_code=500, detail="Failed to convert JSON to CSV")
+
+        # Apply Excel formula escaping and add UTF-8 BOM
+        escaped_csv_content = escape_excel_formulas_in_csv(csv_content)
+        file_content_with_bom = b'\xef\xbb\xbf' + escaped_csv_content.encode('utf-8')
+
+        # Create temporary file for download
+        import tempfile
+        import os
+        filename = f"order_{order_id}_item_{item_id}_primary.csv"
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as temp_file:
+            temp_file.write(file_content_with_bom)
+            temp_file_path = temp_file.name
+
+        response = FileResponse(
+            path=temp_file_path,
+            filename=filename,
+            media_type="text/csv; charset=utf-8",
+        )
+        response.headers["X-File-Source"] = "S3"
+        response.headers["X-Result-Scope"] = "primary_file_only"
+        response.headers["X-Result-Path"] = stored_path
+        return response
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to download primary file CSV for item {item_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to download CSV file: {str(e)}")
+
+
 # ========== ATTACHMENT FILES ENDPOINTS ==========
 
 @app.post("/orders/{order_id}/items/{item_id}/files", response_model=dict)
@@ -4229,9 +4843,12 @@ def delete_order_item_file(
         if other_links == 0:
             db.delete(file_info)
 
-        # Update item file count
-        remaining_files = db.query(OrderItemFile).filter(OrderItemFile.item_id == item_id).count()
-        item.file_count = remaining_files
+        # Update item file count (attachments only, exclude primary file)
+        remaining_attachments = db.query(OrderItemFile).filter(
+            OrderItemFile.item_id == item_id,
+            OrderItemFile.file_id != item.primary_file_id
+        ).count()
+        item.file_count = remaining_attachments
         item.updated_at = datetime.utcnow()
 
         db.commit()
@@ -4240,7 +4857,7 @@ def delete_order_item_file(
             "message": "File deleted successfully",
             "item_id": item_id,
             "file_id": file_id,
-            "remaining_files": remaining_files
+            "remaining_files": remaining_attachments
         }
 
     except HTTPException:
@@ -4255,8 +4872,8 @@ def attach_awb_month_to_item(
     order_id: int,
     item_id: int,
     month: str = Form(...),
-    include_bill: bool = Form(False),  # DEPRECATED: Monthly bills should be uploaded via "Upload Files" button
-    monthly_bill_pdf: UploadFile = File(None),  # DEPRECATED: Monthly bills should be uploaded via "Upload Files" button
+    include_bill: bool = Form(False),  # DEPRECATED: Monthly bills should be uploaded via OCR Orders / AWB monthly pipeline
+    monthly_bill_pdf: UploadFile = File(None),  # DEPRECATED: Monthly bills should be uploaded via OCR Orders / AWB monthly pipeline
     debug: bool = Query(False, description="If true, return detailed diagnostics including sample invoice keys and prefix statistics"),
     db: Session = Depends(get_db)
 ):
@@ -4275,6 +4892,10 @@ def attach_awb_month_to_item(
         and optionally debug info with sample keys and prefix statistics
     """
     try:
+        logger.warning(
+            "[DEPRECATED_API] /orders/{order_id}/items/{item_id}/awb/attach-month is deprecated; "
+            "prefer /api/awb/process-monthly and the AWB Orders pipeline."
+        )
         # Validate month format
         if not month or '-' not in month:
             raise HTTPException(status_code=400, detail="Month must be in YYYY-MM format")
@@ -4501,7 +5122,11 @@ def preview_master_csv(path: str = Query(..., description="OneDrive path to mast
 
 @app.get("/orders/{order_id}/items/{item_id}/download/json")
 def download_order_item_json(order_id: int, item_id: int, db: Session = Depends(get_db)):
-    """Download OCR result JSON file for a specific order item"""
+    """Download OCR result JSON file for a specific order item.
+
+    If an aggregated JSON (including all files for the item) exists, it is preferred.
+    Otherwise, falls back to the legacy primary-only JSON stored in ocr_result_json_path.
+    """
     try:
         # Verify order and item exist
         order = db.query(OcrOrder).filter(OcrOrder.order_id == order_id).first()
@@ -4515,23 +5140,32 @@ def download_order_item_json(order_id: int, item_id: int, db: Session = Depends(
         if not item:
             raise HTTPException(status_code=404, detail="Order item not found")
 
-        # Allow download even if mapping not completed; only require OCR outputs
-
-        if not item.ocr_result_json_path:
-            raise HTTPException(status_code=404, detail="JSON result file not found for this item")
-
         # Use existing S3 download infrastructure
         s3_manager = get_s3_manager()
         if not s3_manager:
             raise HTTPException(status_code=500, detail="S3 storage not available")
 
-        # Download file content from S3
-        file_content = s3_manager.download_file_by_stored_path(item.ocr_result_json_path)
-        if not file_content:
-            raise HTTPException(status_code=404, detail=f"File not found in S3: {item.ocr_result_json_path}")
+        file_content = None
 
-        # Generate filename for download
-        filename = f"order_{order_id}_item_{item_id}_{item.item_name or 'result'}.json"
+        # Prefer aggregated JSON (all files) if available for this item
+        try:
+            aggregated_key = f"results/orders/{item_id // 1000}/items/{item_id}/item_{item_id}_results.json"
+            aggregated_stored_path = f"{s3_manager.upload_prefix}{aggregated_key}"
+            file_content = s3_manager.download_file_by_stored_path(aggregated_stored_path)
+        except Exception as e:
+            logger.warning(f"Failed to load aggregated JSON for item {item_id}: {e}")
+
+        # Fallback to legacy primary-only JSON if aggregated not found
+        if not file_content:
+            if not item.ocr_result_json_path:
+                raise HTTPException(status_code=404, detail="JSON result file not found for this item")
+
+            file_content = s3_manager.download_file_by_stored_path(item.ocr_result_json_path)
+            if not file_content:
+                raise HTTPException(status_code=404, detail=f"File not found in S3: {item.ocr_result_json_path}")
+
+        # Generate filename for download (combined primary + attachments)
+        filename = f"order_{order_id}_item_{item_id}_results.json"
 
         # Create temporary file to serve
         import tempfile
@@ -4559,7 +5193,11 @@ def download_order_item_json(order_id: int, item_id: int, db: Session = Depends(
 
 @app.get("/orders/{order_id}/items/{item_id}/download/csv")
 def download_order_item_csv(order_id: int, item_id: int, db: Session = Depends(get_db)):
-    """Download OCR result CSV file for a specific order item (using deep flattening)"""
+    """Download OCR result CSV file for a specific order item (using deep flattening).
+
+    If an aggregated JSON (including all files for the item) exists, it is preferred.
+    Otherwise, falls back to the legacy primary-only JSON stored in ocr_result_json_path.
+    """
     try:
         # Verify order and item exist
         order = db.query(OcrOrder).filter(OcrOrder.order_id == order_id).first()
@@ -4573,20 +5211,29 @@ def download_order_item_csv(order_id: int, item_id: int, db: Session = Depends(g
         if not item:
             raise HTTPException(status_code=404, detail="Order item not found")
 
-        # Allow CSV generated from OCR JSON regardless of mapping status
-
-        if not item.ocr_result_json_path:
-            raise HTTPException(status_code=404, detail="JSON result file not found for this item")
-
         # Use existing S3 download infrastructure to get JSON
         s3_manager = get_s3_manager()
         if not s3_manager:
             raise HTTPException(status_code=500, detail="S3 storage not available")
 
-        # Download JSON file content from S3
-        json_content = s3_manager.download_file_by_stored_path(item.ocr_result_json_path)
+        json_content = None
+
+        # Prefer aggregated JSON (all files) if available for this item
+        try:
+            aggregated_key = f"results/orders/{item_id // 1000}/items/{item_id}/item_{item_id}_results.json"
+            aggregated_stored_path = f"{s3_manager.upload_prefix}{aggregated_key}"
+            json_content = s3_manager.download_file_by_stored_path(aggregated_stored_path)
+        except Exception as e:
+            logger.warning(f"Failed to load aggregated JSON for CSV of item {item_id}: {e}")
+
+        # Fallback to legacy primary-only JSON if aggregated not found
         if not json_content:
-            raise HTTPException(status_code=404, detail=f"JSON file not found in S3: {item.ocr_result_json_path}")
+            if not item.ocr_result_json_path:
+                raise HTTPException(status_code=404, detail="JSON result file not found for this item")
+
+            json_content = s3_manager.download_file_by_stored_path(item.ocr_result_json_path)
+            if not json_content:
+                raise HTTPException(status_code=404, detail=f"JSON file not found in S3: {item.ocr_result_json_path}")
 
         # Parse JSON content
         try:
@@ -4602,8 +5249,8 @@ def download_order_item_csv(order_id: int, item_id: int, db: Session = Depends(g
         # Apply Excel formula escaping
         escaped_csv_content = escape_excel_formulas_in_csv(csv_content)
 
-        # Generate filename for download
-        filename = f"order_{order_id}_item_{item_id}_primary.csv"
+        # Generate filename for download (combined primary + attachments)
+        filename = f"order_{order_id}_item_{item_id}_results.csv"
 
         # Create temporary file with UTF-8 BOM
         import tempfile
@@ -4957,8 +5604,8 @@ def merge_csv_by_join_key(
         column_order = None
         try:
             if item.document_type and item.document_type.template_json_path:
-                s3_manager = get_s3_manager()
-                template_content = s3_manager.download_file_by_stored_path(item.document_type.template_json_path)
+                file_storage = get_file_storage()
+                template_content = file_storage.download_file(item.document_type.template_json_path)
                 if template_content:
                     template_data = json.loads(template_content.decode('utf-8'))
                     from utils.template_service import validate_template_payload
@@ -4983,8 +5630,11 @@ def merge_csv_by_join_key(
             file_path = f"s3://{s3_manager.bucket_name}/{s3_manager.upload_prefix}{s3_key}"
             logger.info(f"Saved merged CSV to S3: {file_path}")
         else:
-            # Local storage path
-            local_dir = f"uploads/orders/{order_id}/items/{item_id}"
+            # Local storage path (from env)
+            base_dir = os.getenv("LOCAL_UPLOAD_DIR")
+            if not base_dir:
+                raise HTTPException(status_code=500, detail="LOCAL_UPLOAD_DIR not set for local storage")
+            local_dir = os.path.join(base_dir, f"orders/{order_id}/items/{item_id}")
             os.makedirs(local_dir, exist_ok=True)
             local_path = os.path.join(local_dir, f"item_{item_id}_merged_by_{join_key}.csv")
             # Optional: add BOM for Excel friendliness
@@ -6851,10 +7501,10 @@ if __name__ == "__main__":
         logger.error(f"Failed to load application config: {e}")
         port = 8000  # Fallback port
 
-    # Use multiple workers to handle concurrent requests
+    # Start with a single worker to reduce memory usage
     uvicorn.run(
         app,
         host="0.0.0.0",
         port=port,
-        workers=4,  # Use multiple workers to handle concurrent requests
+        workers=1,
     )

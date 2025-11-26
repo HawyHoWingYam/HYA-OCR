@@ -1,6 +1,10 @@
 """
-集中配置加載模塊
-優先級：環境變量 > AWS Secrets Manager > 配置文件
+集中配置加載模組（嚴格環境變數版）
+— 僅從 backend.env/系統環境讀取；不再從 AWS Secrets 或 config.json 提供隱式預設/回退。
+
+原則：
+- 唯一配置來源：backend.env（或同名環境變數）；代碼內不提供默認值。
+- 缺失關鍵變數時，及早報錯（啟動時可見），避免靜默回退。
 """
 
 import os
@@ -11,42 +15,15 @@ from typing import List, Dict, Any, Optional
 from botocore.exceptions import ClientError, NoCredentialsError
 from dotenv import load_dotenv
 
-# 加載 .env / backend.env 文件 - 支持按環境加載 (優先級: .env.<ENV> -> backend.env -> .env)
-env_name = os.getenv("ENVIRONMENT") or os.getenv("DATABASE_ENV")
-candidate_paths = []
-if env_name:
-    candidate_paths.extend([
-        # Centralized project env directory (primary location)
-        os.path.join(os.path.dirname(__file__), "..", "..", "env", f".env.{env_name}"),
-        # Project root env directory (when running from project root)
-        os.path.join("env", f".env.{env_name}"),
-        # Legacy backend env directory (fallback)
-        os.path.join(os.path.dirname(__file__), "env", f".env.{env_name}"),
-        # Dotfile next to CWD (legacy)
-        f".env.{env_name}",
-    ])
+# 僅從 backend/backend.env（或同層 backend.env）加載環境變量，避免隱式回退
+backend_dir = os.path.dirname(__file__)
+env_path = os.path.join(backend_dir, "backend.env")
 
-# 回退到通用 backend.env / .env
-candidate_paths.extend([
-    # Backend 專用環境文件（與 config_loader.py 同層）
-    os.path.join(os.path.dirname(__file__), "backend.env"),
-    # Centralized project env directory (primary location)
-    os.path.join(os.path.dirname(__file__), "..", "..", "env", ".env"),
-    # Project root env directory
-    os.path.join("env", ".env"),
-    # Legacy backend env directory (fallback)
-    os.path.join(os.path.dirname(__file__), "env", ".env"),
-    # Dotfile next to CWD (legacy)
-    ".env",
-])
-
-for env_path in candidate_paths:
-    if os.path.exists(env_path):
-        load_dotenv(env_path)
-        print(f"✅ 加載環境變量文件: {env_path}")
-        break
+if os.path.exists(env_path):
+    load_dotenv(env_path, override=True)
+    print(f"✅ 加載環境變量文件: {env_path}")
 else:
-    print("⚠️  未找到 .env 文件，使用系統環境變量")
+    print("⚠️  未找到 backend.env，將僅使用當前進程環境變量")
 
 logger = logging.getLogger(__name__)
 
@@ -59,294 +36,103 @@ class ConfigLoader:
         self._config_file_cache = None
         self._aws_client = None
 
+    def _require_env(self, name: str) -> str:
+        value = os.getenv(name)
+        if value is None or str(value).strip() == "":
+            raise ValueError(f"Missing required environment variable: {name}")
+        return value
+
     def get_database_url(self) -> str:
-        """獲取數據庫連接URL"""
-        # 優先級：環境變量 > AWS Secrets > 配置文件
-        database_url = os.getenv("DATABASE_URL")
-        if database_url:
-            logger.info("Using database URL from environment variable")
-            return database_url
-
-        # 嘗試從 AWS Secrets Manager 獲取
-        secret = self._get_aws_secret("database")
-        if secret and "database_url" in secret:
-            logger.info("Using database URL from AWS Secrets Manager")
-            return secret["database_url"]
-
-        # 回退到配置文件
-        config = self._get_config_file()
-        if config and "database_url" in config:
-            logger.warning("Using database URL from config file (fallback)")
-            return config["database_url"]
-
-        raise ValueError(
-            "Database URL not found in environment variables, AWS Secrets, or config file"
-        )
+        """獲取數據庫連接URL（僅來源於環境變數）"""
+        database_url = self._require_env("DATABASE_URL")
+        logger.info("Using database URL from environment variable")
+        return database_url
 
     def get_gemini_api_keys(self) -> List[str]:
-        """獲取 Gemini API 密鑰列表"""
-        api_keys = []
-
-        # 從環境變量獲取多個 API keys
-        for i in range(1, 10):  # 支援最多9個 API key
+        """獲取 Gemini API 密鑰列表（僅來源於環境變數）"""
+        api_keys: List[str] = []
+        for i in range(1, 10):
             key = os.getenv(f"GEMINI_API_KEY_{i}")
-            if key:
-                api_keys.append(key)
+            if key and key.strip():
+                api_keys.append(key.strip())
+        # 單一鍵位於 GEMINI_API_KEY 亦接受
+        single = os.getenv("GEMINI_API_KEY") or os.getenv("API_KEY")
+        if single and single.strip():
+            api_keys.append(single.strip())
 
-        if api_keys:
-            logger.info(
-                f"Using {len(api_keys)} Gemini API keys from environment variables"
-            )
-            return api_keys
+        if not api_keys:
+            raise ValueError("No Gemini API keys configured in environment (GEMINI_API_KEY_* or GEMINI_API_KEY)")
 
-        # 單個 API key 環境變量（向後兼容）
-        single_key = os.getenv("GEMINI_API_KEY") or os.getenv("API_KEY")
-        if single_key:
-            logger.info("Using single Gemini API key from environment variable")
-            return [single_key]
-
-        # 從 AWS Secrets Manager 獲取
-        secret = self._get_aws_secret("gemini")
-        if secret:
-            if "api_keys" in secret and isinstance(secret["api_keys"], list):
-                logger.info(
-                    f"Using {len(secret['api_keys'])} Gemini API keys from AWS Secrets"
-                )
-                return secret["api_keys"]
-            elif "api_key" in secret:
-                logger.info("Using single Gemini API key from AWS Secrets")
-                return [secret["api_key"]]
-
-        # 回退到配置文件
-        config = self._get_config_file()
-        if config:
-            if "api_keys" in config and isinstance(config["api_keys"], list):
-                logger.warning(
-                    f"Using {len(config['api_keys'])} Gemini API keys from config file (fallback)"
-                )
-                return config["api_keys"]
-            elif "api_key" in config:
-                logger.warning(
-                    "Using single Gemini API key from config file (fallback)"
-                )
-                return [config["api_key"]]
-
-        # 在測試環境下允許無 API key 運行
-        if os.getenv("ENVIRONMENT") == "test":
-            logger.warning("Running in test mode without Gemini API keys")
-            return ["test-api-key-mock"]
-
-        raise ValueError(
-            "No Gemini API keys found in environment variables, AWS Secrets, or config file"
-        )
+        logger.info(f"Using {len(api_keys)} Gemini API keys from environment variables")
+        return api_keys
 
     def get_aws_credentials(self) -> Dict[str, str]:
-        """獲取 AWS 憑證"""
-        credentials = {}
-
-        # 從環境變量獲取
-        aws_access_key = os.getenv("AWS_ACCESS_KEY_ID")
-        aws_secret_key = os.getenv("AWS_SECRET_ACCESS_KEY")
-        aws_region = os.getenv("AWS_DEFAULT_REGION", "ap-southeast-1")
-        aws_secret_name = os.getenv("AWS_SECRET_NAME")
-
-        if aws_access_key and aws_secret_key:
-            logger.info("Using AWS credentials from environment variables")
-            return {
-                "aws_access_key_id": aws_access_key,
-                "aws_secret_access_key": aws_secret_key,
-                "aws_default_region": aws_region,
-                "aws_secret_name": aws_secret_name,
-            }
-
-        # 回退到配置文件
-        config = self._get_config_file()
-        if config:
-            for key in [
-                "aws_access_key_id",
-                "aws_secret_access_key",
-                "aws_default_region",
-                "aws_secret_name",
-            ]:
-                if key in config:
-                    credentials[key] = config[key]
-
-            if credentials.get("aws_access_key_id") and credentials.get(
-                "aws_secret_access_key"
-            ):
-                logger.warning("Using AWS credentials from config file (fallback)")
-                return credentials
-
-        logger.warning("No AWS credentials found, using default boto3 credential chain")
-        return {"aws_default_region": aws_region or "ap-southeast-1"}
+        """獲取 AWS 憑證（僅環境變數；需要時必須存在）"""
+        region = self._require_env("AWS_DEFAULT_REGION")
+        access_key = os.getenv("AWS_ACCESS_KEY_ID")
+        secret_key = os.getenv("AWS_SECRET_ACCESS_KEY")
+        # 有些環境可能走 IAM role；若設置了 STORAGE_BACKEND=s3 則必須顯式提供 Key/Secret
+        storage_backend = os.getenv("STORAGE_BACKEND", "").lower()
+        if storage_backend == "s3":
+            if not access_key or not secret_key:
+                raise ValueError("When STORAGE_BACKEND=s3, AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY must be set in environment")
+        creds: Dict[str, str] = {"aws_default_region": region}
+        if access_key:
+            creds["aws_access_key_id"] = access_key
+        if secret_key:
+            creds["aws_secret_access_key"] = secret_key
+        return creds
 
     def get_app_config(self) -> Dict[str, Any]:
-        """獲取應用配置"""
+        """獲取應用配置（僅環境變數）"""
+        api_base_url = self._require_env("API_BASE_URL")
+        port_str = self._require_env("PORT")
+        model_name = self._require_env("MODEL_NAME")
+        environment = self._require_env("ENVIRONMENT")
+        try:
+            port = int(port_str)
+        except Exception:
+            raise ValueError("PORT must be an integer")
         return {
-            "api_base_url": os.getenv(
-                "API_BASE_URL", self._get_from_config("API_BASE_URL", "localhost")
-            ),
-            "port": int(os.getenv("PORT", self._get_from_config("port", 8000))),
-            "model_name": os.getenv(
-                "MODEL_NAME",
-                self._get_from_config("model_name", "gemini-2.5-flash-preview-05-20"),
-            ),
-            "environment": os.getenv("ENVIRONMENT", "development"),
-            "document_types": self._get_from_config("document_type", {}),
+            "api_base_url": api_base_url,
+            "port": port,
+            "model_name": model_name,
+            "environment": environment,
         }
 
     def get_prompt_schema_config(self) -> Dict[str, Any]:
-        """獲取prompt和schema管理配置"""
-        default_config = {
-            "storage_backend": "auto",
-            "cache": {
-                "enabled": True,
-                "max_size": 100,
-                "ttl_minutes": 30
-            },
-            "s3": {
-                "enabled": True,
-                "bucket_name": None,
-                "region": "ap-southeast-1",
-                "prompt_prefix": "prompts/",
-                "schema_prefix": "schemas/",
-                "auto_backup": True,
-                "encryption": True
-            },
-            "local_backup": {
-                "enabled": True,
-                "path": "uploads/prompt_schema_backup",
-                "auto_sync": True
-            },
-            "validation": {
-                "strict_mode": True,
-                "prompt_min_length": 10,
-                "prompt_max_length": 50000,
-                "required_prompt_keywords": ["extract", "analyze", "identify", "process"],
-                "schema_required_fields": ["type", "properties"]
-            },
-            "performance": {
-                "thread_pool_size": 4,
-                "concurrent_uploads": 3,
-                "retry_attempts": 3,
-                "timeout_seconds": 30
-            }
+        """獲取 prompt/schema 管理配置（僅環境變數）。
+        最小化需求：強制聲明後端與必要參數，不做自動推斷。
+        """
+        storage_backend = self._require_env("STORAGE_BACKEND").lower()
+        cfg: Dict[str, Any] = {
+            "storage_backend": storage_backend,
+            "cache": {},
+            "s3": {},
+            "validation": {},
+            "performance": {},
         }
 
-        # 從配置文件加載
-        config_data = self._get_from_config("prompt_schema_management", default_config)
-
-        # 環境變量覆蓋
-        if os.getenv("PROMPT_SCHEMA_STORAGE_BACKEND"):
-            config_data["storage_backend"] = os.getenv("PROMPT_SCHEMA_STORAGE_BACKEND")
-
-        if os.getenv("PROMPT_SCHEMA_CACHE_ENABLED"):
-            config_data["cache"]["enabled"] = os.getenv("PROMPT_SCHEMA_CACHE_ENABLED").lower() == "true"
-
+        # 可選：緩存參數（如提供則使用，否則由上層模組自行處理默認或不啟用）
+        if os.getenv("PROMPT_SCHEMA_CACHE_ENABLED") is not None:
+            cfg.setdefault("cache", {})["enabled"] = os.getenv("PROMPT_SCHEMA_CACHE_ENABLED").lower() == "true"
         if os.getenv("PROMPT_SCHEMA_CACHE_SIZE"):
-            config_data["cache"]["max_size"] = int(os.getenv("PROMPT_SCHEMA_CACHE_SIZE"))
+            cfg.setdefault("cache", {})["max_size"] = int(os.getenv("PROMPT_SCHEMA_CACHE_SIZE"))
 
-        if os.getenv("PROMPT_SCHEMA_S3_ENABLED"):
-            config_data["s3"]["enabled"] = os.getenv("PROMPT_SCHEMA_S3_ENABLED").lower() == "true"
+        if storage_backend == "s3":
+            # 明確要求 S3 參數
+            cfg.setdefault("s3", {})["bucket_name"] = self._require_env("S3_BUCKET_NAME")
+            cfg["s3"]["region"] = self._require_env("AWS_DEFAULT_REGION")
 
-        if os.getenv("PROMPT_SCHEMA_S3_BUCKET"):
-            config_data["s3"]["bucket_name"] = os.getenv("PROMPT_SCHEMA_S3_BUCKET")
-
-        if os.getenv("PROMPT_SCHEMA_LOCAL_BACKUP_PATH"):
-            config_data["local_backup"]["path"] = os.getenv("PROMPT_SCHEMA_LOCAL_BACKUP_PATH")
-
-        # 如果沒有明確設置bucket_name，使用主S3配置的bucket
-        if not config_data["s3"]["bucket_name"]:
-            config_data["s3"]["bucket_name"] = os.getenv("S3_BUCKET_NAME")
-
-        # 如果storage_backend是auto，根據S3可用性自動決定
-        if config_data["storage_backend"] == "auto":
-            config_data["storage_backend"] = "s3" if (
-                config_data["s3"]["enabled"] and 
-                config_data["s3"]["bucket_name"] and 
-                os.getenv("S3_BUCKET_NAME")
-            ) else "local"
-
-        return config_data
+        return cfg
 
     def _get_aws_secret(self, secret_type: str) -> Optional[Dict[str, Any]]:
-        """從 AWS Secrets Manager 獲取機密"""
-        if secret_type in self._secrets_cache:
-            return self._secrets_cache[secret_type]
-
-        try:
-            if not self._aws_client:
-                aws_creds = self.get_aws_credentials()
-                if (
-                    "aws_access_key_id" in aws_creds
-                    and "aws_secret_access_key" in aws_creds
-                ):
-                    self._aws_client = boto3.client(
-                        "secretsmanager",
-                        region_name=aws_creds.get(
-                            "aws_default_region", "ap-southeast-1"
-                        ),
-                        aws_access_key_id=aws_creds["aws_access_key_id"],
-                        aws_secret_access_key=aws_creds["aws_secret_access_key"],
-                    )
-                else:
-                    # 使用默認憑證鏈
-                    self._aws_client = boto3.client(
-                        "secretsmanager",
-                        region_name=aws_creds.get(
-                            "aws_default_region", "ap-southeast-1"
-                        ),
-                    )
-
-            # 根據 secret_type 決定 secret 名稱
-            secret_name_map = {
-                "database": os.getenv("DATABASE_SECRET_NAME", "prod/database"),
-                "gemini": os.getenv("GEMINI_SECRET_NAME", "prod/gemini"),
-                "default": os.getenv("AWS_SECRET_NAME"),
-            }
-
-            secret_name = secret_name_map.get(secret_type, secret_name_map["default"])
-            if not secret_name:
-                return None
-
-            response = self._aws_client.get_secret_value(SecretId=secret_name)
-            secret_data = json.loads(response["SecretString"])
-            self._secrets_cache[secret_type] = secret_data
-            return secret_data
-
-        except (ClientError, NoCredentialsError, json.JSONDecodeError) as e:
-            logger.warning(f"Could not retrieve AWS secret for {secret_type}: {e}")
-            return None
+        """（禁用）不再從 Secrets 提供回退，保持兼容接口但恒返 None。"""
+        return None
 
     def _get_config_file(self) -> Optional[Dict[str, Any]]:
-        """從配置文件獲取配置"""
-        if self._config_file_cache is not None:
-            return self._config_file_cache
-
-        config_paths = [
-            # Centralized project env directory (primary location)
-            os.path.join(os.path.dirname(__file__), "..", "..", "env", "config.json"),
-            # Project root env directory
-            os.path.join("env", "config.json"),
-            # Legacy backend env directory (fallback)
-            os.path.join(os.path.dirname(__file__), "env", "config.json"),
-            # Current directory (legacy)
-            "config.json",
-        ]
-
-        for config_path in config_paths:
-            try:
-                if os.path.exists(config_path):
-                    with open(config_path, "r", encoding="utf-8") as f:
-                        self._config_file_cache = json.load(f)
-                        return self._config_file_cache
-            except (json.JSONDecodeError, IOError) as e:
-                logger.warning(f"Could not read config file {config_path}: {e}")
-                continue
-
-        logger.warning("No config file found")
-        self._config_file_cache = {}
-        return self._config_file_cache
+        """（禁用）不再使用 config.json 作為回退。"""
+        return {}
 
     def _get_from_config(self, key: str, default=None) -> Any:
         """從配置文件獲取特定值"""
@@ -371,10 +157,38 @@ class ConfigLoader:
         except ValueError as e:
             errors.append(f"Gemini API configuration: {e}")
 
-        # 檢查應用配置
-        app_config = self.get_app_config()
-        if not app_config.get("port"):
-            errors.append("Application port not configured")
+        # 檢查應用配置與運營參數（嚴格模式）
+        try:
+            app_config = self.get_app_config()
+        except Exception as e:
+            errors.append(f"Application configuration: {e}")
+
+        # 存儲後端校驗
+        storage_backend = os.getenv("STORAGE_BACKEND")
+        if not storage_backend:
+            errors.append("Missing STORAGE_BACKEND (expected 's3' or 'local')")
+        else:
+            sb = storage_backend.lower()
+            if sb not in ("s3", "local"):
+                errors.append("STORAGE_BACKEND must be 's3' or 'local'")
+            if sb == "s3":
+                if not os.getenv("S3_BUCKET_NAME"):
+                    errors.append("S3_BUCKET_NAME is required when STORAGE_BACKEND=s3")
+                for name in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_DEFAULT_REGION"):
+                    if not os.getenv(name):
+                        errors.append(f"{name} is required when STORAGE_BACKEND=s3")
+            if sb == "local":
+                if not os.getenv("LOCAL_UPLOAD_DIR"):
+                    errors.append("LOCAL_UPLOAD_DIR is required when STORAGE_BACKEND=local")
+
+        # OneDrive 開關與必填
+        onedrive_enabled = os.getenv("ONEDRIVE_SYNC_ENABLED")
+        if onedrive_enabled is None:
+            errors.append("Missing ONEDRIVE_SYNC_ENABLED (expected 'true' to enable)")
+        elif onedrive_enabled.lower() == "true":
+            for name in ("ONEDRIVE_CLIENT_ID", "ONEDRIVE_CLIENT_SECRET", "ONEDRIVE_TENANT_ID", "ONEDRIVE_TARGET_USER_UPN"):
+                if not os.getenv(name):
+                    errors.append(f"{name} is required when ONEDRIVE_SYNC_ENABLED=true")
 
         return errors
 

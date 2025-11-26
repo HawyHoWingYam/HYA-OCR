@@ -33,6 +33,8 @@ from db.models import (
     CompanyDocumentConfig,
     File,
     ApiUsage,
+    CompanyDocMappingDefault,
+    MappingTemplate,
 )
 from main import extract_text_from_image, extract_text_from_pdf
 from utils.s3_storage import get_s3_manager
@@ -45,7 +47,8 @@ if TYPE_CHECKING:
     from utils.onedrive_client import OneDriveClient  # pragma: no cover - typing only
 from utils.mapping_config import MappingItemType
 from utils.mapping_config_resolver import MappingConfigResolver
-from utils.ws_notify import broadcast as ws_broadcast
+from utils.order_stats import build_order_update_payload
+from utils.ws_notify import broadcast as ws_broadcast, broadcast_summary as ws_broadcast_summary
 from config_loader import config_loader
 
 logger = logging.getLogger(__name__)
@@ -455,6 +458,79 @@ class MatchingEngine:
                 mapping_value=mapping_value,
                 match_reason=f"Unknown strategy: {strategy}"
             )
+
+
+def _has_applicable_mapping_template(
+    db: Session,
+    company_id: int,
+    doc_type_id: int,
+    item_type: OrderItemType,
+) -> bool:
+    """
+    Check whether there is any MappingTemplate that could apply to this item.
+
+    Follows the same matching rules as MappingConfigResolver._resolve_template:
+    - item_type must match
+    - company_id/doc_type_id can be exact match or NULL (global)
+    """
+    templates = (
+        db.query(MappingTemplate)
+        .filter(MappingTemplate.item_type == item_type)
+        .filter(
+            (MappingTemplate.company_id.is_(None)) | (MappingTemplate.company_id == company_id),
+            (MappingTemplate.doc_type_id.is_(None)) | (MappingTemplate.doc_type_id == doc_type_id),
+        )
+        .limit(1)
+        .all()
+    )
+    return bool(templates)
+
+
+def _order_requires_mapping(db: Session, order: OcrOrder) -> bool:
+    """
+    Determine whether an order should run mapping stage.
+
+    Rules:
+    - If any item already has mapping_config -> require mapping
+    - Else if order has legacy mapping_file_path/mapping_keys -> require mapping
+    - Else if there is any CompanyDocMappingDefault for items -> require mapping
+    - Else if there is any applicable MappingTemplate for items -> require mapping
+    - Otherwise, treat as OCR-only (mapping skipped)
+    """
+    items = db.query(OcrOrderItem).filter(OcrOrderItem.order_id == order.order_id).all()
+    if not items:
+        return False
+
+    # Item-level explicit configs
+    for item in items:
+        if item.mapping_config:
+            return True
+
+    # Legacy order-level mapping settings
+    if order.mapping_file_path or (order.mapping_keys and len(order.mapping_keys) > 0):
+        return True
+
+    # Defaults or templates for any item
+    for item in items:
+        # Explicit default record
+        default_exists = (
+            db.query(CompanyDocMappingDefault)
+            .filter(
+                CompanyDocMappingDefault.company_id == item.company_id,
+                CompanyDocMappingDefault.doc_type_id == item.doc_type_id,
+                CompanyDocMappingDefault.item_type == item.item_type,
+            )
+            .first()
+            is not None
+        )
+        if default_exists:
+            return True
+
+        # Applicable template (company/doc_type specific or global)
+        if _has_applicable_mapping_template(db, item.company_id, item.doc_type_id, item.item_type):
+            return True
+
+    return False
 
 
 class OrderProcessor:
@@ -1359,19 +1435,36 @@ class OrderProcessor:
                     order.status = OrderStatus.FAILED
                     order.error_message = "All items failed to process at OCR stage"
                 elif completed_count > 0:
-                    # OCR ok for at least some items: proceed to mapping-only pipeline
-                    order.status = OrderStatus.MAPPING
-                    order.error_message = None
-                    db.commit()
-                    logger.info(f"Order {order_id} moving to mapping stage (OCR completed for {completed_count} items)")
+                    # OCR ok for at least some items
+                    mapping_required = _order_requires_mapping(db, order)
 
-                    # Run mapping-only synchronously to produce mapped_csv and special_csv
-                    await self.process_order_mapping_only(order_id)
+                    if mapping_required:
+                        # Proceed to mapping-only pipeline
+                        order.status = OrderStatus.MAPPING
+                        order.error_message = None
+                        db.commit()
+                        logger.info(
+                            f"Order {order_id} moving to mapping stage (OCR completed for {completed_count} items; mapping templates/defaults detected)"
+                        )
+
+                        # Run mapping-only synchronously to produce mapped_csv and special_csv
+                        await self.process_order_mapping_only(order_id)
+                    else:
+                        # No mapping templates/defaults/configs -> treat as OCR-only order
+                        order.status = OrderStatus.OCR_COMPLETED
+                        order.error_message = None
+                        db.commit()
+                        logger.info(
+                            f"Order {order_id} OCR completed without mapping (no mapping templates/defaults/configs detected)"
+                        )
 
                 db.commit()
-                # Notify clients about status change
+
+                # Notify clients about status change, including attachment statistics
                 try:
-                    await ws_broadcast(order_id, {"type": "order_update", "order_id": order_id, "status": order.status.value})
+                    payload = build_order_update_payload(order, db)
+                    await ws_broadcast(order_id, payload)
+                    await ws_broadcast_summary(payload)
                 except Exception:
                     pass
                 logger.info(f"Order {order_id} OCR stage completed: {completed_count} succeeded, {failed_count} failed")
@@ -1608,6 +1701,13 @@ class OrderProcessor:
                 temp_files_to_cleanup = []
                 is_awb = doc_type.type_code == "AIRWAY_BILL"  # Check if this is an AWB item
 
+                # Resolve model name once per item for API usage tracking
+                try:
+                    app_config = config_loader.get_app_config()
+                    model_name = app_config.get("model_name", "unknown")
+                except Exception:
+                    model_name = "unknown"
+
                 for file_record, is_primary_file in all_files:
                     try:
                         # Download file from S3 to temporary location
@@ -1623,48 +1723,120 @@ class OrderProcessor:
                             temp_file_path = temp_file.name
                             temp_files_to_cleanup.append(temp_file_path)
 
-                        # Process the file
+                        # Process the file via Gemini
                         if file_ext == '.pdf':
                             result = await extract_text_from_pdf(temp_file_path, prompt, schema)
                         else:
                             result = await extract_text_from_image(temp_file_path, prompt, schema)
 
-                        # Clean result data - only keep business data
+                        # Record API usage metrics for this file (order-item based tracking)
+                        input_tokens = 0
+                        output_tokens = 0
+                        processing_time = None
+                        status = None
+
+                        if isinstance(result, dict):
+                            input_tokens = int(result.get("input_tokens") or 0)
+                            output_tokens = int(result.get("output_tokens") or 0)
+                            processing_time = result.get("processing_time")
+                            status_updates = result.get("status_updates") or {}
+                            status = status_updates.get("status")
+
+                        api_usage = ApiUsage(
+                            item_id=item_id,
+                            input_token_count=input_tokens,
+                            output_token_count=output_tokens,
+                            processing_time_seconds=processing_time,
+                            status=status,
+                            model=model_name,
+                            api_call_timestamp=datetime.utcnow(),
+                        )
+                        db.add(api_usage)
+
+                        # Clean result data - only keep business data for downstream mapping
                         if isinstance(result, dict):
                             text_content = result.get("text", "")
                             if text_content:
                                 try:
-                                    business_data = json.loads(text_content)
-                                    business_data["__filename"] = file_record.file_name
-                                    business_data["__is_primary"] = is_primary_file  # Mark if primary file
-                                    # Add file-level metadata for AWB items
-                                    if is_awb:
+                                    parsed = json.loads(text_content)
+
+                                    # Normalise Gemini response so that both dict and list
+                                    # payloads are supported. This allows prompts that return
+                                    # an array of invoices instead of a single object.
+                                    if isinstance(parsed, dict):
+                                        candidates = [parsed]
+                                    elif isinstance(parsed, list):
+                                        # Ensure we always work with dictionaries downstream;
+                                        # wrap non-dict items so they do not crash mapping/CSV.
+                                        # NOTE: avoid shadowing the outer `item` (OcrOrderItem)
+                                        # by using a distinct loop variable.
+                                        candidates = []
+                                        for idx, parsed_item in enumerate(parsed):
+                                            if isinstance(parsed_item, dict):
+                                                candidates.append(parsed_item)
+                                            else:
+                                                candidates.append(
+                                                    {
+                                                        "__value": parsed_item,
+                                                        "__index": idx,
+                                                    }
+                                                )
+                                    else:
+                                        candidates = [
+                                            {
+                                                "__value": parsed,
+                                            }
+                                        ]
+
+                                    for idx, business_data in enumerate(candidates):
+                                        business_data["__filename"] = file_record.file_name
+                                        business_data["__is_primary"] = is_primary_file  # Mark if primary file
+                                        # Preserve index when we normalised from a list so that
+                                        # downstream consumers can tell multiple records apart.
+                                        if "__index" not in business_data and len(candidates) > 1:
+                                            business_data["__index"] = idx
+
+                                        # Add file-level metadata so we can reconstruct per-file
+                                        # results (for attachment downloads) regardless of doc type.
                                         business_data["__file_id"] = file_record.file_id
                                         business_data["__source_path"] = file_record.file_path
-                                    all_results.append(business_data)
+
+                                        all_results.append(business_data)
+
                                 except json.JSONDecodeError:
                                     error_result = {
                                         "text": text_content,
                                         "__filename": file_record.file_name,
-                                        "__is_primary": is_primary_file
+                                        "__is_primary": is_primary_file,
+                                        "__file_id": file_record.file_id,
+                                        "__source_path": file_record.file_path,
                                     }
-                                    if is_awb:
-                                        error_result["__file_id"] = file_record.file_id
-                                        error_result["__source_path"] = file_record.file_path
                                     all_results.append(error_result)
                             else:
                                 no_content_result = {
                                     "__filename": file_record.file_name,
                                     "__error": "No text content in result",
-                                    "__is_primary": is_primary_file
+                                    "__is_primary": is_primary_file,
+                                    "__file_id": file_record.file_id,
+                                    "__source_path": file_record.file_path,
                                 }
-                                if is_awb:
-                                    no_content_result["__file_id"] = file_record.file_id
-                                    no_content_result["__source_path"] = file_record.file_path
                                 all_results.append(no_content_result)
 
                     except Exception as e:
                         logger.error(f"Error processing file {file_record.file_name}: {str(e)}")
+
+                        # Record a failed API usage entry for this file attempt
+                        api_usage = ApiUsage(
+                            item_id=item_id,
+                            input_token_count=0,
+                            output_token_count=0,
+                            processing_time_seconds=None,
+                            status="error",
+                            model=model_name,
+                            api_call_timestamp=datetime.utcnow(),
+                        )
+                        db.add(api_usage)
+
                         error_result = {
                             "__filename": file_record.file_name,
                             "__error": f"Processing failed: {str(e)}",
@@ -1793,49 +1965,89 @@ class OrderProcessor:
             s3_base = f"results/orders/{item_id // 1000}/items/{item_id}"
             is_awb = doc_type_code == "AIRWAY_BILL"
 
-            # Separate primary file result from attachments
+            # Separate primary file result from attachments.
+            # - The *first* record marked as primary is treated as the canonical
+            #   primary_result for backward compatibility.
+            # - Any additional primary-marked records (e.g. multiple invoices
+            #   parsed from the same primary file) are stored in attachment_results
+            #   so that they still appear in CSV/aggregated JSON.
             primary_result = None
             attachment_results = []
             for result in results:
-                if result.get("__is_primary", False):
+                if result.get("__is_primary", False) and primary_result is None:
                     primary_result = result
                 else:
                     attachment_results.append(result)
 
-            # For AWB items, save file-level results
+            # For AWB items, save file-level results (legacy behaviour used by AWB mapping)
             file_results_map = {}
             if is_awb:
                 for result in results:
                     if "__file_id" in result:
                         file_id = result["__file_id"]
                         file_name = result.get("__filename", "unknown")
-                        # Save file-level result
+                        # Save file-level result (single record per file for AWB)
                         file_result_path = await self._save_file_result(item_id, file_id, file_name, result)
                         if file_result_path:
                             file_results_map[file_id] = file_result_path
 
-                # Generate manifest for file results
+                # Generate manifest for file results (AWB only)
                 if file_results_map:
                     await self._generate_file_results_manifest(item_id, file_results_map)
-
-            # Save JSON results (save primary file result separately if available)
-            json_path = None
-            if primary_result:
-                # Save primary file result
-                json_content = json.dumps(primary_result, indent=2, ensure_ascii=False)
-                json_s3_key = f"{s3_base}/item_{item_id}_primary.json"
-                json_upload_success = self.s3_manager.upload_file(json_content.encode('utf-8'), json_s3_key)
-
-                if json_upload_success:
-                    json_path = f"s3://{self.s3_manager.bucket_name}/{self.s3_manager.upload_prefix}{json_s3_key}"
             else:
-                # No primary file, save aggregated results for backward compatibility
-                json_content = json.dumps(attachment_results if attachment_results else results, indent=2, ensure_ascii=False)
-                json_s3_key = f"{s3_base}/item_{item_id}_results.json"
-                json_upload_success = self.s3_manager.upload_file(json_content.encode('utf-8'), json_s3_key)
+                # For non-AWB items, aggregate results per file so that each attachment
+                # has its own JSON/CSV containing all invoices from that image.
+                per_file_results: Dict[int, List[Dict[str, Any]]] = {}
+                for result in results:
+                    file_id = result.get("__file_id")
+                    if file_id is None:
+                        continue
+                    per_file_results.setdefault(int(file_id), []).append(result)
 
-                if json_upload_success:
-                    json_path = f"s3://{self.s3_manager.bucket_name}/{self.s3_manager.upload_prefix}{json_s3_key}"
+                for file_id, file_records in per_file_results.items():
+                    file_name = None
+                    for r in file_records:
+                        name = r.get("__filename")
+                        if name:
+                            file_name = name
+                            break
+                    if not file_name:
+                        file_name = "unknown"
+
+                    # Save the list of records for this file. The helper accepts arbitrary
+                    # JSON-serialisable data, so a list is fine.
+                    await self._save_file_result(item_id, file_id, file_name, file_records)
+
+            # Save JSON results:
+            # - Primary-only JSON for backward compatibility and mapping (if primary exists)
+            # - Aggregated JSON (all files) for combined result downloads
+            json_path = None
+
+            if primary_result:
+                # Save primary file result (used by existing mapping and header preview logic)
+                primary_json_content = json.dumps(primary_result, indent=2, ensure_ascii=False)
+                primary_json_key = f"{s3_base}/item_{item_id}_primary.json"
+                primary_upload_success = self.s3_manager.upload_file(primary_json_content.encode('utf-8'), primary_json_key)
+
+                if primary_upload_success:
+                    json_path = f"s3://{self.s3_manager.bucket_name}/{self.s3_manager.upload_prefix}{primary_json_key}"
+
+                # Additionally, save aggregated results (primary + attachments) for combined JSON view
+                try:
+                    aggregated_json_content = json.dumps(results, indent=2, ensure_ascii=False)
+                    aggregated_json_key = f"{s3_base}/item_{item_id}_results.json"
+                    self.s3_manager.upload_file(aggregated_json_content.encode('utf-8'), aggregated_json_key)
+                except Exception as e:
+                    logger.warning(f"Failed to save aggregated JSON results for item {item_id}: {e}")
+            else:
+                # No primary file, keep existing behavior: save aggregated results only
+                aggregated_data = attachment_results if attachment_results else results
+                aggregated_json_content = json.dumps(aggregated_data, indent=2, ensure_ascii=False)
+                aggregated_json_key = f"{s3_base}/item_{item_id}_results.json"
+                aggregated_upload_success = self.s3_manager.upload_file(aggregated_json_content.encode('utf-8'), aggregated_json_key)
+
+                if aggregated_upload_success:
+                    json_path = f"s3://{self.s3_manager.bucket_name}/{self.s3_manager.upload_prefix}{aggregated_json_key}"
 
             # Generate CSV results using new mapping function
             csv_path = await self._generate_item_csv_quick(item_id, primary_result, attachment_results)
@@ -1883,36 +2095,62 @@ class OrderProcessor:
 
                 for item in completed_items:
                     try:
-                        # Download item results from S3
-                        if item.ocr_result_json_path.startswith('s3://'):
-                            s3_key = item.ocr_result_json_path.replace(f"s3://{self.s3_manager.bucket_name}/", "")
-                            if s3_key.startswith(self.s3_manager.upload_prefix):
-                                s3_key = s3_key[len(self.s3_manager.upload_prefix):]
+                        item_results_content = None
 
-                            item_results_content = self.s3_manager.download_file(s3_key)
-                            if item_results_content:
-                                loaded = json.loads(item_results_content.decode('utf-8'))
+                        # Prefer aggregated per-item JSON (primary + attachments, multi-invoice aware)
+                        try:
+                            aggregated_key = (
+                                f"results/orders/{item.item_id // 1000}/items/{item.item_id}/"
+                                f"item_{item.item_id}_results.json"
+                            )
+                            aggregated_stored_path = f"{self.s3_manager.upload_prefix}{aggregated_key}"
+                            item_results_content = self.s3_manager.download_file_by_stored_path(
+                                aggregated_stored_path
+                            )
+                        except Exception as agg_exc:
+                            logger.warning(
+                                f"Failed to load aggregated JSON for consolidation of item {item.item_id}: {agg_exc}"
+                            )
 
-                                # Normalise to a list of dicts
-                                if isinstance(loaded, dict):
-                                    item_results = [loaded]
-                                elif isinstance(loaded, list):
-                                    item_results = loaded
-                                else:
-                                    raise ValueError("Unexpected results JSON structure (must be object or array)")
+                        # Fallback to legacy primary-only JSON if aggregated is not available
+                        if not item_results_content and item.ocr_result_json_path:
+                            try:
+                                item_results_content = self.s3_manager.download_file_by_stored_path(
+                                    item.ocr_result_json_path
+                                )
+                            except Exception as primary_exc:
+                                logger.warning(
+                                    f"Failed to load primary JSON for consolidation of item {item.item_id}: {primary_exc}"
+                                )
 
-                                # Add item metadata to each result (defensive: only dicts)
-                                annotated = []
-                                for result in item_results:
-                                    if not isinstance(result, dict):
-                                        continue
-                                    result['__item_id'] = item.item_id
-                                    result['__item_name'] = item.item_name
-                                    result['__company'] = item.company.company_name if item.company else None
-                                    result['__doc_type'] = item.document_type.type_name if item.document_type else None
-                                    annotated.append(result)
+                        if not item_results_content:
+                            logger.warning(
+                                f"No JSON results found for consolidation of item {item.item_id}"
+                            )
+                            continue
 
-                                all_consolidated_results.extend(annotated)
+                        loaded = json.loads(item_results_content.decode('utf-8'))
+
+                        # Normalise to a list of dicts
+                        if isinstance(loaded, dict):
+                            item_results = [loaded]
+                        elif isinstance(loaded, list):
+                            item_results = loaded
+                        else:
+                            raise ValueError("Unexpected results JSON structure (must be object or array)")
+
+                        # Add item metadata to each result (defensive: only dicts)
+                        annotated = []
+                        for result in item_results:
+                            if not isinstance(result, dict):
+                                continue
+                            result['__item_id'] = item.item_id
+                            result['__item_name'] = item.item_name
+                            result['__company'] = item.company.company_name if item.company else None
+                            result['__doc_type'] = item.document_type.type_name if item.document_type else None
+                            annotated.append(result)
+
+                        all_consolidated_results.extend(annotated)
 
                     except Exception as e:
                         logger.error(f"Error loading results for item {item.item_id}: {str(e)}")
@@ -2049,6 +2287,15 @@ class OrderProcessor:
             if order.status not in {OrderStatus.OCR_COMPLETED, OrderStatus.MAPPING}:
                 logger.warning(
                     f"Order {order_id} must be in OCR_COMPLETED or MAPPING status (current: {order.status})"
+                )
+                return
+
+            # If there is no mapping configuration/default/template for this order,
+            # silently skip mapping-only processing instead of marking it as failed.
+            if not _order_requires_mapping(db, order):
+                logger.info(
+                    f"Order {order_id} has no applicable mapping templates/defaults/configs; "
+                    "skipping mapping-only processing"
                 )
                 return
 
@@ -2259,16 +2506,18 @@ class OrderProcessor:
             db.commit()
             # Broadcast final update to clients
             try:
-                can_remap = True
-                remap_count = sum(1 for it in [{"ocr": i.ocr_result_json_path} for i in db.query(OcrOrderItem).filter(OcrOrderItem.order_id == order_id).all()] if it["ocr"])  # lightweight count
-                await ws_broadcast(order_id, {
-                    "type": "order_update",
-                    "order_id": order_id,
-                    "status": order.status.value,
+                # Lightweight remap availability stats
+                items_with_ocr = db.query(OcrOrderItem).filter(OcrOrderItem.order_id == order_id).all()
+                remap_count = sum(1 for i in items_with_ocr if i.ocr_result_json_path)
+
+                extra = {
                     "final_report_paths": order.final_report_paths,
                     "remap_item_count": remap_count,
                     "can_remap": remap_count > 0,
-                })
+                }
+                payload = build_order_update_payload(order, db, extra)
+                await ws_broadcast(order_id, payload)
+                await ws_broadcast_summary(payload)
             except Exception:
                 pass
     async def _load_expanded_ocr_results(self, order_id: int) -> List[Dict[str, Any]]:

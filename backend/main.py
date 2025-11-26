@@ -26,42 +26,26 @@ logger = logging.getLogger(__name__)
 
 
 def get_api_key_and_model() -> tuple[str, str]:
-    """獲取 API key 和模型名稱"""
-    if CONFIG_AVAILABLE:
-        try:
-            api_key_manager = get_api_key_manager()
-            api_key = api_key_manager.get_least_used_key()
+    """獲取 API key 和模型名稱（嚴格依賴 config_loader/env，並支持模型分層）。"""
+    if not CONFIG_AVAILABLE:
+        raise RuntimeError("Config loader not available")
+    try:
+        api_key = get_api_key_manager().get_least_used_key()
 
-            # 使用模型分層管理器獲取當前模型
+        # 優先使用模型分層管理器（GEMINI_MODEL_TIERS）
+        try:
             model_tier_manager = get_model_tier_manager()
             model_name = model_tier_manager.get_current_model()
-            return api_key, model_name
-        except Exception as e:
-            logger.error(f"Failed to get API key from config loader: {e}")
+        except Exception:
+            app_config = config_loader.get_app_config()
+            model_name = app_config.get("model_name")
 
-    # 備用方法：從環境變量獲取
-    api_key = (
-        os.getenv("GEMINI_API_KEY_1")
-        or os.getenv("GEMINI_API_KEY")
-        or os.getenv("API_KEY")
-    )
-    # 模型名稱優先從 GEMINI_MODEL_TIERS 的第一個獲取，否則回退到 MODEL_NAME
-    model_name = None
-    raw_tiers = os.getenv("GEMINI_MODEL_TIERS", "")
-    if raw_tiers:
-        for name in raw_tiers.split(","):
-            name = name.strip()
-            if name:
-                model_name = name
-                break
-
-    if not model_name:
-        model_name = os.getenv("MODEL_NAME", "gemini-2.5-flash-preview-05-20")
-
-    if not api_key:
-        raise ValueError("No Gemini API key found in environment variables or config")
-
-    return api_key, model_name
+        if not model_name:
+            raise ValueError("MODEL_NAME not configured")
+        return api_key, model_name
+    except Exception as e:
+        logger.error(f"Failed to get API key/model from config loader: {e}")
+        raise
 
 
 def configure_gemini_with_retry(api_key: str, max_retries: int = 3):
@@ -433,7 +417,7 @@ def get_response_schema(doc_type, provider_name):
 
 @api_error_handler
 async def extract_text_from_image(
-    image_path, enhanced_prompt, response_schema, api_key=None, model_name=None
+    image_path, enhanced_prompt, response_schema=None, api_key=None, model_name=None
 ):
     """
     Extract text from image using the enhanced pipeline (async version with retry).
@@ -448,13 +432,19 @@ async def extract_text_from_image(
     configure_gemini_with_retry(api_key)
 
     # Configure the model
+    generation_config_kwargs = {
+        "temperature": 0.3,
+        "top_p": 0.95,
+        "top_k": 40,
+        "response_mime_type": "application/json",
+    }
+    # Only include response_schema when provided to avoid API issues with None
+    if response_schema is not None:
+        generation_config_kwargs["response_schema"] = response_schema
+
     model = genai.GenerativeModel(
         model_name=model_name,
-        generation_config={
-            "temperature": 0.3,
-            "top_p": 0.95,
-            "top_k": 40,
-        },
+        generation_config=genai.GenerationConfig(**generation_config_kwargs),
     )
     # Start timing
     start_time = time.time()
@@ -472,10 +462,6 @@ async def extract_text_from_image(
         response = await asyncio.to_thread(
             model.generate_content,
             contents=[enhanced_prompt, processed_image],
-            generation_config=genai.GenerationConfig(
-                response_mime_type="application/json",
-                response_schema=response_schema,
-            ),
         )
         # Calculate processing time
         processing_time = time.time() - start_time
@@ -516,7 +502,7 @@ async def extract_text_from_image(
 
 @api_error_handler
 async def extract_text_from_pdf(
-    pdf_path, enhanced_prompt, response_schema, api_key=None, model_name=None
+    pdf_path, enhanced_prompt, response_schema=None, api_key=None, model_name=None
 ):
     """
     Extract text directly from PDF using Gemini API (async version with retry).
@@ -534,13 +520,19 @@ async def extract_text_from_pdf(
         pdf_data = f.read()
 
     # Configure the model
+    generation_config_kwargs = {
+        "temperature": 0.3,
+        "top_p": 0.95,
+        "top_k": 40,
+        "response_mime_type": "application/json",
+    }
+    # Only include response_schema when provided
+    if response_schema is not None:
+        generation_config_kwargs["response_schema"] = response_schema
+
     model = genai.GenerativeModel(
         model_name=model_name,
-        generation_config={
-            "temperature": 0.3,
-            "top_p": 0.95,
-            "top_k": 40,
-        },
+        generation_config=genai.GenerationConfig(**generation_config_kwargs),
     )
 
     # Start timing
@@ -560,10 +552,6 @@ async def extract_text_from_pdf(
                 enhanced_prompt,
                 {"mime_type": "application/pdf", "data": pdf_data},
             ],
-            generation_config=genai.GenerationConfig(
-                response_mime_type="application/json",
-                response_schema=response_schema,
-            ),
         )
 
         # Calculate processing time

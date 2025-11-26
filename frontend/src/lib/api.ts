@@ -34,32 +34,6 @@ export interface Config {
   updated_at: string;
 }
 
-// Renamed from File to FileInfo to avoid conflict with the browser's File type
-export interface FileInfo {
-  file_id: number;
-  file_name: string;
-  file_path: string;
-  file_category: string;
-  file_size: number;
-  file_type: string;
-  created_at: string;
-}
-
-export interface Job {
-  job_id: number;
-  company_id: number;
-  company_name?: string;
-  doc_type_id: number;
-  type_name?: string;
-  status: string;
-  original_filename: string;
-  error_message?: string;
-  created_at: string;
-  updated_at: string;
-  files?: FileInfo[];
-}
-
-
 // Base API URL - use Next.js proxy path to avoid CORS issues
 const API_BASE_URL = '/api';
 
@@ -114,16 +88,6 @@ export async function fetchApi<T>(url: string, options?: RequestInit): Promise<T
   }
 
   return response.json();
-}
-
-// Exposed API functions that match the existing frontend usage
-export async function fetchJobStatus(jobId: number): Promise<Job> {
-  return fetchApi<Job>(`/jobs/${jobId}`);
-}
-
-export async function fetchJobFiles(jobId: number): Promise<FileInfo[]> { // Updated return type
-  const job = await fetchApi<Job>(`/jobs/${jobId}`);
-  return job.files || [];
 }
 
 export function getFileDownloadUrl(fileId: number): string {
@@ -209,91 +173,18 @@ export const configsApi = {
     }),
 };
 
-// File upload API - Fixed parameter type to use browser's File type instead of our FileInfo
-export async function uploadFile(file: globalThis.File, path: string): Promise<{ file_path: string }> {
+// File upload API - shared helper for configs, etc.
+export async function uploadFile(file: globalThis.File, path: string): Promise<string> {
   const formData = new FormData();
-  formData.append('file', file); // This will work correctly now
+  formData.append('file', file);
   formData.append('path', path);
 
-  return fetchApi<{ file_path: string }>('/upload', {
+  const res = await fetchApi<{ file_path: string }>('/upload', {
     method: 'POST',
     body: formData,
   });
-}
 
-// WebSocket connection
-export function connectWebSocket(jobId: number, onMessage: (data: unknown) => void) {
-  // Derive WS base from configured HTTP API URL to avoid using the Next.js PORT (3000)
-  const httpBase = (process.env.NEXT_PUBLIC_API_URL || process.env.API_BASE_URL || 'http://localhost:8000');
-  const apiUrl = new URL(httpBase);
-  const wsProtocol = apiUrl.protocol === 'https:' ? 'wss:' : 'ws:';
-  const wsBase = `${wsProtocol}//${apiUrl.host}`;
-  const socket = new WebSocket(`${wsBase}/ws/${jobId}`);
-  socket.onopen = () => {
-    console.log(`WebSocket connection established for job ${jobId}`);
-  };
-
-  socket.onmessage = (event) => {
-    try {
-      const data = JSON.parse(event.data);
-      onMessage(data);
-    } catch (error) {
-      console.error('Error parsing WebSocket message:', error);
-    }
-  };
-
-  socket.onerror = (error) => {
-    console.error('WebSocket error:', error);
-  };
-
-  socket.onclose = () => {
-    console.log(`WebSocket connection closed for job ${jobId}`);
-  };
-
-  return {
-    close: () => socket.close(),
-  };
-}
-
-// Download file
-export async function downloadFile(fileId: number): Promise<Blob> {
-  const response = await fetch(`${API_BASE_URL}/download/${fileId}`);
-
-  if (!response.ok) {
-    throw new Error(`Download failed: ${response.status}`);
-  }
-
-  return response.blob();
-}
-
-// Fetch file content for preview
-export async function fetchFilePreview(fileId: number): Promise<unknown> {
-  const response = await fetch(`${API_BASE_URL}/download/${fileId}`);
-
-  if (!response.ok) {
-    throw new Error(`Preview failed: ${response.status}`);
-  }
-
-  // Get the content type to determine how to parse the file
-  const contentType = response.headers.get('content-type') || '';
-  
-  if (contentType.includes('application/json') || contentType.includes('text/plain')) {
-    const text = await response.text();
-    try {
-      return JSON.parse(text);
-    } catch {
-      return text;
-    }
-  } else if (contentType.includes('application/vnd.openxmlformats-officedocument.spreadsheetml.sheet') || 
-             contentType.includes('application/vnd.ms-excel')) {
-    // For Excel files, we'll need to parse them differently
-    // For now, return an indication that it's an Excel file
-    const blob = await response.blob();
-    return { type: 'excel', blob };
-  } else {
-    // For other file types, return as text
-    return await response.text();
-  }
+  return res.file_path;
 }
 
 // Dependency Management Interfaces

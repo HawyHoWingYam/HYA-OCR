@@ -1,14 +1,51 @@
 'use client';
 
 import { useState, useEffect, useRef } from 'react';
-import { useRouter } from 'next/navigation';
 import Image from 'next/image';
 import { fetchDocumentTypes, fetchCompaniesForDocType } from '@/lib/api';
 import type { DocumentType, Company } from '@/lib/api';
 import { MdZoomIn, MdZoomOut, MdRefresh } from 'react-icons/md';
 
+type BatchOcrSummary = {
+  company_id: number;
+  company_code: string;
+  doc_type_id: number;
+  doc_type_code: string;
+  total_files: number;
+  processed_files: number;
+  failed_files: number;
+};
+
+type BatchOcrFileResult = {
+  index: number;
+  filename: string;
+  content_type?: string | null;
+  data: unknown;
+  input_tokens?: number | null;
+  output_tokens?: number | null;
+  processing_time?: number | null;
+  status_updates?: unknown;
+};
+
+type BatchOcrError = {
+  index: number;
+  filename: string;
+  error: string;
+};
+
+type BatchOcrCsvInfo = {
+  filename: string;
+  content: string;
+};
+
+type BatchOcrResponse = {
+  summary: BatchOcrSummary;
+  results: BatchOcrFileResult[];
+  errors: BatchOcrError[];
+  csv: BatchOcrCsvInfo;
+};
+
 export default function Upload() {
-  const router = useRouter();
   const [documentTypes, setDocumentTypes] = useState<DocumentType[]>([]);
   const [selectedType, setSelectedType] = useState<number | null>(null);
   const [companies, setCompanies] = useState<Company[]>([]);
@@ -19,6 +56,7 @@ export default function Upload() {
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [zoomLevel, setZoomLevel] = useState(1);
   const [isLoading, setIsLoading] = useState(false);
+  const [batchResult, setBatchResult] = useState<BatchOcrResponse | null>(null);
   const fileUrlRef = useRef<string | null>(null);
 
   const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB in bytes
@@ -205,94 +243,30 @@ export default function Upload() {
 
     setIsLoading(true);
     setError(null);
+    setBatchResult(null);
 
     try {
-      // 1. Create OCR Order
-      const orderResp = await fetch('/api/orders', {
+      // Build form data for batch OCR endpoint
+      const formData = new FormData();
+      for (const file of files) {
+        formData.append('files', file);
+      }
+
+      formData.append('company_id', String(selectedCompany));
+      formData.append('doc_type_id', String(selectedType));
+
+      const response = await fetch('/api/ocr/batch', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          order_name: `Upload ${new Date().toISOString()}`,
-          primary_doc_type_id: selectedType
-        })
+        body: formData,
       });
 
-      if (!orderResp.ok) {
-        throw new Error('Failed to create order');
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(errorText || 'Failed to process batch OCR');
       }
 
-      const orderData = await orderResp.json();
-      const orderId = orderData.order_id;
-      console.log('Created order:', orderId);
-
-      // 2. Upload files and create order items
-      const uploadedFiles = [];
-
-      for (const file of files) {
-        // Upload file to backend
-        const uploadFormData = new FormData();
-        uploadFormData.append('file', file);
-
-        const uploadResp = await fetch('/api/upload', {
-          method: 'POST',
-          body: uploadFormData
-        });
-
-        if (!uploadResp.ok) {
-          console.warn(`Failed to upload file ${file.name}`);
-          continue;
-        }
-
-        const uploadedData = await uploadResp.json();
-        uploadedFiles.push({
-          file_id: uploadedData.file_id,
-          original_name: file.name
-        });
-      }
-
-      if (uploadedFiles.length === 0) {
-        throw new Error('No files uploaded successfully');
-      }
-
-      // 3. Create order items and attach files
-      for (const uploadedFile of uploadedFiles) {
-        // Create order item
-        const itemResp = await fetch(`/api/orders/${orderId}/items`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            company_id: selectedCompany,
-            doc_type_id: selectedType,
-            item_name: uploadedFile.original_name
-          })
-        });
-
-        if (!itemResp.ok) {
-          console.warn(`Failed to create item for ${uploadedFile.original_name}`);
-          continue;
-        }
-
-        const itemData = await itemResp.json();
-        const itemId = itemData.item_id;
-
-        // Attach file to item
-        const attachResp = await fetch(`/api/orders/${orderId}/items/${itemId}/files`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ file_id: uploadedFile.file_id })
-        });
-
-        if (!attachResp.ok) {
-          console.warn(`Failed to attach file to item ${itemId}`);
-        }
-      }
-
-      // 4. Order-level mapping file workflow has been removed (per-item config is used instead)
-
-      console.log('Order setup completed successfully');
-
-      // 5. Redirect to orders page
-      router.push(`/orders/${orderId}`);
+      const data: BatchOcrResponse = await response.json();
+      setBatchResult(data);
 
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to start upload');
@@ -505,6 +479,85 @@ export default function Upload() {
           </button>
         </div>
       </form>
+
+      {/* Batch OCR Results */}
+      {batchResult && (
+        <div className="mt-8">
+          <h2 className="text-xl font-semibold mb-4">OCR Results</h2>
+
+          <div className="mb-4 p-4 bg-gray-50 border rounded">
+            <p className="text-sm text-gray-700">
+              Company: <span className="font-medium">{batchResult.summary.company_code}</span> ·
+              Document Type: <span className="font-medium ml-1">{batchResult.summary.doc_type_code}</span>
+            </p>
+            <p className="text-sm text-gray-700 mt-1">
+              Files: <span className="font-medium">{batchResult.summary.processed_files}</span> processed /
+              <span className="font-medium ml-1">{batchResult.summary.total_files}</span> total
+              {batchResult.summary.failed_files > 0 && (
+                <span className="text-red-600 ml-2">
+                  ({batchResult.summary.failed_files} failed)
+                </span>
+              )}
+            </p>
+
+            <div className="mt-3">
+              <button
+                type="button"
+                onClick={() => {
+                  const blob = new Blob([batchResult.csv.content], {
+                    type: 'text/csv;charset=utf-8;',
+                  });
+                  const url = URL.createObjectURL(blob);
+                  const link = document.createElement('a');
+                  link.href = url;
+                  link.setAttribute('download', batchResult.csv.filename || 'batch_ocr.csv');
+                  document.body.appendChild(link);
+                  link.click();
+                  document.body.removeChild(link);
+                  URL.revokeObjectURL(url);
+                }}
+                className="inline-flex items-center px-4 py-2 bg-green-600 text-white text-sm font-medium rounded hover:bg-green-700"
+              >
+                Download CSV
+              </button>
+            </div>
+          </div>
+
+          {batchResult.errors.length > 0 && (
+            <div className="mb-4 p-4 bg-red-50 border border-red-200 rounded">
+              <h3 className="text-sm font-semibold text-red-700 mb-2">Errors</h3>
+              <ul className="text-sm text-red-700 list-disc list-inside space-y-1">
+                {batchResult.errors.map((errItem, idx) => (
+                  <li key={idx}>
+                    <span className="font-medium">{errItem.filename}</span>: {errItem.error}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          {batchResult.results.length > 0 && (
+            <div className="space-y-4">
+              {batchResult.results.map((result) => (
+                <div key={result.index} className="border rounded p-4 bg-white">
+                  <div className="flex justify-between items-center mb-2">
+                    <div>
+                      <p className="text-sm font-semibold text-gray-800">{result.filename}</p>
+                      <p className="text-xs text-gray-500">
+                        Index: {result.index}{' '}
+                        {result.processing_time != null && `· ${result.processing_time.toFixed(2)}s`}
+                      </p>
+                    </div>
+                  </div>
+                  <pre className="mt-2 text-xs bg-gray-900 text-gray-100 rounded p-3 overflow-auto max-h-64">
+                    {JSON.stringify(result.data, null, 2)}
+                  </pre>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }

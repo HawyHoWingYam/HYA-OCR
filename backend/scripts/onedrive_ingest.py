@@ -9,7 +9,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from utils.onedrive_client import OneDriveClient
-from utils.s3_storage import S3StorageManager
+from utils.s3_storage import get_s3_manager
 from db.models import File, OneDriveSync
 
 # Configure logging
@@ -300,8 +300,9 @@ def run_onedrive_sync(month: str = None, force: bool = False, reconcile: bool = 
             target_user_upn=ONEDRIVE_TARGET_USER_UPN  # NEW: App-only access to target user
         )
 
-        s3_bucket = os.getenv('S3_BUCKET_NAME', 'hya-ocr-sandbox')
-        s3_manager = S3StorageManager(bucket_name=s3_bucket)
+        s3_manager = get_s3_manager()
+        if not s3_manager:
+            raise Exception("S3 storage not available (ensure STORAGE_BACKEND=s3 and S3 env vars are set)")
 
         # Connect to OneDrive
         if not onedrive_client.connect():

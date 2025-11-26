@@ -1,5 +1,6 @@
 """OneDrive integration client using O365 library"""
 import logging
+import os
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 from O365 import Account
@@ -42,7 +43,10 @@ class OneDriveClient:
         self.drive = None
 
     def connect(self) -> bool:
-        """Authenticate and establish connection"""
+        """Authenticate and establish connection.
+
+        Returns False on any auth failure instead of logging misleading success.
+        """
         try:
             credentials = (self.client_id, self.client_secret)
 
@@ -53,9 +57,13 @@ class OneDriveClient:
                 tenant_id=self.tenant_id
             )
 
-            # Authenticate
+            # Authenticate (client credentials flow)
+            # Some O365 versions may not raise on failure; verify the final auth state explicitly.
             if not self.account.is_authenticated:
-                self.account.authenticate()
+                auth_ok = self.account.authenticate()
+                if not auth_ok or not self.account.is_authenticated:
+                    logger.error("❌ OneDrive authentication failed (check client id/secret and app permissions)")
+                    return False
 
             # Get storage for specific user (app-only) or default (delegated auth)
             if self.target_user_upn:
@@ -67,7 +75,12 @@ class OneDriveClient:
                 self.storage = self.account.storage()
                 logger.info("✅ Connected to OneDrive (default drive)")
 
+            # Obtain default drive; fail fast if unavailable
             self.drive = self.storage.get_default_drive()
+            if not self.drive:
+                logger.error("❌ Failed to obtain OneDrive drive object (authentication/storage not ready)")
+                return False
+
             logger.info("✅ Successfully obtained drive object")
             return True
 
@@ -395,3 +408,46 @@ class OneDriveClient:
                 logger.info("✅ OneDrive client closed")
             except Exception as e:
                 logger.warning(f"⚠️ Error closing client: {str(e)}")
+
+
+def build_client_from_env() -> Optional[OneDriveClient]:
+    """Build a OneDriveClient from standard environment variables.
+
+    This helper centralises how we construct the client so that scripts and
+    background jobs can share the same logic.
+    """
+    client_id = os.getenv("ONEDRIVE_CLIENT_ID")
+    client_secret = os.getenv("ONEDRIVE_CLIENT_SECRET")
+    tenant_id = os.getenv("ONEDRIVE_TENANT_ID")
+    target_user_upn = os.getenv("ONEDRIVE_TARGET_USER_UPN")
+
+    if not client_id or not client_secret or not tenant_id:
+        logger.error(
+            "❌ Missing OneDrive credentials in environment "
+            "(ONEDRIVE_CLIENT_ID / ONEDRIVE_CLIENT_SECRET / ONEDRIVE_TENANT_ID)"
+        )
+        return None
+
+    return OneDriveClient(
+        client_id=client_id,
+        client_secret=client_secret,
+        tenant_id=tenant_id,
+        target_user_upn=target_user_upn,
+    )
+
+
+def normalise_onedrive_path(path: str) -> str:
+    """Normalise an internal OneDrive path (no leading/trailing slashes)."""
+    return (path or "").strip().strip("/")
+
+
+def join_onedrive_path(*parts: str) -> str:
+    """Join path components into a canonical OneDrive path."""
+    cleaned = [normalise_onedrive_path(p) for p in parts if p is not None]
+    cleaned = [c for c in cleaned if c]
+    return "/".join(cleaned)
+
+
+def path_basename(path: str) -> str:
+    """Return last component of a OneDrive path."""
+    return normalise_onedrive_path(path).split("/")[-1] if path else ""

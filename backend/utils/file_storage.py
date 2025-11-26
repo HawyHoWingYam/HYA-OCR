@@ -16,40 +16,18 @@ class FileStorageService:
     """统一的文件存储服务，支持本地存储和S3存储"""
 
     def __init__(self):
-        self.s3_manager = get_s3_manager()
+        # 決策依據環境變數，不做靜默回退
         self.use_s3 = is_s3_enabled()
+        self.s3_manager = get_s3_manager() if self.use_s3 else None
 
-        def _resolve_path(env_key: str, default_path: Path) -> Path:
-            value = os.getenv(env_key)
-            candidate = Path(value) if value else default_path
-            return candidate.expanduser().resolve()
+        # 本地存儲根目錄必須由環境變數提供
+        self.local_upload_dir = os.getenv("LOCAL_UPLOAD_DIR")
+        if not self.use_s3:
+            if not self.local_upload_dir or not self.local_upload_dir.strip():
+                raise ValueError("LOCAL_UPLOAD_DIR must be set when STORAGE_BACKEND=local")
+            os.makedirs(self.local_upload_dir, exist_ok=True)
 
-        default_storage_root = Path(__file__).resolve().parents[2] / "storage"
-        self.storage_root = _resolve_path("LOCAL_STORAGE_ROOT", default_storage_root)
-        self.local_upload_dir = _resolve_path("LOCAL_UPLOAD_DIR", self.storage_root / "upload")
-        self.local_orders_dir = _resolve_path("LOCAL_ORDERS_DIR", self.local_upload_dir / "orders")
-        self.local_image_dir = _resolve_path("LOCAL_UPLOAD_IMAGE_DIR", self.local_upload_dir / "images")
-        self.local_pdf_dir = _resolve_path("LOCAL_UPLOAD_PDF_DIR", self.local_upload_dir / "pdfs")
-        self.local_results_dir = _resolve_path("LOCAL_RESULTS_DIR", self.storage_root / "results")
-        self.local_result_json_dir = _resolve_path("LOCAL_RESULT_JSON_DIR", self.local_results_dir / "json")
-        self.local_result_csv_dir = _resolve_path("LOCAL_RESULT_CSV_DIR", self.local_results_dir / "csv")
-
-        paths_to_ensure = {
-            self.storage_root,
-            self.local_upload_dir,
-            self.local_orders_dir,
-            self.local_image_dir,
-            self.local_pdf_dir,
-            self.local_results_dir,
-            self.local_result_json_dir,
-            self.local_result_csv_dir,
-        }
-        for path in paths_to_ensure:
-            path.mkdir(parents=True, exist_ok=True)
-
-        logger.info(
-            f"📁 文件存储服务初始化完成，使用{'S3' if self.use_s3 else '本地'}存储"
-        )
+        logger.info(f"📁 文件存储服务初始化完成，使用{'S3' if self.use_s3 else '本地'}存储")
 
     def save_uploaded_file(
         self,
@@ -163,12 +141,13 @@ class FileStorageService:
             unique_id = uuid.uuid4().hex[:8]
             safe_filename = filename.replace(" ", "_")
 
-            order_dir = self.local_orders_dir / str(order_id) / "items" / str(item_id)
-            order_dir.mkdir(parents=True, exist_ok=True)
+            # Use configured local upload base directory
+            order_dir = os.path.join(self.local_upload_dir, "orders", str(order_id), "items", str(item_id))
+            os.makedirs(order_dir, exist_ok=True)
 
             # Generate file path
             local_filename = f"{timestamp}_{unique_id}_{safe_filename}"
-            file_path = order_dir / local_filename
+            file_path = os.path.join(order_dir, local_filename)
 
             # Save file
             with open(file_path, "wb") as buffer:
@@ -314,12 +293,13 @@ class FileStorageService:
             unique_id = uuid.uuid4().hex[:8]
             safe_filename = filename.replace(" ", "_")
 
-            mapping_dir = self.local_orders_dir / str(order_id) / "mapping"
-            mapping_dir.mkdir(parents=True, exist_ok=True)
+            # Use configured local upload base directory
+            mapping_dir = os.path.join(self.local_upload_dir, "orders", str(order_id), "mapping")
+            os.makedirs(mapping_dir, exist_ok=True)
 
             # Generate file path
             local_filename = f"{timestamp}_{unique_id}_{safe_filename}"
-            file_path = mapping_dir / local_filename
+            file_path = os.path.join(mapping_dir, local_filename)
 
             # Save file
             with open(file_path, "wb") as buffer:

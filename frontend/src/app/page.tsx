@@ -19,26 +19,12 @@ export default function Home() {
             📦 OCR Orders
           </Link>
 
-          {/* <Link
-            href="/awb/monthly"
-            className="bg-purple-600 text-white py-3 px-6 rounded-lg text-center font-medium hover:bg-purple-700 transition-colors"
-          >
-            📄 AWB 月度處理
-          </Link> */}
-
-          {/* <Link
-            href="/upload"
-            className="bg-blue-600 text-white py-3 px-6 rounded-lg text-center font-medium hover:bg-blue-700 transition-colors"
-          >
-            Upload New Documents
-          </Link>
-
           <Link
-            href="/jobs"
-            className="bg-slate-200 text-slate-800 py-3 px-6 rounded-lg text-center font-medium hover:bg-slate-300 transition-colors"
+            href="/ocr-schedules"
+            className="bg-green-600 text-white py-3 px-6 rounded-lg text-center font-medium hover:bg-green-700 transition-colors"
           >
-            View Processing Batches
-          </Link> */}
+            🕒 OCR Schedules
+          </Link>
 
           <Link
             href="/admin"

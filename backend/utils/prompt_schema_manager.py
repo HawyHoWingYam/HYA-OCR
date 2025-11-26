@@ -216,8 +216,23 @@ class PromptSchemaManager:
         # 初始化数据库会话（用于查询配置路径）
         self.db_session = None
         
-        # 初始化组件
-        self.s3_manager = get_s3_manager()
+        # 初始化存储后端
+        backend = self.config.get("storage_backend", "auto")
+        self.storage_backend = backend
+        # 仅在 STORAGE_BACKEND=s3 且启用时，初始化 S3 管理器
+        self.s3_manager = get_s3_manager() if backend == "s3" and is_s3_enabled() else None
+        self.local_root: Optional[Path] = None
+        if not self.s3_manager:
+            local_base = os.getenv("LOCAL_UPLOAD_DIR")
+            if local_base:
+                self.local_root = Path(local_base) / "prompt_schema"
+                try:
+                    self.local_root.mkdir(parents=True, exist_ok=True)
+                except Exception as e:
+                    logger.error(f"❌ 初始化本地 prompt/schema 根目录失败: {e}")
+                    self.local_root = None
+            else:
+                logger.info("ℹ️ LOCAL_UPLOAD_DIR 未设置，本地 prompt/schema 存储不可用")
         
         # 根据配置决定是否启用缓存
         cache_config = self.config.get("cache", {})
@@ -235,43 +250,16 @@ class PromptSchemaManager:
         performance_config = self.config.get("performance", {})
         thread_pool_size = performance_config.get("thread_pool_size", 4)
         self.executor = ThreadPoolExecutor(max_workers=thread_pool_size)
-        
-        # 本地备份路径（可通过环境变量覆盖，兼容多系统路径）
-        backup_config = self.config.get("local_backup", {})
-        backup_path = Path(str(backup_config.get("path", "uploads/prompt_schema_backup")))
-        storage_root_env = os.getenv("LOCAL_STORAGE_ROOT")
-        storage_root = Path(storage_root_env) if storage_root_env else backup_path
-        self.local_backup_path = storage_root.expanduser().resolve()
 
-        def _resolve_local_path(env_key: str, default_path: Path) -> Path:
-            value = os.getenv(env_key)
-            candidate = Path(value) if value else default_path
-            return candidate.expanduser().resolve()
-
-        self.prompt_local_path = _resolve_local_path(
-            "PROMPT_LOCAL_PATH", self.local_backup_path / "prompts"
-        )
-        self.schema_local_path = _resolve_local_path(
-            "SCHEMA_LOCAL_PATH", self.local_backup_path / "schemas"
-        )
-
-        if backup_config.get("enabled", True):
-            for path in {
-                self.local_backup_path,
-                self.prompt_local_path,
-                self.schema_local_path,
-            }:
-                path.mkdir(parents=True, exist_ok=True)
-        
         # 更新验证器配置
         validation_config = self.config.get("validation", {})
         self.validator.update_config(validation_config)
         
         logger.info("✅ PromptSchemaManager初始化完成")
-        logger.info(f"   - 存储后端: {self.config.get('storage_backend', 'auto')}")
-        logger.info(f"   - S3启用: {is_s3_enabled()}")
+        logger.info(f"   - 存储后端: {self.storage_backend}")
+        logger.info(f"   - S3启用: {self.s3_manager is not None}")
+        logger.info(f"   - 本地根目录: {self.local_root if self.local_root else 'disabled'}")
         logger.info(f"   - 缓存启用: {self.cache is not None}")
-        logger.info(f"   - 本地备份: {backup_config.get('enabled', True)}")
     
     def _get_default_config(self) -> dict:
         """获取默认配置"""
@@ -283,7 +271,6 @@ class PromptSchemaManager:
                 "prompt_prefix": "prompts/", "schema_prefix": "schemas/",
                 "auto_backup": True, "encryption": True
             },
-            "local_backup": {"enabled": True, "path": "uploads/prompt_schema_backup", "auto_sync": True},
             "validation": {
                 "strict_mode": True, "prompt_min_length": 10, "prompt_max_length": 50000,
                 "required_prompt_keywords": ["extract", "analyze", "identify", "process"],
@@ -294,50 +281,18 @@ class PromptSchemaManager:
                 "retry_attempts": 3, "timeout_seconds": 30
             }
         }
-    
-    def _get_local_path(self, company_code: str, doc_type_code: str, filename: str, file_type: str) -> Path:
-        """生成本地文件路径"""
-        base_dir = self.prompt_local_path if file_type == "prompt" else self.schema_local_path
-        return base_dir / company_code / doc_type_code / filename
-    
-    def _save_local_backup(self, company_code: str, doc_type_code: str, filename: str, 
-                          file_type: str, content: Union[str, dict]) -> bool:
-        """保存本地备份"""
-        try:
-            local_path = self._get_local_path(company_code, doc_type_code, filename, file_type)
-            local_path.parent.mkdir(parents=True, exist_ok=True)
-            
-            if file_type == "prompt":
-                local_path.write_text(content, encoding="utf-8")
-            else:  # schema
-                local_path.write_text(json.dumps(content, ensure_ascii=False, indent=2), encoding="utf-8")
-            
-            logger.debug(f"💾 本地备份已保存: {local_path}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"❌ 保存本地备份失败: {e}")
-            return False
-    
-    def _load_local_backup(self, company_code: str, doc_type_code: str, filename: str, 
-                          file_type: str) -> Optional[Union[str, dict]]:
-        """加载本地备份"""
-        try:
-            local_path = self._get_local_path(company_code, doc_type_code, filename, file_type)
-            
-            if not local_path.exists():
-                return None
-            
-            if file_type == "prompt":
-                content = local_path.read_text(encoding="utf-8")
-                return content
-            else:  # schema
-                content = local_path.read_text(encoding="utf-8")
-                return json.loads(content)
-                
-        except Exception as e:
-            logger.error(f"❌ 加载本地备份失败: {e}")
+
+    def _get_local_prompt_path(self, company_code: str, doc_type_code: str, filename: str) -> Optional[Path]:
+        """生成本地 prompt 文件路径"""
+        if not self.local_root:
             return None
+        return self.local_root / company_code / doc_type_code / "prompt" / filename
+
+    def _get_local_schema_path(self, company_code: str, doc_type_code: str, filename: str) -> Optional[Path]:
+        """生成本地 schema 文件路径"""
+        if not self.local_root:
+            return None
+        return self.local_root / company_code / doc_type_code / "schema" / filename
     
     def _get_db_session(self):
         """获取数据库会话"""
@@ -441,6 +396,7 @@ class PromptSchemaManager:
             # 2. 从数据库获取实际配置路径
             prompt_path, _ = self._get_config_paths(company_code, doc_type_code)
             
+            # S3 存储路径
             if prompt_path and self.s3_manager:
                 # 2a. 如果是S3路径，直接从S3读取
                 if prompt_path.startswith('s3://'):
@@ -461,13 +417,9 @@ class PromptSchemaManager:
                             # 缓存结果
                             if self.cache:
                                 self.cache.set(company_code, doc_type_code, "prompt", filename, content)
-                            
-                            # 保存本地备份
-                            self._save_local_backup(company_code, doc_type_code, filename, "prompt", content)
-                            
                             return content
                 
-                # 2b. 回退到旧的约定路径方式
+                # 2b. 回退到旧的约定路径方式（S3）
                 content = await asyncio.get_event_loop().run_in_executor(
                     self.executor,
                     self.s3_manager.get_prompt,
@@ -483,23 +435,39 @@ class PromptSchemaManager:
                     # 缓存结果
                     if self.cache:
                         self.cache.set(company_code, doc_type_code, "prompt", filename, content)
-                    
-                    # 保存本地备份
-                    self._save_local_backup(company_code, doc_type_code, filename, "prompt", content)
-                    
                     return content
-            
-            # 3. 回退到本地备份
-            content = self._load_local_backup(company_code, doc_type_code, filename, "prompt")
-            if content is not None:
-                logger.info(f"📂 使用本地备份prompt: {company_code}/{doc_type_code}/{filename}")
-                
-                # 缓存结果
-                if self.cache:
-                    self.cache.set(company_code, doc_type_code, "prompt", filename, content)
-                
-                return content
-            
+
+            # 本地存储：优先使用数据库中的路径，其次使用标准本地路径
+            if not self.s3_manager:
+                # 2c. 数据库存储的本地路径
+                try:
+                    if prompt_path and not prompt_path.startswith("s3://") and os.path.exists(prompt_path):
+                        with open(prompt_path, "r", encoding="utf-8") as f:
+                            content = f.read()
+                        is_valid, message = self.validator.validate_prompt(content)
+                        if not is_valid:
+                            logger.warning(f"⚠️ Prompt验证失败: {message}")
+                        if self.cache:
+                            self.cache.set(company_code, doc_type_code, "prompt", filename, content)
+                        return content
+                except Exception as e:
+                    logger.warning(f"⚠️ 使用数据库本地路径读取prompt失败: {e}")
+
+                # 2d. 约定结构下的本地路径
+                local_path = self._get_local_prompt_path(company_code, doc_type_code, filename)
+                if local_path and local_path.exists():
+                    try:
+                        content = local_path.read_text(encoding="utf-8")
+                        is_valid, message = self.validator.validate_prompt(content)
+                        if not is_valid:
+                            logger.warning(f"⚠️ Prompt验证失败: {message}")
+                        if self.cache:
+                            self.cache.set(company_code, doc_type_code, "prompt", filename, content)
+                        return content
+                    except Exception as e:
+                        logger.error(f"❌ 从本地路径读取prompt失败: {e}")
+                        return None
+
             logger.error(f"❌ 未找到prompt文件: {company_code}/{doc_type_code}/{filename}")
             return None
             
@@ -529,6 +497,7 @@ class PromptSchemaManager:
             # 2. 从数据库获取实际配置路径
             _, schema_path = self._get_config_paths(company_code, doc_type_code)
             
+            # S3 存储路径
             if schema_path and self.s3_manager:
                 # 2a. 如果是S3路径，直接从S3读取
                 if schema_path.startswith('s3://'):
@@ -549,13 +518,9 @@ class PromptSchemaManager:
                             # 缓存结果
                             if self.cache:
                                 self.cache.set(company_code, doc_type_code, "schema", filename, content)
-                            
-                            # 保存本地备份
-                            self._save_local_backup(company_code, doc_type_code, filename, "schema", content)
-                            
                             return content
                 
-                # 2b. 回退到旧的约定路径方式
+                # 2b. 回退到旧的约定路径方式（S3）
                 content = await asyncio.get_event_loop().run_in_executor(
                     self.executor,
                     self.s3_manager.get_schema,
@@ -571,23 +536,39 @@ class PromptSchemaManager:
                     # 缓存结果
                     if self.cache:
                         self.cache.set(company_code, doc_type_code, "schema", filename, content)
-                    
-                    # 保存本地备份
-                    self._save_local_backup(company_code, doc_type_code, filename, "schema", content)
-                    
                     return content
             
-            # 3. 回退到本地备份
-            content = self._load_local_backup(company_code, doc_type_code, filename, "schema")
-            if content is not None:
-                logger.info(f"📂 使用本地备份schema: {company_code}/{doc_type_code}/{filename}")
-                
-                # 缓存结果
-                if self.cache:
-                    self.cache.set(company_code, doc_type_code, "schema", filename, content)
-                
-                return content
-            
+            # 本地存储：优先使用数据库中的路径，其次使用标准本地路径
+            if not self.s3_manager:
+                try:
+                    if schema_path and not schema_path.startswith("s3://") and os.path.exists(schema_path):
+                        with open(schema_path, "r", encoding="utf-8") as f:
+                            raw = f.read()
+                        content = json.loads(raw)
+                        is_valid, message = self.validator.validate_schema(content)
+                        if not is_valid:
+                            logger.warning(f"⚠️ Schema验证失败: {message}")
+                        if self.cache:
+                            self.cache.set(company_code, doc_type_code, "schema", filename, content)
+                        return content
+                except Exception as e:
+                    logger.warning(f"⚠️ 使用数据库本地路径读取schema失败: {e}")
+
+                local_path = self._get_local_schema_path(company_code, doc_type_code, filename)
+                if local_path and local_path.exists():
+                    try:
+                        raw = local_path.read_text(encoding="utf-8")
+                        content = json.loads(raw)
+                        is_valid, message = self.validator.validate_schema(content)
+                        if not is_valid:
+                            logger.warning(f"⚠️ Schema验证失败: {message}")
+                        if self.cache:
+                            self.cache.set(company_code, doc_type_code, "schema", filename, content)
+                        return content
+                    except Exception as e:
+                        logger.error(f"❌ 从本地路径读取schema失败: {e}")
+                        return None
+
             logger.error(f"❌ 未找到schema文件: {company_code}/{doc_type_code}/{filename}")
             return None
             
@@ -617,8 +598,9 @@ class PromptSchemaManager:
                 logger.error(f"❌ Prompt验证失败: {message}")
                 return False
             
-            # 上传到S3
             success = False
+
+            # 上传到S3
             if self.s3_manager:
                 s3_key = await asyncio.get_event_loop().run_in_executor(
                     self.executor,
@@ -626,9 +608,20 @@ class PromptSchemaManager:
                     company_code, doc_type_code, content, filename, metadata
                 )
                 success = s3_key is not None
-            
-            # 保存本地备份（无论S3是否成功）
-            self._save_local_backup(company_code, doc_type_code, filename, "prompt", content)
+            else:
+                # 本地存储
+                local_path = self._get_local_prompt_path(company_code, doc_type_code, filename)
+                if not local_path:
+                    logger.error("❌ 本地 prompt 存储未配置（缺少 LOCAL_UPLOAD_DIR）")
+                    return False
+                try:
+                    local_path.parent.mkdir(parents=True, exist_ok=True)
+                    local_path.write_text(content, encoding="utf-8")
+                    logger.info(f"✅ Prompt 已保存到本地: {local_path}")
+                    success = True
+                except Exception as e:
+                    logger.error(f"❌ 本地保存prompt失败: {e}")
+                    success = False
             
             # 清除缓存
             if self.cache:
@@ -636,10 +629,10 @@ class PromptSchemaManager:
             
             if success:
                 logger.info(f"✅ Prompt上传成功: {company_code}/{doc_type_code}/{filename}")
+                return True
             else:
-                logger.warning(f"⚠️ S3上传失败，但本地备份已保存: {company_code}/{doc_type_code}/{filename}")
-            
-            return True  # 只要本地备份成功就认为成功
+                logger.error(f"❌ Prompt上传失败: {company_code}/{doc_type_code}/{filename}")
+                return False
             
         except Exception as e:
             logger.error(f"❌ 上传prompt失败: {e}")
@@ -667,8 +660,9 @@ class PromptSchemaManager:
                 logger.error(f"❌ Schema验证失败: {message}")
                 return False
             
-            # 上传到S3
             success = False
+
+            # 上传到S3
             if self.s3_manager:
                 s3_key = await asyncio.get_event_loop().run_in_executor(
                     self.executor,
@@ -676,9 +670,23 @@ class PromptSchemaManager:
                     company_code, doc_type_code, schema_data, filename, metadata
                 )
                 success = s3_key is not None
-            
-            # 保存本地备份（无论S3是否成功）
-            self._save_local_backup(company_code, doc_type_code, filename, "schema", schema_data)
+            else:
+                # 本地存储
+                local_path = self._get_local_schema_path(company_code, doc_type_code, filename)
+                if not local_path:
+                    logger.error("❌ 本地 schema 存储未配置（缺少 LOCAL_UPLOAD_DIR）")
+                    return False
+                try:
+                    local_path.parent.mkdir(parents=True, exist_ok=True)
+                    local_path.write_text(
+                        json.dumps(schema_data, ensure_ascii=False, indent=2),
+                        encoding="utf-8"
+                    )
+                    logger.info(f"✅ Schema 已保存到本地: {local_path}")
+                    success = True
+                except Exception as e:
+                    logger.error(f"❌ 本地保存schema失败: {e}")
+                    success = False
             
             # 清除缓存
             if self.cache:
@@ -686,10 +694,10 @@ class PromptSchemaManager:
             
             if success:
                 logger.info(f"✅ Schema上传成功: {company_code}/{doc_type_code}/{filename}")
+                return True
             else:
-                logger.warning(f"⚠️ S3上传失败，但本地备份已保存: {company_code}/{doc_type_code}/{filename}")
-            
-            return True  # 只要本地备份成功就认为成功
+                logger.error(f"❌ Schema上传失败: {company_code}/{doc_type_code}/{filename}")
+                return False
             
         except Exception as e:
             logger.error(f"❌ 上传schema失败: {e}")
@@ -700,20 +708,16 @@ class PromptSchemaManager:
         try:
             s3_status = self.s3_manager.get_health_status() if self.s3_manager else {"status": "disabled"}
             cache_stats = self.cache.get_stats() if self.cache else {"status": "disabled"}
-            
-            prompt_files = sum(1 for p in self.prompt_local_path.rglob("*") if p.is_file()) if self.prompt_local_path.exists() else 0
-            schema_files = sum(1 for p in self.schema_local_path.rglob("*") if p.is_file()) if self.schema_local_path.exists() else 0
-
-            return {
+            health = {
                 "status": "healthy",
                 "s3_storage": s3_status,
-                "cache": cache_stats,
-                "local_backup_path": str(self.local_backup_path),
-                "prompt_local_path": str(self.prompt_local_path),
-                "schema_local_path": str(self.schema_local_path),
-                "prompt_files_count": prompt_files,
-                "schema_files_count": schema_files,
+                "cache": cache_stats
             }
+            if self.local_root:
+                health["local_storage"] = {
+                    "path": str(self.local_root),
+                }
+            return health
             
         except Exception as e:
             return {
@@ -745,35 +749,40 @@ class PromptSchemaManager:
                 result["prompts"].extend(prompts)
                 result["schemas"].extend(schemas)
             
-            def _iter_company_dirs(base_dir: Path):
-                if not base_dir.exists():
-                    return []
-                entries = []
-                for company_dir in base_dir.iterdir():
-                    if not company_dir.is_dir() or (company_code and company_dir.name != company_code):
+            # 本地存储中的模板
+            if self.local_root and self.local_root.exists():
+                for company_dir in self.local_root.iterdir():
+                    if not company_dir.is_dir():
+                        continue
+                    if company_code and company_dir.name != company_code:
                         continue
                     for doc_type_dir in company_dir.iterdir():
-                        if doc_type_dir.is_dir():
-                            entries.append((company_dir, doc_type_dir))
-                return entries
-
-            for company_dir, doc_type_dir in _iter_company_dirs(self.prompt_local_path):
-                for prompt_file in doc_type_dir.glob("*.txt"):
-                    result["prompts"].append({
-                        "key": f"{company_dir.name}/{doc_type_dir.name}/{prompt_file.name}",
-                        "source": "local_backup",
-                        "size": prompt_file.stat().st_size,
-                        "last_modified": datetime.fromtimestamp(prompt_file.stat().st_mtime)
-                    })
-
-            for company_dir, doc_type_dir in _iter_company_dirs(self.schema_local_path):
-                for schema_file in doc_type_dir.glob("*.json"):
-                    result["schemas"].append({
-                        "key": f"{company_dir.name}/{doc_type_dir.name}/{schema_file.name}",
-                        "source": "local_backup",
-                        "size": schema_file.stat().st_size,
-                        "last_modified": datetime.fromtimestamp(schema_file.stat().st_mtime)
-                    })
+                        if not doc_type_dir.is_dir():
+                            continue
+                        # prompts
+                        prompt_dir = doc_type_dir / "prompt"
+                        if prompt_dir.exists():
+                            for prompt_file in prompt_dir.glob("*.txt"):
+                                result["prompts"].append(
+                                    {
+                                        "key": f"{company_dir.name}/{doc_type_dir.name}/{prompt_file.name}",
+                                        "source": "local",
+                                        "size": prompt_file.stat().st_size,
+                                        "last_modified": datetime.fromtimestamp(prompt_file.stat().st_mtime),
+                                    }
+                                )
+                        # schemas
+                        schema_dir = doc_type_dir / "schema"
+                        if schema_dir.exists():
+                            for schema_file in schema_dir.glob("*.json"):
+                                result["schemas"].append(
+                                    {
+                                        "key": f"{company_dir.name}/{doc_type_dir.name}/{schema_file.name}",
+                                        "source": "local",
+                                        "size": schema_file.stat().st_size,
+                                        "last_modified": datetime.fromtimestamp(schema_file.stat().st_mtime),
+                                    }
+                                )
             
             return result
             
