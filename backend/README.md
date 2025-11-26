@@ -13,7 +13,8 @@
   - `python -m venv .venv && source .venv/bin/activate`
   - `pip install --upgrade pip`
   - `pip install -r requirements.txt`
-
+  - `pm2 start ecosystem.config.js`
+  
 ## 配置（backend.env）
 后端仅从环境变量读取配置。建议在 `backend/` 目录放置 `backend.env` 文件（已被自动加载）。必填/可选项如下：
 

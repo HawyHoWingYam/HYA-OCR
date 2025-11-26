@@ -213,9 +213,6 @@ class PromptSchemaManager:
         else:
             self.config = config
             
-        # 初始化数据库会话（用于查询配置路径）
-        self.db_session = None
-        
         # 初始化存储后端
         backend = self.config.get("storage_backend", "auto")
         self.storage_backend = backend
@@ -295,15 +292,24 @@ class PromptSchemaManager:
         return self.local_root / company_code / doc_type_code / "schema" / filename
     
     def _get_db_session(self):
-        """获取数据库会话"""
-        if self.db_session is None:
-            try:
-                from db.database import get_db
-                self.db_session = next(get_db())
-            except Exception as e:
-                logger.error(f"❌ 获取数据库会话失败: {e}")
+        """获取新的数据库会话（调用方负责关闭）
+
+        说明：
+        - 不再缓存全局 Session，避免單個會話在遇到錯誤後進入 invalid transaction 狀態，
+          之後所有查詢都報「Can't reconnect until invalid transaction is rolled back」。
+        - 每次調用都創建一個新的 Session，由調用方在 finally 中關閉。
+        """
+        try:
+            from db.database import SessionLocal
+
+            if SessionLocal is None:
+                logger.error("❌ 数据库尚未初始化：SessionLocal 为 None")
                 return None
-        return self.db_session
+
+            return SessionLocal()
+        except Exception as e:
+            logger.error(f"❌ 获取数据库会话失败: {e}")
+            return None
     
     def _get_config_paths(self, company_code: str, doc_type_code: str) -> Tuple[Optional[str], Optional[str]]:
         """
@@ -316,33 +322,49 @@ class PromptSchemaManager:
         Returns:
             Tuple[Optional[str], Optional[str]]: (prompt_path, schema_path)
         """
+        db = self._get_db_session()
+        if db is None:
+            return None, None
+
         try:
-            db = self._get_db_session()
-            if db is None:
-                return None, None
-                
             from db.models import Company, DocumentType, CompanyDocumentConfig
-            
+
             # 查询配置
-            config = db.query(CompanyDocumentConfig).join(
-                Company, CompanyDocumentConfig.company_id == Company.company_id
-            ).join(
-                DocumentType, CompanyDocumentConfig.doc_type_id == DocumentType.doc_type_id
-            ).filter(
-                Company.company_code == company_code,
-                DocumentType.type_code == doc_type_code,
-                CompanyDocumentConfig.active == True
-            ).first()
-            
+            config = (
+                db.query(CompanyDocumentConfig)
+                .join(Company, CompanyDocumentConfig.company_id == Company.company_id)
+                .join(
+                    DocumentType,
+                    CompanyDocumentConfig.doc_type_id == DocumentType.doc_type_id,
+                )
+                .filter(
+                    Company.company_code == company_code,
+                    DocumentType.type_code == doc_type_code,
+                    CompanyDocumentConfig.active == True,
+                )
+                .first()
+            )
+
             if config:
                 return config.prompt_path, config.schema_path
-            else:
-                logger.warning(f"⚠️ 未找到配置: {company_code}/{doc_type_code}")
-                return None, None
-                
+
+            logger.warning(f"⚠️ 未找到配置: {company_code}/{doc_type_code}")
+            return None, None
+
         except Exception as e:
+            # 确保當前事務被回滾，避免連接長期處於 invalid 狀態
+            try:
+                db.rollback()
+            except Exception as rb_err:
+                logger.warning(f"⚠️ 回滚数据库事务失败: {rb_err}")
+
             logger.error(f"❌ 查询数据库配置失败: {e}")
             return None, None
+        finally:
+            try:
+                db.close()
+            except Exception as close_err:
+                logger.warning(f"⚠️ 关闭数据库会话失败: {close_err}")
     
     def _extract_s3_key_from_path(self, s3_path: str) -> Optional[str]:
         """
