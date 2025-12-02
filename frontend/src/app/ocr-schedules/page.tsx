@@ -15,6 +15,12 @@ interface OcrSchedule {
     history_root_path: string;
     output_root_path: string;
     failed_subfolder_name: string;
+    schedule_root_path: string | null;
+    auto_month_folders: boolean;
+    month_folder_pattern?: string | null;
+    material_subfolder_name?: string | null;
+    history_subfolder_name?: string | null;
+    output_filename_pattern?: string | null;
     schedule_mode: 'INTERVAL' | 'WINDOWED_INTERVAL';
     start_at: string | null;
     interval_seconds: number;
@@ -29,6 +35,12 @@ interface OcrSchedule {
     next_run_at: string | null;
     created_at: string | null;
     updated_at: string | null;
+    current_status?: string | null;
+    last_run_status?: string | null;
+    last_run_summary?: string | null;
+    last_run_error?: string | null;
+    last_run_started_at?: string | null;
+    last_run_finished_at?: string | null;
 }
 
 interface OcrScheduledFileView {
@@ -47,9 +59,28 @@ interface OcrScheduledFileView {
     updated_at: string | null;
 }
 
+interface OcrScheduleRunView {
+    run_id: number;
+    schedule_id: number;
+    status: string | null;
+    started_at: string | null;
+    finished_at: string | null;
+    duration_seconds: number | null;
+    month_str: string | null;
+    files_discovered: number | null;
+    files_processed: number | null;
+    files_failed: number | null;
+    error_message: string | null;
+    metadata: Record<string, any> | null;
+    summary: string | null;
+    created_at: string | null;
+    updated_at: string | null;
+}
+
 // --- API Helpers ---
 
 const API_BASE_URL = '/api';
+const DEFAULT_AUTO_BASE = process.env.NEXT_PUBLIC_ONEDRIVE_AUTO_BASE_PATH || 'HYA-OCR';
 
 async function fetchSchedules(): Promise<OcrSchedule[]> {
     const res = await fetch(`${API_BASE_URL}/ocr-schedules`);
@@ -98,6 +129,12 @@ async function fetchDocumentTypes(): Promise<DocumentType[]> {
     return res.json();
 }
 
+async function fetchScheduleRuns(scheduleId: number, limit: number = 20): Promise<OcrScheduleRunView[]> {
+    const res = await fetch(`${API_BASE_URL}/ocr-schedules/${scheduleId}/runs?limit=${limit}`);
+    if (!res.ok) throw new Error('Failed to fetch schedule runs');
+    return res.json();
+}
+
 // --- Components ---
 
 export default function OcrSchedulesPage() {
@@ -116,6 +153,11 @@ export default function OcrSchedulesPage() {
     const [scheduleFiles, setScheduleFiles] = useState<OcrScheduledFileView[]>([]);
     const [filesLoading, setFilesLoading] = useState(false);
     const [fileStatusFilter, setFileStatusFilter] = useState('');
+
+    // Run log state
+    const [selectedScheduleForRuns, setSelectedScheduleForRuns] = useState<OcrSchedule | null>(null);
+    const [scheduleRuns, setScheduleRuns] = useState<OcrScheduleRunView[]>([]);
+    const [runsLoading, setRunsLoading] = useState(false);
 
     // Initial Data Load
     useEffect(() => {
@@ -187,17 +229,37 @@ export default function OcrSchedulesPage() {
         }
     };
 
+    const handleViewRuns = (schedule: OcrSchedule) => {
+        setSelectedScheduleForRuns(schedule);
+        loadRuns(schedule.schedule_id);
+    };
+
+    const loadRuns = async (scheduleId: number) => {
+        try {
+            setRunsLoading(true);
+            const data = await fetchScheduleRuns(scheduleId, 3);
+            setScheduleRuns(data.slice(0, 3));
+        } catch (err) {
+            console.error(err);
+            alert('Failed to load task logs');
+        } finally {
+            setRunsLoading(false);
+        }
+    };
+
     // Form Handling
     const handleCreateClick = () => {
         setEditingSchedule(null);
         setIsCreating(true);
         setSelectedScheduleForFiles(null); // Close file view if open
+        setSelectedScheduleForRuns(null);
     };
 
     const handleEditClick = (schedule: OcrSchedule) => {
         setEditingSchedule(schedule);
         setIsCreating(false);
         setSelectedScheduleForFiles(null); // Close file view if open
+        setSelectedScheduleForRuns(null);
     };
 
     const handleFormSuccess = () => {
@@ -244,80 +306,147 @@ export default function OcrSchedulesPage() {
 
             {/* Schedules List */}
             {!isCreating && !editingSchedule && (
-                <div className="bg-white shadow-md rounded-lg overflow-hidden mb-8">
+                <div className="bg-white shadow-md rounded-lg mb-8">
                     {isLoading ? (
                         <div className="text-center py-10">Loading schedules...</div>
                     ) : schedules.length === 0 ? (
                         <div className="text-center py-10 text-gray-500">No schedules found. Create one to get started.</div>
                     ) : (
-                        <div className="overflow-x-auto">
-                            <table className="min-w-full divide-y divide-gray-200">
-                                <thead className="bg-gray-50">
-                                    <tr>
-                                        <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Name</th>
-                                        <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Doc Type</th>
-                                        <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Status</th>
-                                        <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Schedule</th>
-                                        <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Next Run</th>
-                                        <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Last Run</th>
-                                        <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">Actions</th>
-                                    </tr>
-                                </thead>
-                                <tbody className="bg-white divide-y divide-gray-200">
-                                    {schedules.map((schedule) => (
-                                        <tr key={schedule.schedule_id} className="hover:bg-gray-50">
-                                            <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">
-                                                {schedule.name}
-                                            </td>
-                                            <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
-                                                {docTypes.find(d => d.doc_type_id === schedule.doc_type_id)?.type_name || schedule.doc_type_id || '-'}
-                                            </td>
-                                            <td className="px-6 py-4 whitespace-nowrap">
-                                                <span className={`px-2 inline-flex text-xs leading-5 font-semibold rounded-full ${schedule.enabled ? 'bg-green-100 text-green-800' : 'bg-gray-100 text-gray-800'
-                                                    }`}>
-                                                    {schedule.enabled ? 'Enabled' : 'Disabled'}
-                                                </span>
-                                            </td>
-                                            <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
-                                                {formatScheduleSummary(schedule)}
-                                            </td>
-                                            <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
-                                                {schedule.next_run_at ? new Date(schedule.next_run_at).toLocaleString() : '-'}
-                                            </td>
-                                            <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
-                                                {schedule.last_run_at ? new Date(schedule.last_run_at).toLocaleString() : '-'}
-                                            </td>
-                                            <td className="px-6 py-4 whitespace-nowrap text-right text-sm font-medium space-x-3">
-                                                <button
-                                                    onClick={() => handleEditClick(schedule)}
-                                                    className="text-indigo-600 hover:text-indigo-900"
-                                                >
-                                                    Edit
-                                                </button>
-                                                <button
-                                                    onClick={() => handleToggleEnabled(schedule)}
-                                                    className={`${schedule.enabled ? 'text-amber-600 hover:text-amber-900' : 'text-green-600 hover:text-green-900'}`}
-                                                >
-                                                    {schedule.enabled ? 'Disable' : 'Enable'}
-                                                </button>
-                                                <button
-                                                    onClick={() => handleRunNow(schedule.schedule_id)}
-                                                    className="text-blue-600 hover:text-blue-900"
-                                                >
-                                                    Run Now
-                                                </button>
-                                                <button
-                                                    onClick={() => handleViewFiles(schedule)}
-                                                    className="text-gray-600 hover:text-gray-900"
-                                                >
-                                                    Files
-                                                </button>
-                                            </td>
+                        <>
+                            <div className="hidden md:block overflow-x-auto">
+                                <table className="min-w-full divide-y divide-gray-200">
+                                    <thead className="bg-gray-50">
+                                        <tr>
+                                            <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Name</th>
+                                            <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Doc Type</th>
+                                            <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Status</th>
+                                            <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Schedule</th>
+                                            <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Next Run</th>
+                                            <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Last Run</th>
+                                            <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">Actions</th>
                                         </tr>
-                                    ))}
-                                </tbody>
-                            </table>
-                        </div>
+                                    </thead>
+                                    <tbody className="bg-white divide-y divide-gray-200">
+                                        {schedules.map((schedule) => (
+                                            <tr key={schedule.schedule_id} className="hover:bg-gray-50">
+                                                <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">
+                                                    <div className="flex items-center gap-2">
+                                                        <span>{schedule.name}</span>
+                                                        {schedule.auto_month_folders && (
+                                                            <span className="px-2 py-0.5 text-xs rounded-full bg-emerald-50 text-emerald-700">Auto</span>
+                                                        )}
+                                                    </div>
+                                                </td>
+                                                <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                                                    {docTypes.find(d => d.doc_type_id === schedule.doc_type_id)?.type_name || schedule.doc_type_id || '-'}
+                                                </td>
+                                                <td className="px-6 py-4 whitespace-nowrap">
+                                                    <div className="flex flex-col gap-1">
+                                                        <RunStatusBadge status={schedule.current_status} />
+                                                        <span className="text-xs text-gray-500">
+                                                            {schedule.enabled ? 'Schedule enabled' : 'Schedule disabled'}
+                                                        </span>
+                                                    </div>
+                                                </td>
+                                                <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                                                    {formatScheduleSummary(schedule)}
+                                                </td>
+                                                <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                                                    {schedule.next_run_at ? new Date(schedule.next_run_at).toLocaleString() : '-'}
+                                                </td>
+                                                <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                                                    <div>
+                                                        {schedule.last_run_at ? new Date(schedule.last_run_at).toLocaleString() : '-'}
+                                                    </div>
+                                                    {schedule.last_run_summary && (
+                                                        <div className="text-xs text-gray-500">{schedule.last_run_summary}</div>
+                                                    )}
+                                                    {schedule.last_run_error && (
+                                                        <div className="text-xs text-red-600 truncate" title={schedule.last_run_error}>
+                                                            {schedule.last_run_error}
+                                                        </div>
+                                                    )}
+                                                </td>
+                                                <td className="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">
+                                                    <div className="flex flex-wrap gap-2 justify-end">
+                                                        <button
+                                                            onClick={() => handleEditClick(schedule)}
+                                                            className="text-indigo-600 hover:text-indigo-900"
+                                                        >
+                                                            Edit
+                                                        </button>
+                                                        <button
+                                                            onClick={() => handleToggleEnabled(schedule)}
+                                                            className={`${schedule.enabled ? 'text-amber-600 hover:text-amber-900' : 'text-green-600 hover:text-green-900'}`}
+                                                        >
+                                                            {schedule.enabled ? 'Disable' : 'Enable'}
+                                                        </button>
+                                                        <button
+                                                            onClick={() => handleRunNow(schedule.schedule_id)}
+                                                            className="text-blue-600 hover:text-blue-900"
+                                                        >
+                                                            Run Now
+                                                        </button>
+                                                        <button
+                                                            onClick={() => handleViewFiles(schedule)}
+                                                            className="text-gray-600 hover:text-gray-900"
+                                                        >
+                                                            Files
+                                                        </button>
+                                                        <button
+                                                            onClick={() => handleViewRuns(schedule)}
+                                                            className="text-purple-600 hover:text-purple-900"
+                                                        >
+                                                            Logs
+                                                        </button>
+                                                    </div>
+                                                </td>
+                                            </tr>
+                                        ))}
+                                    </tbody>
+                                </table>
+                            </div>
+
+                            <div className="md:hidden space-y-4 p-4">
+                                {schedules.map((schedule) => (
+                                    <div key={schedule.schedule_id} className="border rounded-lg p-4 shadow-sm space-y-3">
+                                        <div className="flex flex-col gap-2">
+                                            <div className="flex items-start justify-between gap-3">
+                                                <div>
+                                                    <div className="text-base font-semibold text-gray-900">{schedule.name}</div>
+                                                    <div className="text-sm text-gray-500">
+                                                        {docTypes.find(d => d.doc_type_id === schedule.doc_type_id)?.type_name || schedule.doc_type_id || '-'}
+                                                    </div>
+                                                </div>
+                                                <RunStatusBadge status={schedule.current_status} />
+                                            </div>
+                                            <div className="text-sm text-gray-600 space-y-1">
+                                                <div><span className="font-medium">Schedule:</span> {formatScheduleSummary(schedule)}</div>
+                                                <div><span className="font-medium">Next Run:</span> {schedule.next_run_at ? new Date(schedule.next_run_at).toLocaleString() : '-'}</div>
+                                                <div>
+                                                    <span className="font-medium">Last Run:</span> {schedule.last_run_at ? new Date(schedule.last_run_at).toLocaleString() : '-'}
+                                                </div>
+                                                {schedule.last_run_summary && (
+                                                    <div className="text-xs text-gray-500">{schedule.last_run_summary}</div>
+                                                )}
+                                                {schedule.last_run_error && (
+                                                    <div className="text-xs text-red-600">{schedule.last_run_error}</div>
+                                                )}
+                                            </div>
+                                        </div>
+                                        <div className="flex flex-wrap gap-2">
+                                            <button onClick={() => handleEditClick(schedule)} className="px-3 py-1 rounded bg-indigo-50 text-indigo-700 text-sm">Edit</button>
+                                            <button onClick={() => handleToggleEnabled(schedule)} className="px-3 py-1 rounded bg-amber-50 text-amber-700 text-sm">
+                                                {schedule.enabled ? 'Disable' : 'Enable'}
+                                            </button>
+                                            <button onClick={() => handleRunNow(schedule.schedule_id)} className="px-3 py-1 rounded bg-blue-50 text-blue-700 text-sm">Run Now</button>
+                                            <button onClick={() => handleViewFiles(schedule)} className="px-3 py-1 rounded bg-slate-100 text-slate-700 text-sm">Files</button>
+                                            <button onClick={() => handleViewRuns(schedule)} className="px-3 py-1 rounded bg-purple-50 text-purple-700 text-sm">Logs</button>
+                                        </div>
+                                    </div>
+                                ))}
+                            </div>
+                        </>
                     )}
                 </div>
             )}
@@ -359,40 +488,151 @@ export default function OcrSchedulesPage() {
                     ) : scheduleFiles.length === 0 ? (
                         <div className="text-center py-8 text-gray-500">No files found for this schedule.</div>
                     ) : (
-                        <div className="overflow-x-auto">
-                            <table className="min-w-full divide-y divide-gray-200">
-                                <thead className="bg-gray-50">
-                                    <tr>
-                                        <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase">Month</th>
-                                        <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase">Filename</th>
-                                        <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase">Status</th>
-                                        <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase">Attempts</th>
-                                        <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase">Error</th>
-                                        <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase">Updated</th>
-                                    </tr>
-                                </thead>
-                                <tbody className="bg-white divide-y divide-gray-200">
-                                    {scheduleFiles.map((file) => (
-                                        <tr key={file.id} className="hover:bg-gray-50">
-                                            <td className="px-4 py-2 whitespace-nowrap text-sm text-gray-900">{file.month_str}</td>
-                                            <td className="px-4 py-2 whitespace-nowrap text-sm text-gray-900" title={file.onedrive_path}>
-                                                {file.filename}
-                                            </td>
-                                            <td className="px-4 py-2 whitespace-nowrap">
-                                                <StatusBadge status={file.status} />
-                                            </td>
-                                            <td className="px-4 py-2 whitespace-nowrap text-sm text-gray-500">{file.attempt_count}</td>
-                                            <td className="px-4 py-2 whitespace-nowrap text-sm text-red-600 max-w-xs truncate" title={file.error_message || ''}>
-                                                {file.error_message}
-                                            </td>
-                                            <td className="px-4 py-2 whitespace-nowrap text-sm text-gray-500">
-                                                {file.updated_at ? new Date(file.updated_at).toLocaleString() : '-'}
-                                            </td>
+                        <>
+                            <div className="hidden md:block overflow-x-auto">
+                                <table className="min-w-full divide-y divide-gray-200">
+                                    <thead className="bg-gray-50">
+                                        <tr>
+                                            <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase">Month</th>
+                                            <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase">Filename</th>
+                                            <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase">Status</th>
+                                            <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase">Attempts</th>
+                                            <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase">Error</th>
+                                            <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase">Updated</th>
                                         </tr>
-                                    ))}
-                                </tbody>
-                            </table>
+                                    </thead>
+                                    <tbody className="bg-white divide-y divide-gray-200">
+                                        {scheduleFiles.map((file) => (
+                                            <tr key={file.id} className="hover:bg-gray-50">
+                                                <td className="px-4 py-2 whitespace-nowrap text-sm text-gray-900">{file.month_str}</td>
+                                                <td className="px-4 py-2 whitespace-nowrap text-sm text-gray-900" title={file.onedrive_path}>
+                                                    {file.filename}
+                                                </td>
+                                                <td className="px-4 py-2 whitespace-nowrap">
+                                                    <StatusBadge status={file.status} />
+                                                </td>
+                                                <td className="px-4 py-2 whitespace-nowrap text-sm text-gray-500">{file.attempt_count}</td>
+                                                <td className="px-4 py-2 whitespace-nowrap text-sm text-red-600 max-w-xs truncate" title={file.error_message || ''}>
+                                                    {file.error_message}
+                                                </td>
+                                                <td className="px-4 py-2 whitespace-nowrap text-sm text-gray-500">
+                                                    {file.updated_at ? new Date(file.updated_at).toLocaleString() : '-'}
+                                                </td>
+                                            </tr>
+                                        ))}
+                                    </tbody>
+                                </table>
+                            </div>
+                            <div className="md:hidden space-y-3">
+                                {scheduleFiles.map((file) => (
+                                    <div key={file.id} className="border rounded-lg p-3 shadow-sm">
+                                        <div className="flex items-center justify-between mb-2">
+                                            <div className="text-sm font-semibold text-gray-900">{file.filename}</div>
+                                            <StatusBadge status={file.status} />
+                                        </div>
+                                        <div className="text-xs text-gray-600 space-y-1">
+                                            <div><span className="font-medium">Month:</span> {file.month_str}</div>
+                                            <div><span className="font-medium">Attempts:</span> {file.attempt_count}</div>
+                                            <div><span className="font-medium">Updated:</span> {file.updated_at ? new Date(file.updated_at).toLocaleString() : '-'}</div>
+                                            {file.error_message && (
+                                                <div className="text-red-600">{file.error_message}</div>
+                                            )}
+                                        </div>
+                                    </div>
+                                ))}
+                            </div>
+                        </>
+                    )}
+                </div>
+            )}
+
+            {/* Task Logs Panel */}
+            {selectedScheduleForRuns && (
+                <div className="bg-white shadow-md rounded-lg p-6 border-t-4 border-purple-500">
+                    <div className="flex justify-between items-center mb-4">
+                        <h2 className="text-xl font-bold">
+                            Task Logs for: {selectedScheduleForRuns.name}
+                        </h2>
+                        <div className="flex items-center gap-2">
+                            <button
+                                onClick={() => loadRuns(selectedScheduleForRuns.schedule_id)}
+                                className="text-sm text-purple-600 hover:text-purple-800"
+                            >
+                                Refresh
+                            </button>
+                            <button
+                                onClick={() => setSelectedScheduleForRuns(null)}
+                                className="text-gray-500 hover:text-gray-700"
+                            >
+                                ✕ Close
+                            </button>
                         </div>
+                    </div>
+
+                    {runsLoading ? (
+                        <div className="text-center py-8">Loading logs...</div>
+                    ) : scheduleRuns.length === 0 ? (
+                        <div className="text-center py-8 text-gray-500">No task logs yet.</div>
+                    ) : (
+                        <>
+                            <div className="hidden md:block overflow-x-auto">
+                                <table className="min-w-full divide-y divide-gray-200">
+                                    <thead className="bg-gray-50">
+                                        <tr>
+                                            <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase">Started</th>
+                                            <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase">Duration</th>
+                                            <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase">Status</th>
+                                            <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase">Summary</th>
+                                            <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase">Files</th>
+                                            <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase">Error</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody className="bg-white divide-y divide-gray-200">
+                                        {scheduleRuns.map((run) => (
+                                            <tr key={run.run_id} className="hover:bg-gray-50">
+                                                <td className="px-4 py-2 whitespace-nowrap text-sm text-gray-900">
+                                                    {run.started_at ? new Date(run.started_at).toLocaleString() : '-'}
+                                                </td>
+                                                <td className="px-4 py-2 whitespace-nowrap text-sm text-gray-500">
+                                                    {run.duration_seconds != null ? formatDuration(run.duration_seconds) : '-'}
+                                                </td>
+                                                <td className="px-4 py-2 whitespace-nowrap">
+                                                    <RunStatusBadge status={run.status} />
+                                                </td>
+                                                <td className="px-4 py-2 whitespace-nowrap text-sm text-gray-600">
+                                                    {run.summary || '-'}
+                                                </td>
+                                                <td className="px-4 py-2 whitespace-nowrap text-sm text-gray-600">
+                                                    {`${run.files_processed ?? 0}/${run.files_discovered ?? 0} processed`}<br />
+                                                    <span className="text-xs text-gray-500">Failed: {run.files_failed ?? 0}</span>
+                                                </td>
+                                                <td className="px-4 py-2 whitespace-nowrap text-sm text-red-600 max-w-xs truncate" title={run.error_message || ''}>
+                                                    {run.error_message || '-'}
+                                                </td>
+                                            </tr>
+                                        ))}
+                                    </tbody>
+                                </table>
+                            </div>
+                            <div className="md:hidden space-y-3">
+                                {scheduleRuns.map((run) => (
+                                    <div key={run.run_id} className="border rounded-lg p-3 shadow-sm">
+                                        <div className="flex items-center justify-between mb-2">
+                                            <div className="text-sm font-semibold text-gray-900">
+                                                {run.started_at ? new Date(run.started_at).toLocaleString() : '-'}
+                                            </div>
+                                            <RunStatusBadge status={run.status} />
+                                        </div>
+                                        <div className="text-xs text-gray-600 space-y-1">
+                                            <div><span className="font-medium">Duration:</span> {run.duration_seconds != null ? formatDuration(run.duration_seconds) : '-'}</div>
+                                            <div><span className="font-medium">Files:</span> {run.files_processed ?? 0}/{run.files_discovered ?? 0} (failed {run.files_failed ?? 0})</div>
+                                            {run.summary && <div>{run.summary}</div>}
+                                            {run.error_message && <div className="text-red-600">{run.error_message}</div>}
+                                        </div>
+                                    </div>
+                                ))}
+                            </div>
+                        </>
                     )}
                 </div>
             )}
@@ -423,6 +663,12 @@ function ScheduleForm({
         history_root_path: '',
         output_root_path: '',
         failed_subfolder_name: '_Failed',
+        schedule_root_path: initialData?.schedule_root_path || '',
+        auto_month_folders: initialData?.auto_month_folders ?? false,
+        material_subfolder_name: initialData?.material_subfolder_name || 'Material',
+        history_subfolder_name: initialData?.history_subfolder_name || 'history',
+        output_filename_pattern: initialData?.output_filename_pattern || '{YYYYMM}.xlsx',
+        month_folder_pattern: initialData?.month_folder_pattern || '{YYYYMM}',
         schedule_mode: 'INTERVAL',
         start_at: '', // datetime-local string
         interval_seconds: 3600,
@@ -442,8 +688,61 @@ function ScheduleForm({
     const [error, setError] = useState('');
     const [saving, setSaving] = useState(false);
 
+    const slugifyFolderName = (value: string) => {
+        const safe = (value || '').trim();
+        if (!safe) return 'Schedule';
+        return safe
+            .replace(/[\\/]+/g, '-')
+            .replace(/[^A-Za-z0-9 _\-]+/g, '')
+            .replace(/\s+/g, ' ')
+            .trim() || 'Schedule';
+    };
+
+    const deriveAutoRootPath = (value: string) => `${DEFAULT_AUTO_BASE}/${slugifyFolderName(value)}`;
+
+    const renderPatternValue = (pattern: string | undefined, fallback: string, monthStr: string) => {
+        const tpl = (pattern && pattern.trim().length ? pattern : fallback);
+        const year = monthStr.slice(0, 4);
+        const yy = year.slice(2);
+        const mm = monthStr.slice(4);
+        return tpl
+            .replaceAll('{YYYYMM}', `${year}${mm}`)
+            .replaceAll('{YYYY}', year)
+            .replaceAll('{YY}', yy)
+            .replaceAll('{MM}', mm);
+    };
+
     const handleChange = (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement>) => {
         const { name, value, type } = e.target;
+        if (name === 'auto_month_folders') {
+            const checked = (e.target as HTMLInputElement).checked;
+            setFormData((prev: any) => {
+                const next = {
+                    ...prev,
+                    auto_month_folders: checked
+                };
+                if (checked && !prev.schedule_root_path) {
+                    next.schedule_root_path = deriveAutoRootPath(prev.name || 'Schedule');
+                }
+                return next;
+            });
+            return;
+        }
+
+        if (name === 'name') {
+            setFormData((prev: any) => {
+                const next = { ...prev, name: value };
+                if (prev.auto_month_folders) {
+                    const prevDefault = deriveAutoRootPath(prev.name || 'Schedule');
+                    if (!prev.schedule_root_path || prev.schedule_root_path === prevDefault) {
+                        next.schedule_root_path = deriveAutoRootPath(value || 'Schedule');
+                    }
+                }
+                return next;
+            });
+            return;
+        }
+
         setFormData((prev: any) => ({
             ...prev,
             [name]: type === 'checkbox' ? (e.target as HTMLInputElement).checked : value
@@ -484,6 +783,19 @@ function ScheduleForm({
                 payload.start_at = null;
             }
 
+            if (payload.auto_month_folders) {
+                if (!payload.schedule_root_path) {
+                    payload.schedule_root_path = deriveAutoRootPath(payload.name || 'Schedule');
+                }
+                payload.material_root_path = payload.material_root_path || payload.schedule_root_path;
+                payload.history_root_path = payload.history_root_path || payload.schedule_root_path;
+                payload.output_root_path = payload.output_root_path || payload.schedule_root_path;
+            }
+
+            if (!payload.failed_subfolder_name) {
+                payload.failed_subfolder_name = '_Failed';
+            }
+
             if (isCreating) {
                 await createSchedule(payload);
             } else if (initialData) {
@@ -497,6 +809,14 @@ function ScheduleForm({
             setSaving(false);
         }
     };
+
+    const previewMonthStr = new Date().toISOString().slice(0, 7).replace('-', '');
+    const previewMonthFolder = renderPatternValue(formData.month_folder_pattern, '{YYYYMM}', previewMonthStr);
+    const previewOutputName = renderPatternValue(formData.output_filename_pattern, '{YYYYMM}.xlsx', previewMonthStr);
+    const previewRoot = formData.schedule_root_path || deriveAutoRootPath(formData.name || 'Schedule');
+    const previewMaterialPath = `${previewRoot}/${previewMonthFolder}/${formData.material_subfolder_name || 'Material'}`;
+    const previewHistoryPath = `${previewRoot}/${previewMonthFolder}/${formData.history_subfolder_name || 'history'}`;
+    const previewOutputPath = `${previewRoot}/${previewMonthFolder}/${previewOutputName}`;
 
     return (
         <div className="bg-white shadow-md rounded-lg p-6 mb-6">
@@ -543,43 +863,147 @@ function ScheduleForm({
                 </div>
 
                 {/* Paths */}
-                <div className="space-y-2">
-                    <h3 className="text-sm font-medium text-gray-900 pt-2">OneDrive Paths</h3>
-                    <div>
-                        <label className="block text-xs text-gray-500">Material Root Path</label>
+                <div className="space-y-3">
+                    <h3 className="text-sm font-medium text-gray-900 pt-2">OneDrive Structure</h3>
+                    <div className="flex items-start gap-3 bg-gray-50 border border-gray-200 rounded-lg p-3">
                         <input
-                            type="text"
-                            name="material_root_path"
-                            value={formData.material_root_path}
+                            type="checkbox"
+                            name="auto_month_folders"
+                            checked={formData.auto_month_folders}
                             onChange={handleChange}
-                            required
-                            className="mt-1 block w-full border border-gray-300 rounded-md shadow-sm py-2 px-3 sm:text-sm"
+                            className="mt-1 h-4 w-4 text-indigo-600 border-gray-300 rounded"
                         />
-                    </div>
-                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                         <div>
-                            <label className="block text-xs text-gray-500">History Root Path</label>
-                            <input
-                                type="text"
-                                name="history_root_path"
-                                value={formData.history_root_path}
-                                onChange={handleChange}
-                                required
-                                className="mt-1 block w-full border border-gray-300 rounded-md shadow-sm py-2 px-3 sm:text-sm"
-                            />
-                        </div>
-                        <div>
-                            <label className="block text-xs text-gray-500">Output Root Path</label>
-                            <input
-                                type="text"
-                                name="output_root_path"
-                                value={formData.output_root_path}
-                                onChange={handleChange}
-                                required
-                                className="mt-1 block w-full border border-gray-300 rounded-md shadow-sm py-2 px-3 sm:text-sm"
-                            />
+                            <p className="text-sm text-gray-900 font-medium">Auto-manage monthly folders</p>
+                            <p className="text-xs text-gray-500">Create {DEFAULT_AUTO_BASE}/&lt;Schedule&gt;/YYYYMM/{'{'}Material, history, Excel{'}'} automatically.</p>
                         </div>
                     </div>
+
+                    {formData.auto_month_folders ? (
+                        <div className="space-y-3 border border-indigo-100 rounded-lg p-3 bg-indigo-50/30">
+                            <div>
+                                <label className="block text-xs text-gray-600">Schedule Root Path</label>
+                                <input
+                                    type="text"
+                                    name="schedule_root_path"
+                                    value={formData.schedule_root_path}
+                                    onChange={handleChange}
+                                    placeholder={`${DEFAULT_AUTO_BASE}/Shop Invoice`}
+                                    className="mt-1 block w-full border border-gray-300 rounded-md shadow-sm py-2 px-3 sm:text-sm"
+                                />
+                                <p className="text-xs text-gray-500 mt-1">Monthly folders are created under this root automatically.</p>
+                            </div>
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                <div>
+                                    <label className="block text-xs text-gray-600">Month Folder Pattern</label>
+                                    <input
+                                        type="text"
+                                        name="month_folder_pattern"
+                                        value={formData.month_folder_pattern}
+                                        onChange={handleChange}
+                                        className="mt-1 block w-full border border-gray-300 rounded-md shadow-sm py-2 px-3 sm:text-sm"
+                                    />
+                                    <p className="text-xs text-gray-400">Tokens: {'{'}YYYYMM{'}'}, {'{'}YYYY{'}'}, {'{'}YY{'}'}, {'{'}MM{'}'}</p>
+                                </div>
+                                <div>
+                                    <label className="block text-xs text-gray-600">Output Filename Pattern</label>
+                                    <input
+                                        type="text"
+                                        name="output_filename_pattern"
+                                        value={formData.output_filename_pattern}
+                                        onChange={handleChange}
+                                        className="mt-1 block w-full border border-gray-300 rounded-md shadow-sm py-2 px-3 sm:text-sm"
+                                    />
+                                </div>
+                            </div>
+                            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                                <div>
+                                    <label className="block text-xs text-gray-600">Material Subfolder</label>
+                                    <input
+                                        type="text"
+                                        name="material_subfolder_name"
+                                        value={formData.material_subfolder_name}
+                                        onChange={handleChange}
+                                        className="mt-1 block w-full border border-gray-300 rounded-md shadow-sm py-2 px-3 sm:text-sm"
+                                    />
+                                </div>
+                                <div>
+                                    <label className="block text-xs text-gray-600">History Subfolder</label>
+                                    <input
+                                        type="text"
+                                        name="history_subfolder_name"
+                                        value={formData.history_subfolder_name}
+                                        onChange={handleChange}
+                                        className="mt-1 block w-full border border-gray-300 rounded-md shadow-sm py-2 px-3 sm:text-sm"
+                                    />
+                                </div>
+                                <div>
+                                    <label className="block text-xs text-gray-600">Failed Subfolder</label>
+                                    <input
+                                        type="text"
+                                        name="failed_subfolder_name"
+                                        value={formData.failed_subfolder_name}
+                                        onChange={handleChange}
+                                        className="mt-1 block w-full border border-gray-300 rounded-md shadow-sm py-2 px-3 sm:text-sm"
+                                    />
+                                </div>
+                            </div>
+                            <div className="text-xs text-slate-600 bg-white border border-dashed border-indigo-200 rounded-md p-3 space-y-1">
+                                <div className="font-medium text-slate-700">Preview (current month)</div>
+                                <div className="font-mono break-all">Material ➜ {previewMaterialPath}</div>
+                                <div className="font-mono break-all">History ➜ {previewHistoryPath}</div>
+                                <div className="font-mono break-all">Output ➜ {previewOutputPath}</div>
+                            </div>
+                        </div>
+                    ) : (
+                        <div className="space-y-2">
+                            <div>
+                                <label className="block text-xs text-gray-500">Material Root Path</label>
+                                <input
+                                    type="text"
+                                    name="material_root_path"
+                                    value={formData.material_root_path}
+                                    onChange={handleChange}
+                                    required={!formData.auto_month_folders}
+                                    className="mt-1 block w-full border border-gray-300 rounded-md shadow-sm py-2 px-3 sm:text-sm"
+                                />
+                            </div>
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                <div>
+                                    <label className="block text-xs text-gray-500">History Root Path</label>
+                                    <input
+                                        type="text"
+                                        name="history_root_path"
+                                        value={formData.history_root_path}
+                                        onChange={handleChange}
+                                        required={!formData.auto_month_folders}
+                                        className="mt-1 block w-full border border-gray-300 rounded-md shadow-sm py-2 px-3 sm:text-sm"
+                                    />
+                                </div>
+                                <div>
+                                    <label className="block text-xs text-gray-500">Output Root Path</label>
+                                    <input
+                                        type="text"
+                                        name="output_root_path"
+                                        value={formData.output_root_path}
+                                        onChange={handleChange}
+                                        required={!formData.auto_month_folders}
+                                        className="mt-1 block w-full border border-gray-300 rounded-md shadow-sm py-2 px-3 sm:text-sm"
+                                    />
+                                </div>
+                            </div>
+                            <div>
+                                <label className="block text-xs text-gray-500">Failed Subfolder Name</label>
+                                <input
+                                    type="text"
+                                    name="failed_subfolder_name"
+                                    value={formData.failed_subfolder_name}
+                                    onChange={handleChange}
+                                    className="mt-1 block w-full border border-gray-300 rounded-md shadow-sm py-2 px-3 sm:text-sm"
+                                />
+                            </div>
+                        </div>
+                    )}
                 </div>
 
                 {/* Scheduling */}
@@ -723,14 +1147,29 @@ function ScheduleForm({
 }
 
 function formatScheduleSummary(s: OcrSchedule) {
-    let summary = `Every ${s.period_value} ${s.period_unit}(s)`;
+    const value = s.period_value ?? '?';
+    const unit = s.period_unit ?? 'unit';
+    let summary = `Every ${value} ${unit}(s)`;
     if (s.schedule_mode === 'WINDOWED_INTERVAL') {
         summary += ` within ${s.window_start_time}-${s.window_end_time}`;
         if (s.allowed_weekdays) {
             summary += ` (Days: ${s.allowed_weekdays})`;
         }
     }
+    if (s.auto_month_folders) {
+        summary += ` • Auto folders under ${s.schedule_root_path || DEFAULT_AUTO_BASE}`;
+    } else {
+        summary += ' • Manual OneDrive roots';
+    }
     return summary;
+}
+
+function formatDuration(seconds: number) {
+    if (seconds == null || Number.isNaN(seconds)) return '-';
+    if (seconds < 60) return `${seconds}s`;
+    const minutes = Math.floor(seconds / 60);
+    const remaining = seconds % 60;
+    return `${minutes}m ${remaining}s`;
 }
 
 function StatusBadge({ status }: { status: string }) {
@@ -744,6 +1183,33 @@ function StatusBadge({ status }: { status: string }) {
     return (
         <span className={`px-2 inline-flex text-xs leading-5 font-semibold rounded-full ${color}`}>
             {status}
+        </span>
+    );
+}
+
+function RunStatusBadge({ status }: { status?: string | null }) {
+    const normalized = (status || 'IDLE').toUpperCase();
+    let color = 'bg-gray-100 text-gray-800';
+    switch (normalized) {
+        case 'RUNNING':
+            color = 'bg-blue-100 text-blue-800';
+            break;
+        case 'SUCCESS':
+            color = 'bg-green-100 text-green-800';
+            break;
+        case 'FAILED':
+            color = 'bg-red-100 text-red-800';
+            break;
+        case 'QUEUED':
+            color = 'bg-yellow-100 text-yellow-800';
+            break;
+        case 'DISABLED':
+            color = 'bg-slate-200 text-slate-700';
+            break;
+    }
+    return (
+        <span className={`px-2 inline-flex text-xs leading-5 font-semibold rounded-full ${color}`}>
+            {normalized}
         </span>
     );
 }

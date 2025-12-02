@@ -19,12 +19,13 @@ import shutil
 import tempfile
 import io
 import zipfile
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import json
 import logging
 import asyncio
 from sqlalchemy import func
 import time
+import re
 
 # Optional APScheduler imports with graceful fallback
 try:
@@ -62,8 +63,10 @@ from db.models import (
     OrderItemType,
     OcrSchedule,
     OcrScheduledFile,
+    OcrScheduleRun,
     ScheduleMode,
     ScheduledFileStatus,
+    ScheduleRunStatus,
 )
 from main import extract_text_from_image, extract_text_from_pdf
 from utils.excel_converter import json_to_excel, json_to_csv
@@ -94,6 +97,19 @@ from utils.mapping_config import (
 )
 from utils.mapping_config_resolver import MappingConfigResolver
 from utils.order_stats import compute_order_attachment_stats
+from utils.onedrive_client import (
+    verify_onedrive_connection,
+    build_client_from_env,
+    join_onedrive_path,
+    normalise_onedrive_path,
+)
+from utils.ocr_schedule_runner import (
+    DEFAULT_HISTORY_SUBFOLDER,
+    DEFAULT_MATERIAL_SUBFOLDER,
+    DEFAULT_MONTH_PATTERN,
+    DEFAULT_OUTPUT_PATTERN,
+    ensure_month_structure,
+)
 
 # Cost allocation imports
 from cost_allocation.dynamic_mapping_processor import process_dynamic_mapping_file
@@ -282,8 +298,164 @@ def _calculate_interval_seconds(period_unit: str, period_value: int, runs_per_pe
     return interval
 
 
+def _parse_iso_datetime(value: str) -> datetime:
+    """Parse an ISO-8601 timestamp, allowing trailing 'Z'."""
+    cleaned = value.strip()
+    if cleaned.endswith("Z"):
+        cleaned = cleaned[:-1] + "+00:00"
+    dt = datetime.fromisoformat(cleaned)
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
+
+
+def _resolve_start_datetime(schedule_data: dict, *, required: bool) -> Optional[datetime]:
+    """Resolve schedule start time from either start_at or legacy fields."""
+    start_at_value = schedule_data.get("start_at")
+    if start_at_value:
+        try:
+            return _parse_iso_datetime(start_at_value)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid start_at format; expected ISO 8601 string")
+
+    start_date = schedule_data.get("start_date")
+    start_time = schedule_data.get("start_time")
+    if start_date and start_time:
+        try:
+            return datetime.fromisoformat(f"{start_date}T{start_time}:00")
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid start_date/start_time format")
+
+    if required:
+        raise HTTPException(
+            status_code=400,
+            detail="Missing required field: start_at or start_date/start_time",
+        )
+
+    return None
+
+
+def _serialize_schedule_run(run: OcrScheduleRun) -> dict:
+    """Serialize OcrScheduleRun records."""
+    return {
+        "run_id": run.run_id,
+        "schedule_id": run.schedule_id,
+        "status": run.status.value if run.status else None,
+        "started_at": run.started_at.isoformat() if run.started_at else None,
+        "finished_at": run.finished_at.isoformat() if run.finished_at else None,
+        "duration_seconds": run.duration_seconds,
+        "month_str": run.month_str,
+        "files_discovered": run.files_discovered,
+        "files_processed": run.files_processed,
+        "files_failed": run.files_failed,
+        "error_message": run.error_message,
+        "metadata": run.metadata_payload,
+        "summary": _build_run_summary(run),
+        "created_at": run.created_at.isoformat() if run.created_at else None,
+        "updated_at": run.updated_at.isoformat() if run.updated_at else None,
+    }
+
+
+def _build_run_summary(run: OcrScheduleRun) -> Optional[str]:
+    discovered = run.files_discovered or 0
+    processed = run.files_processed or 0
+    failed = run.files_failed or 0
+    if discovered == 0 and processed == 0 and failed == 0:
+        return None
+    return f"discovered {discovered}, processed {processed}, failed {failed}"
+
+
+def _latest_run(schedule: OcrSchedule) -> Optional[OcrScheduleRun]:
+    runs = getattr(schedule, "runs", None)
+    if not runs:
+        return None
+    latest = None
+    for run in runs:
+        if not latest:
+            latest = run
+            continue
+        latest_ts = latest.started_at or datetime.min
+        current_ts = run.started_at or datetime.min
+        if current_ts > latest_ts:
+            latest = run
+    return latest
+
+
+def _derive_schedule_status(schedule: OcrSchedule, latest_run: Optional[OcrScheduleRun]) -> str:
+    if not schedule.enabled:
+        return "DISABLED"
+    if latest_run and latest_run.status:
+        return latest_run.status.value
+    return "IDLE"
+
+
+def _slugify_schedule_folder(label: Optional[str]) -> str:
+    text = (label or "Schedule").strip()
+    text = re.sub(r"[\\/]+", "-", text)
+    text = re.sub(r"[^A-Za-z0-9 _\-]+", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text or "Schedule"
+
+
+def _sanitize_folder_value(value: Optional[str], default: str) -> str:
+    candidate = (value if value not in (None, "") else default)
+    candidate = candidate.strip()
+    candidate = re.sub(r"[\\/]+", "-", candidate)
+    candidate = re.sub(r"[:*?\"<>|]", "-", candidate)
+    return candidate or default
+
+
+def _sanitize_filename_pattern(value: Optional[str], default: str) -> str:
+    candidate = (value if value not in (None, "") else default).strip()
+    candidate = re.sub(r"[\\/]+", "-", candidate)
+    candidate = re.sub(r"[:*?\"<>|]", "-", candidate)
+    return candidate or default
+
+
+def _resolve_schedule_root_path(payload: dict, fallback_name: str) -> str:
+    provided = payload.get("schedule_root_path")
+    if provided:
+        normalized = normalise_onedrive_path(provided)
+        if normalized:
+            return normalized
+
+    base_root = payload.get("base_root_path") or os.getenv("ONEDRIVE_AUTO_BASE_PATH") or "HYA-OCR"
+    base_root = normalise_onedrive_path(base_root)
+    folder_label = payload.get("schedule_folder_name") or payload.get("name") or fallback_name
+    folder_component = _slugify_schedule_folder(folder_label)
+    return join_onedrive_path(base_root, folder_component)
+
+
+def _start_month_str(start_at: Optional[datetime]) -> str:
+    anchor = start_at or datetime.utcnow()
+    return anchor.strftime("%Y%m")
+
+
+def _provision_auto_month(schedule: OcrSchedule, month_str: str) -> None:
+    onedrive_client = build_client_from_env()
+    if not onedrive_client:
+        raise HTTPException(status_code=500, detail="Missing OneDrive credentials for auto folder provisioning")
+
+    try:
+        if not onedrive_client.connect():
+            raise HTTPException(status_code=502, detail="Failed to connect to OneDrive during folder provisioning")
+        ensure_month_structure(onedrive_client, schedule, month_str)
+    except HTTPException:
+        raise
+    except Exception as exc:  # pragma: no cover - defensive logging
+        logger.error("❌ Failed to provision OneDrive structure for schedule %s: %s", schedule.schedule_id, exc)
+        raise HTTPException(status_code=502, detail=f"Failed to provision OneDrive folders: {exc}")
+    finally:
+        try:
+            onedrive_client.close()
+        except Exception:
+            pass
+
+
 def _serialize_ocr_schedule(s: OcrSchedule) -> dict:
     """Serialize OcrSchedule to an API-friendly dict."""
+    latest_run = _latest_run(s)
+    current_status = _derive_schedule_status(s, latest_run)
     return {
         "schedule_id": s.schedule_id,
         "name": s.name,
@@ -294,6 +466,12 @@ def _serialize_ocr_schedule(s: OcrSchedule) -> dict:
         "history_root_path": s.history_root_path,
         "output_root_path": s.output_root_path,
         "failed_subfolder_name": s.failed_subfolder_name,
+        "schedule_root_path": s.schedule_root_path,
+        "auto_month_folders": s.auto_month_folders,
+        "month_folder_pattern": s.month_folder_pattern,
+        "material_subfolder_name": s.material_subfolder_name,
+        "history_subfolder_name": s.history_subfolder_name,
+        "output_filename_pattern": s.output_filename_pattern,
         "schedule_mode": s.schedule_mode.value if s.schedule_mode else None,
         "start_at": s.start_at.isoformat() if s.start_at else None,
         "interval_seconds": s.interval_seconds,
@@ -306,6 +484,12 @@ def _serialize_ocr_schedule(s: OcrSchedule) -> dict:
         "max_files_per_cycle": s.max_files_per_cycle,
         "last_run_at": s.last_run_at.isoformat() if s.last_run_at else None,
         "next_run_at": s.next_run_at.isoformat() if s.next_run_at else None,
+        "current_status": current_status,
+        "last_run_status": latest_run.status.value if latest_run and latest_run.status else None,
+        "last_run_summary": _build_run_summary(latest_run) if latest_run else None,
+        "last_run_error": latest_run.error_message if latest_run else None,
+        "last_run_started_at": latest_run.started_at.isoformat() if latest_run and latest_run.started_at else None,
+        "last_run_finished_at": latest_run.finished_at.isoformat() if latest_run and latest_run.finished_at else None,
         "created_by_user_id": s.created_by_user_id,
         "created_at": s.created_at.isoformat() if s.created_at else None,
         "updated_at": s.updated_at.isoformat() if s.updated_at else None,
@@ -458,8 +642,7 @@ def create_ocr_schedule(schedule_data: dict, db: Session = Depends(get_db)):
 
     Expected payload (minimum):
     - name: str
-    - start_date: 'YYYY-MM-DD'
-    - start_time: 'HH:MM'
+    - start_at: ISO string (e.g. 2025-12-01T09:00:00Z) OR legacy start_date/start_time pair
     - period_unit: 'second' | 'minute' | 'hour' | 'day'
     - period_value: int
     - runs_per_period: int
@@ -468,8 +651,6 @@ def create_ocr_schedule(schedule_data: dict, db: Session = Depends(get_db)):
     """
     try:
         name = schedule_data["name"]
-        start_date = schedule_data["start_date"]
-        start_time = schedule_data["start_time"]
         period_unit = schedule_data["period_unit"]
         period_value = int(schedule_data["period_value"])
         runs_per_period = int(schedule_data["runs_per_period"])
@@ -478,10 +659,7 @@ def create_ocr_schedule(schedule_data: dict, db: Session = Depends(get_db)):
     except ValueError:
         raise HTTPException(status_code=400, detail="period_value and runs_per_period must be integers")
 
-    try:
-        start_at = datetime.fromisoformat(f"{start_date}T{start_time}:00")
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid start_date/start_time format")
+    start_at = _resolve_start_datetime(schedule_data, required=True)
 
     try:
         interval_seconds = _calculate_interval_seconds(period_unit, period_value, runs_per_period)
@@ -494,15 +672,65 @@ def create_ocr_schedule(schedule_data: dict, db: Session = Depends(get_db)):
     except KeyError:
         raise HTTPException(status_code=400, detail=f"Invalid schedule_mode: {schedule_mode_str}")
 
+    auto_month_folders = bool(schedule_data.get("auto_month_folders", False))
+
+    if auto_month_folders:
+        schedule_root_path = _resolve_schedule_root_path(schedule_data, fallback_name=name)
+        material_root_path = history_root_path = output_root_path = schedule_root_path
+    else:
+        try:
+            material_root_path = schedule_data["material_root_path"]
+            history_root_path = schedule_data["history_root_path"]
+            output_root_path = schedule_data["output_root_path"]
+            schedule_root_path = schedule_data.get("schedule_root_path")
+        except KeyError as e:
+            raise HTTPException(status_code=400, detail=f"Missing required path: {e.args[0]}")
+
+    material_root_path = normalise_onedrive_path(material_root_path or "")
+    history_root_path = normalise_onedrive_path(history_root_path or "")
+    output_root_path = normalise_onedrive_path(output_root_path or "")
+    schedule_root_path = (
+        normalise_onedrive_path(schedule_root_path or "")
+        if schedule_root_path
+        else None
+    )
+
+    if auto_month_folders and not schedule_root_path:
+        raise HTTPException(status_code=400, detail="schedule_root_path could not be determined for auto folder mode")
+
+    if not auto_month_folders:
+        if not material_root_path or not history_root_path or not output_root_path:
+            raise HTTPException(status_code=400, detail="material_root_path, history_root_path and output_root_path are required")
+
+    material_subfolder_name = _sanitize_folder_value(
+        schedule_data.get("material_subfolder_name"),
+        DEFAULT_MATERIAL_SUBFOLDER,
+    )
+    history_subfolder_name = _sanitize_folder_value(
+        schedule_data.get("history_subfolder_name"),
+        DEFAULT_HISTORY_SUBFOLDER,
+    )
+    failed_subfolder_name = _sanitize_folder_value(
+        schedule_data.get("failed_subfolder_name"),
+        schedule_data.get("failed_subfolder_name", "_Failed"),
+    )
+    month_folder_pattern = (schedule_data.get("month_folder_pattern") or DEFAULT_MONTH_PATTERN).strip()
+    if not month_folder_pattern:
+        month_folder_pattern = DEFAULT_MONTH_PATTERN
+    output_filename_pattern = _sanitize_filename_pattern(
+        schedule_data.get("output_filename_pattern"),
+        DEFAULT_OUTPUT_PATTERN,
+    )
+
     schedule = OcrSchedule(
         name=name,
         enabled=bool(schedule_data.get("enabled", True)),
         company_id=schedule_data.get("company_id"),
         doc_type_id=schedule_data.get("doc_type_id"),
-        material_root_path=schedule_data["material_root_path"],
-        history_root_path=schedule_data["history_root_path"],
-        output_root_path=schedule_data["output_root_path"],
-        failed_subfolder_name=schedule_data.get("failed_subfolder_name", "_Failed"),
+        material_root_path=material_root_path,
+        history_root_path=history_root_path,
+        output_root_path=output_root_path,
+        failed_subfolder_name=failed_subfolder_name,
         schedule_mode=schedule_mode,
         start_at=start_at,
         interval_seconds=interval_seconds,
@@ -514,12 +742,27 @@ def create_ocr_schedule(schedule_data: dict, db: Session = Depends(get_db)):
         allowed_weekdays=schedule_data.get("allowed_weekdays"),
         max_files_per_cycle=schedule_data.get("max_files_per_cycle"),
         created_by_user_id=schedule_data.get("created_by_user_id"),
+        auto_month_folders=auto_month_folders,
+        schedule_root_path=schedule_root_path,
+        month_folder_pattern=month_folder_pattern,
+        material_subfolder_name=material_subfolder_name,
+        history_subfolder_name=history_subfolder_name,
+        output_filename_pattern=output_filename_pattern,
     )
 
     # Initial next_run_at is the start_at; scheduler will respect this.
     schedule.next_run_at = start_at
 
     db.add(schedule)
+    db.flush()
+
+    if auto_month_folders:
+        try:
+            _provision_auto_month(schedule, _start_month_str(schedule.start_at))
+        except Exception:
+            db.rollback()
+            raise
+
     db.commit()
     db.refresh(schedule)
 
@@ -532,6 +775,13 @@ def update_ocr_schedule(schedule_id: int, schedule_data: dict, db: Session = Dep
     if not schedule:
         raise HTTPException(status_code=404, detail="OCR schedule not found")
 
+    previous_auto = bool(schedule.auto_month_folders)
+    structure_fields_changed = False
+
+    if "auto_month_folders" in schedule_data:
+        schedule.auto_month_folders = bool(schedule_data["auto_month_folders"])
+        structure_fields_changed = structure_fields_changed or schedule.auto_month_folders != previous_auto
+
     # Update simple scalar fields if present
     for field in [
         "name",
@@ -541,7 +791,6 @@ def update_ocr_schedule(schedule_id: int, schedule_data: dict, db: Session = Dep
         "material_root_path",
         "history_root_path",
         "output_root_path",
-        "failed_subfolder_name",
         "window_start_time",
         "window_end_time",
         "allowed_weekdays",
@@ -550,6 +799,45 @@ def update_ocr_schedule(schedule_id: int, schedule_data: dict, db: Session = Dep
     ]:
         if field in schedule_data:
             setattr(schedule, field, schedule_data[field])
+
+    if "failed_subfolder_name" in schedule_data:
+        schedule.failed_subfolder_name = _sanitize_folder_value(
+            schedule_data.get("failed_subfolder_name"),
+            schedule.failed_subfolder_name or "_Failed",
+        )
+        structure_fields_changed = True
+
+    if "material_subfolder_name" in schedule_data:
+        schedule.material_subfolder_name = _sanitize_folder_value(
+            schedule_data.get("material_subfolder_name"),
+            schedule.material_subfolder_name or DEFAULT_MATERIAL_SUBFOLDER,
+        )
+        structure_fields_changed = True
+
+    if "history_subfolder_name" in schedule_data:
+        schedule.history_subfolder_name = _sanitize_folder_value(
+            schedule_data.get("history_subfolder_name"),
+            schedule.history_subfolder_name or DEFAULT_HISTORY_SUBFOLDER,
+        )
+        structure_fields_changed = True
+
+    if "schedule_root_path" in schedule_data:
+        schedule.schedule_root_path = normalise_onedrive_path(schedule_data.get("schedule_root_path") or "")
+        structure_fields_changed = True
+
+    if "month_folder_pattern" in schedule_data:
+        pattern = (schedule_data.get("month_folder_pattern") or DEFAULT_MONTH_PATTERN).strip()
+        if not pattern:
+            pattern = DEFAULT_MONTH_PATTERN
+        schedule.month_folder_pattern = pattern
+        structure_fields_changed = True
+
+    if "output_filename_pattern" in schedule_data:
+        schedule.output_filename_pattern = _sanitize_filename_pattern(
+            schedule_data.get("output_filename_pattern"),
+            schedule.output_filename_pattern or DEFAULT_OUTPUT_PATTERN,
+        )
+        structure_fields_changed = True
 
     # Optionally update schedule_mode and period configuration
     if "schedule_mode" in schedule_data:
@@ -577,25 +865,59 @@ def update_ocr_schedule(schedule_id: int, schedule_data: dict, db: Session = Dep
             raise HTTPException(status_code=400, detail=str(e))
 
     # Optionally update start_at
-    start_date = schedule_data.get("start_date")
-    start_time = schedule_data.get("start_time")
-    if start_date and start_time:
-        try:
-            schedule.start_at = datetime.fromisoformat(f"{start_date}T{start_time}:00")
-        except Exception:
-            raise HTTPException(status_code=400, detail="Invalid start_date/start_time format")
+    start_override = False
+    has_start_at = bool(schedule_data.get("start_at"))
+    has_legacy_start = bool(schedule_data.get("start_date") and schedule_data.get("start_time"))
+    if has_start_at or has_legacy_start:
+        new_start = _resolve_start_datetime(schedule_data, required=True)
+        schedule.start_at = new_start
+        start_override = True
 
     # Reset next_run_at if requested or if start_at changed
-    if schedule_data.get("reset_next_run", False) or (start_date and start_time):
+    if schedule_data.get("reset_next_run", False) or start_override:
         schedule.next_run_at = schedule.start_at or datetime.utcnow()
+
+    if schedule.auto_month_folders and not schedule.schedule_root_path:
+        schedule.schedule_root_path = _resolve_schedule_root_path(
+            schedule_data,
+            fallback_name=schedule.name,
+        )
+        structure_fields_changed = True
+
+    if schedule.auto_month_folders and schedule.schedule_root_path:
+        schedule.material_root_path = schedule.schedule_root_path
+        schedule.history_root_path = schedule.schedule_root_path
+        schedule.output_root_path = schedule.schedule_root_path
+
+    need_provision = schedule.auto_month_folders and (
+        (not previous_auto)
+        or structure_fields_changed
+        or start_override
+    )
+
+    if need_provision:
+        try:
+            db.flush()
+            _provision_auto_month(schedule, _start_month_str(schedule.start_at))
+        except Exception:
+            db.rollback()
+            raise
 
     db.commit()
     db.refresh(schedule)
     return _serialize_ocr_schedule(schedule)
 
 
+def _should_run_schedule_immediately() -> bool:
+    return not bool(os.getenv("OCR_SCHEDULE_ENABLED") and os.getenv("OCR_SCHEDULE_ENABLED").lower() == "true")
+
+
 @app.post("/ocr-schedules/{schedule_id}/run-now", response_model=dict)
-def trigger_ocr_schedule(schedule_id: int, db: Session = Depends(get_db)):
+def trigger_ocr_schedule(
+    schedule_id: int,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
     schedule = db.query(OcrSchedule).filter(OcrSchedule.schedule_id == schedule_id).first()
     if not schedule:
         raise HTTPException(status_code=404, detail="OCR schedule not found")
@@ -604,10 +926,24 @@ def trigger_ocr_schedule(schedule_id: int, db: Session = Depends(get_db)):
     schedule.next_run_at = now
     db.commit()
 
-    return {
+    response = {
         "message": "Schedule marked to run as soon as possible",
         "schedule": _serialize_ocr_schedule(schedule),
+        "immediate_run": False,
     }
+
+    if _should_run_schedule_immediately():
+        from utils.ocr_schedule_runner import process_schedule
+
+        logger.info(
+            "⚡ OCR schedule %s triggered via run-now without scheduler; executing immediately",
+            schedule_id,
+        )
+        background_tasks.add_task(process_schedule, schedule_id)
+        response["immediate_run"] = True
+        response["message"] += " (manual run dispatched)"
+
+    return response
 
 
 @app.get("/ocr-schedules/{schedule_id}/files", response_model=List[dict])
@@ -653,6 +989,51 @@ def list_ocr_schedule_files(
     return results
 
 
+@app.get("/ocr-schedules/{schedule_id}/runs", response_model=List[dict])
+def list_ocr_schedule_runs(
+    schedule_id: int,
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+):
+    schedule_exists = (
+        db.query(OcrSchedule.schedule_id)
+        .filter(OcrSchedule.schedule_id == schedule_id)
+        .scalar()
+    )
+    if not schedule_exists:
+        raise HTTPException(status_code=404, detail="OCR schedule not found")
+
+    runs = (
+        db.query(OcrScheduleRun)
+        .filter(OcrScheduleRun.schedule_id == schedule_id)
+        .order_by(OcrScheduleRun.started_at.desc())
+        .offset(offset)
+        .limit(limit)
+        .all()
+    )
+    return [_serialize_schedule_run(run) for run in runs]
+
+
+@app.get("/ocr-schedules/{schedule_id}/runs/{run_id}", response_model=dict)
+def get_ocr_schedule_run_detail(
+    schedule_id: int,
+    run_id: int,
+    db: Session = Depends(get_db),
+):
+    run = (
+        db.query(OcrScheduleRun)
+        .filter(
+            OcrScheduleRun.schedule_id == schedule_id,
+            OcrScheduleRun.run_id == run_id,
+        )
+        .first()
+    )
+    if not run:
+        raise HTTPException(status_code=404, detail="Schedule run not found")
+    return _serialize_schedule_run(run)
+
+
 # Startup and Shutdown Events for Scheduler
 @app.on_event("startup")
 async def startup_event():
@@ -670,6 +1051,12 @@ async def startup_event():
         onedrive_enabled = bool(onedrive_env and onedrive_env.lower() == "true")
 
         if onedrive_enabled:
+            if verify_onedrive_connection():
+                logger.info("✅ OneDrive credentials validated during startup")
+            else:
+                logger.error(
+                    "❌ OneDrive startup verification failed; scheduled syncs may fail until credentials are fixed"
+                )
             scheduler.add_job(
                 run_onedrive_sync,
                 CronTrigger(hour=2, minute=0),
@@ -690,8 +1077,8 @@ async def startup_event():
         if ocr_enabled:
             scheduler.add_job(
                 run_ocr_schedules_job,
-                # Default: check every 5 minutes for due work
-                CronTrigger(minute="*/5"),
+                # Poll every minute for due work
+                CronTrigger(minute="*"),
                 id="ocr_schedules_runner",
                 name="OCR Schedules Runner",
                 replace_existing=True,

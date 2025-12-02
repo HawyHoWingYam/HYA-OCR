@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import tempfile
+from dataclasses import dataclass
 from datetime import datetime, time, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -22,8 +23,10 @@ from db.database import SessionLocal
 from db.models import (
     OcrSchedule,
     OcrScheduledFile,
+    OcrScheduleRun,
     ScheduleMode,
     ScheduledFileStatus,
+    ScheduleRunStatus,
 )
 from main import extract_text_from_pdf
 from utils.order_processor import escape_excel_formulas
@@ -34,6 +37,52 @@ from utils.onedrive_client import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class MonthStructure:
+    material_folder: Any
+    failed_folder: Any
+    history_folder: Any
+    output_excel_path: str
+    material_folder_path: str
+    failed_folder_path: str
+    history_folder_path: str
+    month_folder_path: str
+
+
+DEFAULT_MONTH_PATTERN = "{YYYYMM}"
+DEFAULT_OUTPUT_PATTERN = "{YYYYMM}.xlsx"
+DEFAULT_MATERIAL_SUBFOLDER = "Material"
+DEFAULT_HISTORY_SUBFOLDER = "history"
+
+
+def _sanitize_path_component(value: Optional[str], default: str) -> str:
+    component = (value or "").strip()
+    if not component:
+        return default
+    for ch in ["/", "\\", ":", "*", "?", '"', "<", ">", "|"]:
+        component = component.replace(ch, "-")
+    component = component.strip()
+    return component or default
+
+
+def _render_pattern_value(pattern: Optional[str], month_str: str, default_template: str) -> str:
+    template = pattern or default_template or DEFAULT_MONTH_PATTERN
+    if len(month_str) != 6 or not month_str.isdigit():
+        raise ValueError(f"Invalid month string '{month_str}'")
+    year = month_str[:4]
+    month = month_str[4:]
+    replacements = {
+        "{YYYYMM}": f"{year}{month}",
+        "{YYYY}": year,
+        "{YY}": year[2:],
+        "{MM}": month,
+    }
+    value = template
+    for token, token_value in replacements.items():
+        value = value.replace(token, token_value)
+    return value
 
 
 def _utcnow() -> datetime:
@@ -100,13 +149,22 @@ def _get_current_month_str(now: datetime) -> str:
     return now.strftime("%Y%m")
 
 
-def _ensure_month_structure(
+def ensure_month_structure(
     onedrive_client,
     schedule: OcrSchedule,
     month_str: str,
-) -> Tuple[Any, Any, Any, str]:
-    """Ensure Material/YYYYMM, History/YYYYMM and Output/YYYYMM.xlsx exist."""
-    # Material root
+) -> MonthStructure:
+    """Ensure per-month folder structure exists for a schedule."""
+    if getattr(schedule, "auto_month_folders", False):
+        return _ensure_auto_month_structure(onedrive_client, schedule, month_str)
+    return _ensure_legacy_month_structure(onedrive_client, schedule, month_str)
+
+
+def _ensure_legacy_month_structure(
+    onedrive_client,
+    schedule: OcrSchedule,
+    month_str: str,
+) -> MonthStructure:
     material_root = normalise_onedrive_path(schedule.material_root_path or "")
     history_root = normalise_onedrive_path(schedule.history_root_path or "")
     output_root = normalise_onedrive_path(schedule.output_root_path or "")
@@ -116,18 +174,33 @@ def _ensure_month_structure(
             f"OCR schedule {schedule.schedule_id} has incomplete OneDrive roots"
         )
 
+    logger.info(
+        "🔍 schedule %s resolving material root path '%s'",
+        schedule.schedule_id,
+        material_root,
+    )
     material_parent = onedrive_client.get_folder(material_root)
     if not material_parent:
         raise RuntimeError(
             f"Material root folder not found for schedule {schedule.schedule_id}: {material_root}"
         )
 
+    logger.info(
+        "🔍 schedule %s resolving history root path '%s'",
+        schedule.schedule_id,
+        history_root,
+    )
     history_parent = onedrive_client.get_folder(history_root)
     if not history_parent:
         raise RuntimeError(
             f"History root folder not found for schedule {schedule.schedule_id}: {history_root}"
         )
 
+    logger.info(
+        "🔍 schedule %s resolving output root path '%s'",
+        schedule.schedule_id,
+        output_root,
+    )
     output_parent = onedrive_client.get_folder(output_root)
     if not output_parent:
         raise RuntimeError(
@@ -153,11 +226,115 @@ def _ensure_month_structure(
             f"Failed to get/create history month folder {month_str} under {history_root}"
         )
 
-    # Excel file path is just a canonical OneDrive path; the actual upload
-    # is handled lazily when we first need to write.
     output_excel_path = join_onedrive_path(output_root, f"{month_str}.xlsx")
+    material_month_path = join_onedrive_path(material_root, month_str)
+    history_month_path = join_onedrive_path(history_root, month_str)
+    failed_folder_path = join_onedrive_path(material_month_path, failed_name)
 
-    return material_month, failed_folder, history_month, output_excel_path
+    return MonthStructure(
+        material_folder=material_month,
+        failed_folder=failed_folder,
+        history_folder=history_month,
+        output_excel_path=output_excel_path,
+        material_folder_path=material_month_path,
+        failed_folder_path=failed_folder_path,
+        history_folder_path=history_month_path,
+        month_folder_path=material_month_path,
+    )
+
+
+def _ensure_auto_month_structure(
+    onedrive_client,
+    schedule: OcrSchedule,
+    month_str: str,
+) -> MonthStructure:
+    schedule_root = normalise_onedrive_path(schedule.schedule_root_path or "")
+    if not schedule_root:
+        raise RuntimeError(
+            f"Auto-folder schedule {schedule.schedule_id} missing schedule_root_path"
+        )
+
+    schedule_root_folder = onedrive_client.ensure_folder_path(schedule_root)
+    if not schedule_root_folder:
+        raise RuntimeError(
+            f"Schedule root folder not found or cannot be created: {schedule_root}"
+        )
+
+    month_folder_name_raw = _render_pattern_value(
+        schedule.month_folder_pattern,
+        month_str,
+        DEFAULT_MONTH_PATTERN,
+    )
+    month_folder_name = _sanitize_path_component(
+        month_folder_name_raw,
+        default=month_str,
+    )
+    month_folder = onedrive_client.get_or_create_folder(
+        schedule_root_folder,
+        month_folder_name,
+    )
+    if not month_folder:
+        raise RuntimeError(
+            f"Failed to create/find month folder {month_folder_name} under {schedule_root}"
+        )
+
+    month_folder_path = join_onedrive_path(schedule_root, month_folder_name)
+    material_name = _sanitize_path_component(
+        schedule.material_subfolder_name or DEFAULT_MATERIAL_SUBFOLDER,
+        DEFAULT_MATERIAL_SUBFOLDER,
+    )
+    history_name = _sanitize_path_component(
+        schedule.history_subfolder_name or DEFAULT_HISTORY_SUBFOLDER,
+        DEFAULT_HISTORY_SUBFOLDER,
+    )
+    failed_name = _sanitize_path_component(
+        schedule.failed_subfolder_name or "_Failed",
+        schedule.failed_subfolder_name or "_Failed",
+    )
+
+    material_month = onedrive_client.get_or_create_folder(month_folder, material_name)
+    if not material_month:
+        raise RuntimeError(
+            f"Failed to create/find material folder {material_name} under {month_folder_path}"
+        )
+
+    failed_folder = onedrive_client.get_or_create_folder(material_month, failed_name)
+    if not failed_folder:
+        raise RuntimeError(
+            f"Failed to ensure failed folder {failed_name} under {material_name}"
+        )
+
+    history_month = onedrive_client.get_or_create_folder(month_folder, history_name)
+    if not history_month:
+        raise RuntimeError(
+            f"Failed to create/find history folder {history_name} under {month_folder_path}"
+        )
+
+    output_filename_raw = _render_pattern_value(
+        schedule.output_filename_pattern,
+        month_str,
+        DEFAULT_OUTPUT_PATTERN,
+    )
+    output_filename = _sanitize_path_component(
+        output_filename_raw,
+        default=f"{month_str}.xlsx",
+    )
+    output_excel_path = join_onedrive_path(month_folder_path, output_filename)
+
+    material_month_path = join_onedrive_path(month_folder_path, material_name)
+    history_month_path = join_onedrive_path(month_folder_path, history_name)
+    failed_folder_path = join_onedrive_path(material_month_path, failed_name)
+
+    return MonthStructure(
+        material_folder=material_month,
+        failed_folder=failed_folder,
+        history_folder=history_month,
+        output_excel_path=output_excel_path,
+        material_folder_path=material_month_path,
+        failed_folder_path=failed_folder_path,
+        history_folder_path=history_month_path,
+        month_folder_path=month_folder_path,
+    )
 
 
 def _discover_candidates(
@@ -166,6 +343,7 @@ def _discover_candidates(
     month_str: str,
     onedrive_client,
     material_month_folder,
+    material_month_path: str,
     max_files: int,
 ) -> List[Tuple[Any, OcrScheduledFile]]:
     """Discover new or retryable files in the monthly material folder."""
@@ -194,11 +372,7 @@ def _discover_candidates(
             # Skip temporary lock files
             continue
 
-        onedrive_path = join_onedrive_path(
-            schedule.material_root_path or "",
-            month_str,
-            name,
-        )
+        onedrive_path = join_onedrive_path(material_month_path, name)
 
         row: Optional[OcrScheduledFile] = (
             db.query(OcrScheduledFile)
@@ -373,8 +547,8 @@ def _process_single_file(
     history_month_folder,
     failed_folder,
     output_excel_path: str,
-) -> None:
-    """Run full pipeline for a single file."""
+) -> bool:
+    """Run full pipeline for a single file. Returns True if completed."""
     now = _utcnow()
 
     # Lock row
@@ -388,7 +562,7 @@ def _process_single_file(
         ScheduledFileStatus.PROCESSING,
         ScheduledFileStatus.COMPLETED,
     ):
-        return
+        return False
 
     row.status = ScheduledFileStatus.PROCESSING
     row.attempt_count = (row.attempt_count or 0) + 1
@@ -426,7 +600,7 @@ def _process_single_file(
         row.status = ScheduledFileStatus.ERROR
         row.error_message = f"OCR failed: {exc}"
         db.commit()
-        return
+        return False
 
     # Persist OCR JSON if desired (optional; for now just store inline as JSON string)
     try:
@@ -447,7 +621,7 @@ def _process_single_file(
             row.error_message or "Excel locked or write failed; will retry later"
         )
         db.commit()
-        return
+        return False
 
     # Move file to history/YYYYMM
     from O365.drive import File as O365File, Folder as O365Folder  # type: ignore
@@ -480,6 +654,7 @@ def _process_single_file(
     row.output_excel_path = output_excel_path
     row.excel_row_index = excel_row_index
     db.commit()
+    return True
 
 
 def process_schedule(schedule_id: int) -> None:
@@ -499,58 +674,150 @@ def process_schedule(schedule_id: int) -> None:
         now = _utcnow()
         month_str = _get_current_month_str(now)
 
-        onedrive_client = build_client_from_env()
-        if not onedrive_client:
-            logger.error("❌ Cannot build OneDrive client from env; aborting schedule %s", schedule_id)
-            return
-        if not onedrive_client.connect():
-            logger.error("❌ Failed to connect to OneDrive for schedule %s", schedule_id)
-            return
-
-        material_month, failed_folder, history_month, output_excel_path = _ensure_month_structure(
-            onedrive_client,
-            schedule,
-            month_str,
-        )
-
-        max_files = getattr(schedule, "max_files_per_cycle", None)
-        try:
-            max_files_int = int(max_files) if max_files is not None else 10
-        except Exception:
-            max_files_int = 10
-
-        candidates = _discover_candidates(
-            db=db,
-            schedule=schedule,
+        run = OcrScheduleRun(
+            schedule_id=schedule.schedule_id,
+            status=ScheduleRunStatus.RUNNING,
+            started_at=now,
             month_str=month_str,
-            onedrive_client=onedrive_client,
-            material_month_folder=material_month,
-            max_files=max_files_int,
         )
-
-        if not candidates:
-            logger.info("ℹ️ No OCR candidates found for schedule %s", schedule_id)
-            return
-
+        db.add(run)
+        db.commit()
+        db.refresh(run)
         logger.info(
-            "🔄 Processing %s OCR files for schedule %s (month %s)",
-            len(candidates),
-            schedule_id,
-            month_str,
+            "📝 Created schedule run %s for schedule %s at %s",
+            run.run_id,
+            schedule.schedule_id,
+            run.started_at,
         )
 
-        for file_item, row in candidates:
-            _process_single_file(
+        files_discovered = 0
+        files_processed = 0
+        files_failed = 0
+        run_status = ScheduleRunStatus.RUNNING
+        error_message: Optional[str] = None
+        metadata_updates: Dict[str, Any] = {}
+        run_notes: List[str] = []
+
+        try:
+            onedrive_client = build_client_from_env()
+            if not onedrive_client:
+                logger.error(
+                    "❌ Cannot build OneDrive client from env; aborting schedule %s",
+                    schedule_id,
+                )
+                raise RuntimeError("Missing OneDrive credentials")
+            if not onedrive_client.connect():
+                logger.error(
+                    "❌ Failed to connect to OneDrive for schedule %s", schedule_id
+                )
+                raise RuntimeError("Failed to connect to OneDrive")
+
+            month_structure = ensure_month_structure(
+                onedrive_client,
+                schedule,
+                month_str,
+            )
+            material_month = month_structure.material_folder
+            failed_folder = month_structure.failed_folder
+            history_month = month_structure.history_folder
+            output_excel_path = month_structure.output_excel_path
+
+            max_files = getattr(schedule, "max_files_per_cycle", None)
+            try:
+                max_files_int = int(max_files) if max_files is not None else 10
+            except Exception:
+                max_files_int = 10
+            metadata_updates.update(
+                {
+                    "max_files": max_files_int,
+                    "material_folder_path": month_structure.material_folder_path,
+                    "history_folder_path": month_structure.history_folder_path,
+                    "failed_folder_path": month_structure.failed_folder_path,
+                    "month_folder_path": month_structure.month_folder_path,
+                    "output_excel_path": month_structure.output_excel_path,
+                }
+            )
+
+            candidates = _discover_candidates(
                 db=db,
                 schedule=schedule,
-                onedrive_client=onedrive_client,
-                file_item=file_item,
-                row=row,
                 month_str=month_str,
-                history_month_folder=history_month,
-                failed_folder=failed_folder,
-                output_excel_path=output_excel_path,
+                onedrive_client=onedrive_client,
+                material_month_folder=material_month,
+                material_month_path=month_structure.material_folder_path,
+                max_files=max_files_int,
             )
+
+            files_discovered = len(candidates)
+            if not candidates:
+                logger.info("ℹ️ No OCR candidates found for schedule %s", schedule_id)
+                run_status = ScheduleRunStatus.SUCCESS
+                run_notes.append("No OCR candidates found")
+                return
+
+            logger.info(
+                "🔄 Processing %s OCR files for schedule %s (month %s)",
+                len(candidates),
+                schedule_id,
+                month_str,
+            )
+
+            for file_item, row in candidates:
+                success = _process_single_file(
+                    db=db,
+                    schedule=schedule,
+                    onedrive_client=onedrive_client,
+                    file_item=file_item,
+                    row=row,
+                    month_str=month_str,
+                    history_month_folder=history_month,
+                    failed_folder=failed_folder,
+                    output_excel_path=output_excel_path,
+                )
+                if success:
+                    files_processed += 1
+                else:
+                    files_failed += 1
+
+            run_status = ScheduleRunStatus.SUCCESS
+            logger.info(
+                "✅ Schedule %s run %s completed: processed=%s failed=%s",
+                schedule.schedule_id,
+                run.run_id,
+                files_processed,
+                files_failed,
+            )
+
+        except Exception as exc:
+            files_failed = max(files_failed, 0)
+            error_message = str(exc)
+            run_status = ScheduleRunStatus.FAILED
+            logger.error(
+                "❌ Schedule %s run %s failed: %s",
+                schedule.schedule_id,
+                run.run_id,
+                exc,
+            )
+            raise
+        finally:
+            finished_at = _utcnow()
+            run.status = run_status
+            run.files_discovered = files_discovered
+            run.files_processed = files_processed
+            run.files_failed = files_failed
+            run.error_message = error_message
+            run.finished_at = finished_at
+            if run.started_at:
+                run.duration_seconds = int(
+                    max(0, (finished_at - run.started_at).total_seconds())
+                )
+            metadata_payload = run.metadata_payload or {}
+            if metadata_updates:
+                metadata_payload = {**metadata_payload, **metadata_updates}
+            if run_notes:
+                metadata_payload = {**metadata_payload, "notes": run_notes}
+            run.metadata_payload = metadata_payload or None
+            db.commit()
     finally:
         try:
             db.close()

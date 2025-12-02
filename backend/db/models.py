@@ -379,6 +379,13 @@ class ScheduledFileStatus(enum.Enum):
     ERROR = "ERROR"
 
 
+class ScheduleRunStatus(enum.Enum):
+    QUEUED = "QUEUED"
+    RUNNING = "RUNNING"
+    SUCCESS = "SUCCESS"
+    FAILED = "FAILED"
+
+
 class OcrSchedule(Base):
     __tablename__ = "ocr_schedules"
 
@@ -411,6 +418,41 @@ class OcrSchedule(Base):
         nullable=False,
         default="_Failed",
         comment="Subfolder name for failed files under monthly material folder",
+    )
+    schedule_root_path = Column(
+        String(500),
+        nullable=True,
+        comment="Optional unified base path (e.g. HYA-OCR/Shop Invoice) for auto-managed schedules",
+    )
+    auto_month_folders = Column(
+        Boolean,
+        nullable=False,
+        default=False,
+        comment="When true, create YYYYMM/material/history/output structure under schedule_root_path",
+    )
+    month_folder_pattern = Column(
+        String(64),
+        nullable=True,
+        default="{YYYYMM}",
+        comment="Pattern for month folder name; supports {YYYYMM}, {YYYY}, {YY}, {MM}",
+    )
+    material_subfolder_name = Column(
+        String(255),
+        nullable=True,
+        default="Material",
+        comment="Subfolder created inside monthly folder to drop new PDFs",
+    )
+    history_subfolder_name = Column(
+        String(255),
+        nullable=True,
+        default="history",
+        comment="Subfolder created inside monthly folder to archive processed PDFs",
+    )
+    output_filename_pattern = Column(
+        String(255),
+        nullable=True,
+        default="{YYYYMM}.xlsx",
+        comment="Excel filename rendered from tokens (e.g. {YYYYMM}.xlsx)",
     )
 
     # Scheduling pattern
@@ -492,6 +534,11 @@ class OcrSchedule(Base):
         back_populates="schedule",
         cascade="all, delete-orphan",
     )
+    runs = relationship(
+        "OcrScheduleRun",
+        back_populates="schedule",
+        cascade="all, delete-orphan",
+    )
 
 
 class OcrScheduledFile(Base):
@@ -547,6 +594,35 @@ class OcrScheduledFile(Base):
 
     # Relationships
     schedule = relationship("OcrSchedule", back_populates="scheduled_files")
+
+
+class OcrScheduleRun(Base):
+    __tablename__ = "ocr_schedule_runs"
+
+    run_id = Column(Integer, primary_key=True)
+    schedule_id = Column(
+        Integer,
+        ForeignKey("ocr_schedules.schedule_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    status = Column(
+        Enum(ScheduleRunStatus),
+        nullable=False,
+        default=ScheduleRunStatus.QUEUED,
+    )
+    started_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    finished_at = Column(DateTime, nullable=True)
+    duration_seconds = Column(Integer, nullable=True)
+    month_str = Column(String(6), nullable=True)
+    files_discovered = Column(Integer, nullable=True)
+    files_processed = Column(Integer, nullable=True)
+    files_failed = Column(Integer, nullable=True)
+    error_message = Column(Text, nullable=True)
+    metadata_payload = Column("metadata", JSON, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    schedule = relationship("OcrSchedule", back_populates="runs")
 
 
 class OcrOrder(Base):

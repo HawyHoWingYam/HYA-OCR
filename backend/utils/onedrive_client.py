@@ -103,10 +103,23 @@ class OneDriveClient:
 
         try:
             # Remove leading/trailing slashes
-            folder_path = folder_path.strip('/')
+            folder_path = normalise_onedrive_path(folder_path or "")
+            if folder_path:
+                graph_path = f"/{folder_path}"
+            else:
+                graph_path = "/"
 
-            # Get folder by path
-            folder = self.drive.get_item_by_path(folder_path)
+            logger.debug("🔎 Resolving OneDrive folder path %s", graph_path)
+
+            try:
+                folder = self.drive.get_item_by_path(graph_path)
+            except Exception as exc:
+                logger.error(
+                    "❌ Graph API error while resolving %s: %s",
+                    graph_path,
+                    exc,
+                )
+                raise
 
             if folder and folder.is_folder:
                 logger.info(f"✅ Found folder: {folder_path}")
@@ -400,6 +413,43 @@ class OneDriveClient:
             logger.error(f"❌ Error getting/creating folder {folder_name}: {str(e)}")
             return None
 
+    def ensure_folder_path(self, folder_path: str) -> Optional[O365Folder]:
+        """Ensure a nested folder path exists (creating any missing components).
+
+        Args:
+            folder_path: Absolute OneDrive path like "HYA-OCR/Shop Invoice".
+
+        Returns:
+            Folder object for the deepest component, or None on failure.
+        """
+        if not self.drive:
+            logger.error("❌ Drive not connected. Call connect() first.")
+            return None
+
+        normalized = normalise_onedrive_path(folder_path or "")
+        if not normalized:
+            return self.get_folder("")
+
+        existing = self.get_folder(normalized)
+        if existing:
+            return existing
+
+        if "/" in normalized:
+            parent_path, child_name = normalized.rsplit("/", 1)
+        else:
+            parent_path, child_name = "", normalized
+
+        parent_folder = self.ensure_folder_path(parent_path) if parent_path else self.get_folder("")
+        if not parent_folder or not child_name:
+            logger.error(
+                "❌ Cannot ensure folder %s because parent %s was unavailable",
+                normalized,
+                parent_path or "/",
+            )
+            return None
+
+        return self.get_or_create_folder(parent_folder, child_name)
+
     def close(self) -> None:
         """Close connection"""
         if self.account:
@@ -416,7 +466,17 @@ def build_client_from_env() -> Optional[OneDriveClient]:
     This helper centralises how we construct the client so that scripts and
     background jobs can share the same logic.
     """
-    client_id = os.getenv("ONEDRIVE_CLIENT_ID")
+    client_id = os.getenv("ONEDRIVE_APPLICATION_ID")
+    legacy_client_id = os.getenv("ONEDRIVE_CLIENT_ID")
+    if client_id and legacy_client_id and client_id != legacy_client_id:
+        logger.warning(
+            "⚠️ Both ONEDRIVE_APPLICATION_ID and ONEDRIVE_CLIENT_ID are set; using ONEDRIVE_APPLICATION_ID"
+        )
+    if not client_id and legacy_client_id:
+        client_id = legacy_client_id
+        logger.info(
+            "ℹ️ ONEDRIVE_CLIENT_ID is deprecated; please rename it to ONEDRIVE_APPLICATION_ID"
+        )
     client_secret = os.getenv("ONEDRIVE_CLIENT_SECRET")
     tenant_id = os.getenv("ONEDRIVE_TENANT_ID")
     target_user_upn = os.getenv("ONEDRIVE_TARGET_USER_UPN")
@@ -424,7 +484,7 @@ def build_client_from_env() -> Optional[OneDriveClient]:
     if not client_id or not client_secret or not tenant_id:
         logger.error(
             "❌ Missing OneDrive credentials in environment "
-            "(ONEDRIVE_CLIENT_ID / ONEDRIVE_CLIENT_SECRET / ONEDRIVE_TENANT_ID)"
+            "(ONEDRIVE_APPLICATION_ID / ONEDRIVE_CLIENT_SECRET / ONEDRIVE_TENANT_ID)"
         )
         return None
 
@@ -434,6 +494,26 @@ def build_client_from_env() -> Optional[OneDriveClient]:
         tenant_id=tenant_id,
         target_user_upn=target_user_upn,
     )
+
+
+def verify_onedrive_connection() -> bool:
+    """Attempt to connect to OneDrive using environment credentials."""
+    client = build_client_from_env()
+    if not client:
+        logger.error("❌ OneDrive verification skipped - credentials missing")
+        return False
+
+    try:
+        if not client.connect():
+            logger.error("❌ OneDrive verification failed - unable to connect")
+            return False
+        logger.info("✅ OneDrive startup verification succeeded")
+        return True
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass
 
 
 def normalise_onedrive_path(path: str) -> str:
