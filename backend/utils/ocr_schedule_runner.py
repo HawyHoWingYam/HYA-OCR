@@ -14,7 +14,7 @@ import logging
 import os
 import tempfile
 from dataclasses import dataclass
-from datetime import datetime, time, timedelta
+from datetime import datetime, time, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy.orm import Session
@@ -279,8 +279,17 @@ def describe_month_structure(schedule: OcrSchedule, month_str: str) -> Dict[str,
     }
 
 
+HK_TZ = timezone(timedelta(hours=8))
+
+
 def _utcnow() -> datetime:
+    """UTC now (naive, treated as UTC for storage/ordering)."""
     return datetime.utcnow()
+
+
+def _hk_now() -> datetime:
+    """Hong Kong local time (UTC+8) for logging and user-facing timestamps."""
+    return datetime.now(HK_TZ)
 
 
 def _parse_time_hhmm(value: Optional[str]) -> Optional[time]:
@@ -340,7 +349,7 @@ def _is_within_window(schedule: OcrSchedule, now: datetime) -> bool:
 
 
 def _get_current_month_str(now: datetime) -> str:
-    return now.strftime("%Y%m")
+    return now.astimezone(HK_TZ).strftime("%Y%m")
 
 
 def ensure_month_structure(
@@ -581,12 +590,29 @@ def _discover_candidates(
         )
 
         if row:
+            # If we see a file in the material folder but the last known status
+            # is COMPLETED or (stuck) PROCESSING, we interpret this as either:
+            #   - user intentionally moved it back from history to material, or
+            #   - a previous run crashed mid-processing.
+            # In both cases, reset the row to PENDING so it can be picked up
+            # again in this cycle.
             if row.status in (
                 ScheduledFileStatus.COMPLETED,
                 ScheduledFileStatus.PROCESSING,
             ):
-                continue
-            # Allow retries for WAITING_FOR_EXCEL or ERROR
+                status_label = (
+                    row.status.value if hasattr(row.status, "value") else str(row.status)
+                )
+                logger.info(
+                    "🔁 Found %s file back in material for %s; resetting status to PENDING for reprocessing",
+                    status_label,
+                    onedrive_path,
+                )
+                row.status = ScheduledFileStatus.PENDING
+                row.error_message = None
+                # Keep attempt_count as historical info; it will be incremented
+                # when processing starts again.
+            # WAITING_FOR_EXCEL / ERROR / PENDING will naturally be retried.
         else:
             row = OcrScheduledFile(
                 schedule_id=schedule.schedule_id,
@@ -987,6 +1013,7 @@ def process_schedule(schedule_id: int) -> None:
             logger.info("ℹ️ OCR schedule %s is disabled; skipping", schedule_id)
             return
 
+        # Use UTC for storage/ordering, but derive month and logs based on HK local time.
         now = _utcnow()
         month_str = _get_current_month_str(now)
 
@@ -1128,9 +1155,14 @@ def process_schedule(schedule_id: int) -> None:
             run.error_message = error_message
             run.finished_at = finished_at
             if run.started_at:
-                run.duration_seconds = int(
-                    max(0, (finished_at - run.started_at).total_seconds())
-                )
+                # Both timestamps are stored as naive UTC; direct subtraction
+                # yields a duration in seconds.
+                try:
+                    run.duration_seconds = int(
+                        max(0, (finished_at - run.started_at).total_seconds())
+                    )
+                except Exception:
+                    run.duration_seconds = None
             metadata_payload = run.metadata_payload or {}
             if metadata_updates:
                 metadata_payload = {**metadata_payload, **metadata_updates}

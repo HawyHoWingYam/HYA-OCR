@@ -112,6 +112,30 @@ from utils.ocr_schedule_runner import (
     ensure_month_structure,
 )
 
+HK_TZ = timezone(timedelta(hours=8))
+
+
+def _hk_now() -> datetime:
+    """Return current time in Hong Kong timezone (UTC+8)."""
+    return datetime.now(HK_TZ)
+
+
+def _utc_now() -> datetime:
+    """Return current UTC time (naive, treated as UTC)."""
+    return datetime.utcnow()
+
+
+def _as_hk_iso(dt: Optional[datetime]) -> Optional[str]:
+    """Convert a stored datetime to Hong Kong ISO string for API responses.
+
+    We treat naive values as UTC (historical behaviour) and convert to HK.
+    """
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(HK_TZ).isoformat()
+
 # Cost allocation imports
 from cost_allocation.dynamic_mapping_processor import process_dynamic_mapping_file
 from cost_allocation.matcher import enrich_ocr_data
@@ -342,8 +366,8 @@ def _serialize_schedule_run(run: OcrScheduleRun) -> dict:
         "run_id": run.run_id,
         "schedule_id": run.schedule_id,
         "status": run.status.value if run.status else None,
-        "started_at": run.started_at.isoformat() if run.started_at else None,
-        "finished_at": run.finished_at.isoformat() if run.finished_at else None,
+        "started_at": _as_hk_iso(run.started_at),
+        "finished_at": _as_hk_iso(run.finished_at),
         "duration_seconds": run.duration_seconds,
         "month_str": run.month_str,
         "files_discovered": run.files_discovered,
@@ -352,8 +376,8 @@ def _serialize_schedule_run(run: OcrScheduleRun) -> dict:
         "error_message": run.error_message,
         "metadata": run.metadata_payload,
         "summary": _build_run_summary(run),
-        "created_at": run.created_at.isoformat() if run.created_at else None,
-        "updated_at": run.updated_at.isoformat() if run.updated_at else None,
+        "created_at": _as_hk_iso(run.created_at),
+        "updated_at": _as_hk_iso(run.updated_at),
     }
 
 
@@ -428,7 +452,7 @@ def _resolve_schedule_root_path(payload: dict, fallback_name: str) -> str:
 
 
 def _start_month_str(start_at: Optional[datetime]) -> str:
-    anchor = start_at or datetime.utcnow()
+    anchor = start_at or _hk_now()
     return anchor.strftime("%Y%m")
 
 
@@ -455,7 +479,7 @@ def _provision_auto_month(schedule: OcrSchedule, month_str: str) -> None:
 
 def _normalize_month_param(month: Optional[str]) -> str:
     if not month:
-        return datetime.utcnow().strftime("%Y%m")
+        return _hk_now().strftime("%Y%m")
 
     token = month.strip()
     if re.fullmatch(r"\d{6}", token):
@@ -486,7 +510,7 @@ def _serialize_ocr_schedule(s: OcrSchedule) -> dict:
         "history_subfolder_name": s.history_subfolder_name,
         "output_filename_pattern": s.output_filename_pattern,
         "schedule_mode": s.schedule_mode.value if s.schedule_mode else None,
-        "start_at": s.start_at.isoformat() if s.start_at else None,
+        "start_at": _as_hk_iso(s.start_at),
         "interval_seconds": s.interval_seconds,
         "period_unit": s.period_unit,
         "period_value": s.period_value,
@@ -495,17 +519,17 @@ def _serialize_ocr_schedule(s: OcrSchedule) -> dict:
         "window_end_time": s.window_end_time,
         "allowed_weekdays": s.allowed_weekdays,
         "max_files_per_cycle": s.max_files_per_cycle,
-        "last_run_at": s.last_run_at.isoformat() if s.last_run_at else None,
-        "next_run_at": s.next_run_at.isoformat() if s.next_run_at else None,
+        "last_run_at": _as_hk_iso(s.last_run_at),
+        "next_run_at": _as_hk_iso(s.next_run_at),
         "current_status": current_status,
         "last_run_status": latest_run.status.value if latest_run and latest_run.status else None,
         "last_run_summary": _build_run_summary(latest_run) if latest_run else None,
         "last_run_error": latest_run.error_message if latest_run else None,
-        "last_run_started_at": latest_run.started_at.isoformat() if latest_run and latest_run.started_at else None,
-        "last_run_finished_at": latest_run.finished_at.isoformat() if latest_run and latest_run.finished_at else None,
+        "last_run_started_at": _as_hk_iso(latest_run.started_at) if latest_run else None,
+        "last_run_finished_at": _as_hk_iso(latest_run.finished_at) if latest_run else None,
         "created_by_user_id": s.created_by_user_id,
-        "created_at": s.created_at.isoformat() if s.created_at else None,
-        "updated_at": s.updated_at.isoformat() if s.updated_at else None,
+        "created_at": _as_hk_iso(s.created_at),
+        "updated_at": _as_hk_iso(s.updated_at),
     }
 
 
@@ -515,7 +539,7 @@ def health_check():
     """增強的健康檢查端點"""
     health_status = {
         "status": "healthy",
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": _as_hk_iso(_utc_now()),
         "services": {},
         "config": {},
     }
@@ -912,7 +936,7 @@ def update_ocr_schedule(schedule_id: int, schedule_data: dict, db: Session = Dep
 
     # Reset next_run_at if requested or if start_at changed
     if schedule_data.get("reset_next_run", False) or start_override:
-        schedule.next_run_at = schedule.start_at or datetime.utcnow()
+        schedule.next_run_at = schedule.start_at or _utc_now()
 
     if schedule.auto_month_folders and not schedule.schedule_root_path:
         schedule.schedule_root_path = _resolve_schedule_root_path(
@@ -959,7 +983,7 @@ def trigger_ocr_schedule(
     if not schedule:
         raise HTTPException(status_code=404, detail="OCR schedule not found")
 
-    now = datetime.utcnow()
+    now = _utc_now()
     schedule.next_run_at = now
     db.commit()
 
@@ -1018,8 +1042,8 @@ def list_ocr_schedule_files(
                 "ocr_json_path": f.ocr_json_path,
                 "output_excel_path": f.output_excel_path,
                 "excel_row_index": f.excel_row_index,
-                "created_at": f.created_at.isoformat() if f.created_at else None,
-                "updated_at": f.updated_at.isoformat() if f.updated_at else None,
+                "created_at": _as_hk_iso(f.created_at),
+                "updated_at": _as_hk_iso(f.updated_at),
             }
         )
 

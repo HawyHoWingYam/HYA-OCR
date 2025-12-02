@@ -705,7 +705,11 @@ function ScheduleForm({
         output_filename_pattern: seed?.output_filename_pattern || '{YYYYMM}.xlsx',
         month_folder_pattern: seed?.month_folder_pattern || '{YYYYMM}',
         schedule_mode: seed?.schedule_mode || 'INTERVAL',
-        start_at: seed?.start_at ? new Date(seed.start_at).toISOString().slice(0, 16) : '',
+        // Backend returns start_at as Hong Kong ISO (UTC+8).
+        // For datetime-local we want the literal local wall time without
+        // applying the browser's timezone again, so we just slice the
+        // yyyy-MM-ddTHH:mm part.
+        start_at: seed?.start_at ? seed.start_at.slice(0, 16) : '',
         interval_seconds: seed?.interval_seconds || 3600,
         period_unit: seed?.period_unit || 'hour',
         period_value: seed?.period_value || 1,
