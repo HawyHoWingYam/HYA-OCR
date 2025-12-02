@@ -8,6 +8,7 @@ This module implements the recurring logic for:
 - Moving processed files to history and tracking status in DB
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -28,7 +29,8 @@ from db.models import (
     ScheduledFileStatus,
     ScheduleRunStatus,
 )
-from main import extract_text_from_pdf
+from main import extract_text_from_pdf, extract_text_from_image
+from utils.prompt_schema_manager import load_prompt_and_schema
 from utils.order_processor import escape_excel_formulas
 from utils.onedrive_client import (
     build_client_from_env,
@@ -55,6 +57,130 @@ DEFAULT_MONTH_PATTERN = "{YYYYMM}"
 DEFAULT_OUTPUT_PATTERN = "{YYYYMM}.xlsx"
 DEFAULT_MATERIAL_SUBFOLDER = "Material"
 DEFAULT_HISTORY_SUBFOLDER = "history"
+IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg")
+SUPPORTED_DOCUMENT_EXTENSIONS = (".pdf",) + IMAGE_EXTENSIONS
+DEFAULT_OCR_PROMPT = os.getenv(
+    "OCR_SCHEDULE_PROMPT",
+    "You are an OCR assistant. Extract all visible text from the document and return JSON with a single field raw_text containing the extracted text.",
+)
+
+_custom_schema = None
+_schema_env = os.getenv("OCR_SCHEDULE_RESPONSE_SCHEMA")
+if _schema_env:
+    try:
+        _custom_schema = json.loads(_schema_env)
+    except json.JSONDecodeError:
+        logger.warning("⚠️ OCR_SCHEDULE_RESPONSE_SCHEMA is not valid JSON; using default schema")
+
+DEFAULT_OCR_RESPONSE_SCHEMA = _custom_schema or {
+    "type": "object",
+    "properties": {
+        "raw_text": {"type": "string"},
+    },
+    "required": ["raw_text"],
+}
+
+
+def _run_async_callable(async_fn, *args, **kwargs):
+    async def runner():
+        return await async_fn(*args, **kwargs)
+
+    try:
+        return asyncio.run(runner())
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(runner())
+        finally:
+            loop.close()
+
+
+def _run_gemini_ocr(local_path: str, filename: str, prompt: Optional[str], schema: Optional[dict]) -> dict:
+    prompt_to_use = prompt or DEFAULT_OCR_PROMPT
+    schema_to_use = schema or DEFAULT_OCR_RESPONSE_SCHEMA
+    extension = os.path.splitext(filename)[1].lower()
+    if extension == ".pdf":
+        raw_result = _run_async_callable(
+            extract_text_from_pdf,
+            local_path,
+            prompt_to_use,
+            response_schema=schema_to_use,
+        )
+    else:
+        raw_result = _run_async_callable(
+            extract_text_from_image,
+            local_path,
+            prompt_to_use,
+            response_schema=schema_to_use,
+        )
+
+    text_payload: Optional[str] = None
+    input_tokens: Optional[int] = None
+    output_tokens: Optional[int] = None
+    processing_time: Optional[float] = None
+    status_updates: Dict[str, Any] = {}
+
+    if isinstance(raw_result, dict):
+        text_payload = raw_result.get("text")
+        input_tokens = raw_result.get("input_tokens")
+        output_tokens = raw_result.get("output_tokens")
+        processing_time = raw_result.get("processing_time")
+        status_updates = raw_result.get("status_updates") or {}
+    elif isinstance(raw_result, str):
+        text_payload = raw_result
+
+    if text_payload:
+        try:
+            parsed_data = json.loads(text_payload)
+        except json.JSONDecodeError:
+            parsed_data = {"raw_text": text_payload}
+    else:
+        parsed_data = {"raw_text": None}
+
+    return {
+        "data": parsed_data,
+        "meta": {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "processing_time": processing_time,
+            "status_updates": status_updates,
+        },
+    }
+
+
+def _load_prompt_and_schema_for_schedule(schedule: OcrSchedule) -> Tuple[str, Optional[dict]]:
+    company_code = getattr(getattr(schedule, "company", None), "company_code", None)
+    doc_type_code = getattr(getattr(schedule, "document_type", None), "type_code", None)
+
+    if company_code and doc_type_code:
+        try:
+            prompt, schema = _run_async_callable(
+                load_prompt_and_schema,
+                company_code,
+                doc_type_code,
+            )
+            if prompt:
+                logger.info(
+                    "✅ Loaded prompt/schema for schedule %s (%s/%s)",
+                    schedule.schedule_id,
+                    company_code,
+                    doc_type_code,
+                )
+                return prompt, schema
+            logger.warning(
+                "⚠️ Prompt missing for schedule %s (%s/%s); falling back to default",
+                schedule.schedule_id,
+                company_code,
+                doc_type_code,
+            )
+        except Exception as exc:
+            logger.warning(
+                "⚠️ Failed to load prompt/schema for schedule %s: %s",
+                schedule.schedule_id,
+                exc,
+            )
+
+    return DEFAULT_OCR_PROMPT, DEFAULT_OCR_RESPONSE_SCHEMA
 
 
 def _sanitize_path_component(value: Optional[str], default: str) -> str:
@@ -83,6 +209,74 @@ def _render_pattern_value(pattern: Optional[str], month_str: str, default_templa
     for token, token_value in replacements.items():
         value = value.replace(token, token_value)
     return value
+
+
+def describe_month_structure(schedule: OcrSchedule, month_str: str) -> Dict[str, str]:
+    """Return canonical OneDrive paths for a schedule/month without touching OneDrive."""
+    if not month_str or len(month_str) != 6 or not month_str.isdigit():
+        raise ValueError("month must be provided in YYYYMM format")
+
+    failed_name = _sanitize_path_component(
+        schedule.failed_subfolder_name or "_Failed",
+        schedule.failed_subfolder_name or "_Failed",
+    )
+
+    if getattr(schedule, "auto_month_folders", False):
+        schedule_root = normalise_onedrive_path(schedule.schedule_root_path or "")
+        if not schedule_root:
+            raise ValueError("schedule_root_path is required when auto_month_folders=true")
+
+        month_folder_name = _sanitize_path_component(
+            _render_pattern_value(
+                schedule.month_folder_pattern,
+                month_str,
+                DEFAULT_MONTH_PATTERN,
+            ),
+            month_str,
+        )
+        material_name = _sanitize_path_component(
+            schedule.material_subfolder_name or DEFAULT_MATERIAL_SUBFOLDER,
+            DEFAULT_MATERIAL_SUBFOLDER,
+        )
+        history_name = _sanitize_path_component(
+            schedule.history_subfolder_name or DEFAULT_HISTORY_SUBFOLDER,
+            DEFAULT_HISTORY_SUBFOLDER,
+        )
+
+        month_folder_path = join_onedrive_path(schedule_root, month_folder_name)
+        material_folder_path = join_onedrive_path(month_folder_path, material_name)
+        history_folder_path = join_onedrive_path(month_folder_path, history_name)
+        failed_folder_path = join_onedrive_path(month_folder_path, failed_name)
+        output_excel_name = _sanitize_path_component(
+            _render_pattern_value(
+                schedule.output_filename_pattern,
+                month_str,
+                DEFAULT_OUTPUT_PATTERN,
+            ),
+            f"{month_str}.xlsx",
+        )
+        output_excel_path = join_onedrive_path(month_folder_path, output_excel_name)
+    else:
+        material_root = normalise_onedrive_path(schedule.material_root_path or "")
+        history_root = normalise_onedrive_path(schedule.history_root_path or "")
+        output_root = normalise_onedrive_path(schedule.output_root_path or "")
+        if not material_root or not history_root or not output_root:
+            raise ValueError("material_root_path, history_root_path, and output_root_path are required")
+
+        month_folder_path = join_onedrive_path(material_root, month_str)
+        material_folder_path = month_folder_path
+        history_folder_path = join_onedrive_path(history_root, month_str)
+        failed_folder_path = join_onedrive_path(month_folder_path, failed_name)
+        output_excel_path = join_onedrive_path(output_root, f"{month_str}.xlsx")
+
+    return {
+        "auto_month_folders": bool(getattr(schedule, "auto_month_folders", False)),
+        "month_folder_path": month_folder_path,
+        "material_folder_path": material_folder_path,
+        "history_folder_path": history_folder_path,
+        "failed_folder_path": failed_folder_path,
+        "output_excel_path": output_excel_path,
+    }
 
 
 def _utcnow() -> datetime:
@@ -298,16 +492,16 @@ def _ensure_auto_month_structure(
             f"Failed to create/find material folder {material_name} under {month_folder_path}"
         )
 
-    failed_folder = onedrive_client.get_or_create_folder(material_month, failed_name)
-    if not failed_folder:
-        raise RuntimeError(
-            f"Failed to ensure failed folder {failed_name} under {material_name}"
-        )
-
     history_month = onedrive_client.get_or_create_folder(month_folder, history_name)
     if not history_month:
         raise RuntimeError(
             f"Failed to create/find history folder {history_name} under {month_folder_path}"
+        )
+
+    failed_folder = onedrive_client.get_or_create_folder(month_folder, failed_name)
+    if not failed_folder:
+        raise RuntimeError(
+            f"Failed to ensure failed folder {failed_name} under {month_folder_path}"
         )
 
     output_filename_raw = _render_pattern_value(
@@ -323,7 +517,7 @@ def _ensure_auto_month_structure(
 
     material_month_path = join_onedrive_path(month_folder_path, material_name)
     history_month_path = join_onedrive_path(month_folder_path, history_name)
-    failed_folder_path = join_onedrive_path(material_month_path, failed_name)
+    failed_folder_path = join_onedrive_path(month_folder_path, failed_name)
 
     return MonthStructure(
         material_folder=material_month,
@@ -354,8 +548,9 @@ def _discover_candidates(
     from utils.onedrive_client import O365File  # type: ignore
 
     try:
-        pdf_items: List[O365File] = onedrive_client.list_all_pdfs(
+        pdf_items: List[O365File] = onedrive_client.list_all_documents(
             material_month_folder,
+            file_extensions=list(SUPPORTED_DOCUMENT_EXTENSIONS),
             created_month_filter=None,
         )
     except Exception as exc:
@@ -417,7 +612,7 @@ def _append_rows_to_excel_on_onedrive(
     onedrive_client,
     excel_path: str,
     ocr_json: Dict[str, Any],
-    max_retries: int = 3,
+    max_retries: int = 2,
 ) -> int:
     """Append flattened OCR JSON rows to Excel file on OneDrive, handling lock/retry.
 
@@ -452,11 +647,78 @@ def _append_rows_to_excel_on_onedrive(
                 seen.add(key)
                 new_headers.append(str(key))
 
+    logger.info(
+        "🧮 Preparing Excel append for %s: %s flattened row(s), keys=%s",
+        excel_path,
+        len(flattened_rows),
+        ", ".join(new_headers),
+    )
+
     last_exc: Optional[Exception] = None
     for attempt in range(max_retries):
         try:
+            normalized_path = normalise_onedrive_path(excel_path)
+            parent_path = "/".join(normalized_path.split("/")[:-1])
+            filename_only = normalized_path.split("/")[-1]
+
+            parent_folder = onedrive_client.get_folder(parent_path)
+            if not parent_folder:
+                logger.error(
+                    "❌ Failed to resolve parent folder %s when preparing Excel append",
+                    parent_path,
+                )
+                return -1
+
+            existing_file = None
+            try:
+                for item in parent_folder.get_items():
+                    if getattr(item, "is_file", False) and getattr(item, "name", "") == filename_only:
+                        existing_file = item
+                        break
+            except Exception as list_exc:
+                logger.warning(
+                    "⚠️ Failed to list items under %s while locating Excel: %s",
+                    parent_path,
+                    list_exc,
+                )
+
+            content: Optional[bytes] = None
+            if existing_file is not None:
+                try:
+                    try:
+                        content = existing_file.get_content()  # type: ignore[attr-defined]
+                        logger.info("✅ Downloaded existing Excel via get_content(): %s", excel_path)
+                    except Exception:
+                        import tempfile as _temp
+                        import os as _os2
+
+                        with _temp.TemporaryDirectory() as tmpdir:
+                            ok = existing_file.download(to_path=tmpdir)
+                            if ok:
+                                local_name = getattr(existing_file, "name", filename_only) or filename_only
+                                local_path = _os2.path.join(tmpdir, local_name)
+                                try:
+                                    with open(local_path, "rb") as f:
+                                        content = f.read()
+                                    logger.info("✅ Downloaded existing Excel via download(): %s", excel_path)
+                                except FileNotFoundError:
+                                    logger.warning(
+                                        "⚠️ Downloaded Excel not found in temp dir for %s",
+                                        excel_path,
+                                    )
+                            else:
+                                logger.warning(
+                                    "⚠️ existing_file.download returned False for %s",
+                                    excel_path,
+                                )
+                except Exception as dl_exc:
+                    logger.error(
+                        "❌ Error downloading existing Excel file %s: %s",
+                        excel_path,
+                        dl_exc,
+                    )
+
             # Download existing workbook if present; otherwise create new one.
-            content = onedrive_client.download_file_content(excel_path)
             if content:
                 wb = openpyxl.load_workbook(io.BytesIO(content))
                 ws = wb.active
@@ -465,9 +727,28 @@ def _append_rows_to_excel_on_onedrive(
                     cell.value for cell in next(ws.iter_rows(min_row=1, max_row=1))
                 ]
                 header_cols = [str(h) for h in existing_headers]
-                # NOTE: For now we do NOT auto-extend headers if new keys appear later.
-                # This keeps the sheet schema stable once created.
-                start_row_index = ws.max_row + 1
+
+                # If this workbook only has an initial header row and that header
+                # has no overlap with the new OCR keys (e.g. manually created
+                # template with completely different columns), treat it as
+                # effectively empty and rewrite the header to match OCR keys.
+                nonempty_existing = {h for h in header_cols if h and str(h).strip()}
+                overlap = nonempty_existing.intersection(new_headers)
+                if ws.max_row == 1 and not overlap:
+                    logger.info(
+                        "⚙️ Existing Excel header for %s has no overlap with OCR keys; "
+                        "rewriting header to %s",
+                        excel_path,
+                        ", ".join(new_headers),
+                    )
+                    ws.delete_rows(1)
+                    header_cols = new_headers
+                    ws.append(header_cols)
+                    start_row_index = 2
+                else:
+                    # NOTE: We still do NOT auto-extend headers if new keys appear later.
+                    # This keeps the sheet schema stable once created with OCR keys.
+                    start_row_index = ws.max_row + 1
             else:
                 wb = openpyxl.Workbook()
                 ws = wb.active
@@ -491,43 +772,76 @@ def _append_rows_to_excel_on_onedrive(
             bio.seek(0)
             data = bio.read()
 
-            # Upload back to same path
+            # Upload back to same path (simple overwrite via folder.upload_file)
             normalized_path = normalise_onedrive_path(excel_path)
-            file_item = onedrive_client.drive.get_item_by_path(normalized_path)
-            if file_item:
-                # Replace existing content
-                file_item.upload(data)
-            else:
-                # Create a new file under the parent folder
-                parent_path = "/".join(normalized_path.split("/")[:-1])
-                parent_folder = onedrive_client.get_folder(parent_path)
-                if not parent_folder:
-                    logger.error(
-                        "❌ Failed to resolve parent folder %s when uploading Excel",
-                        parent_path,
-                    )
-                    return -1
-                parent_folder.upload_file(
-                    data=data,
-                    name=normalized_path.split("/")[-1],
+            parent_path = "/".join(normalized_path.split("/")[:-1])
+            filename_only = normalized_path.split("/")[-1]
+
+            parent_folder = onedrive_client.get_folder(parent_path)
+            if not parent_folder:
+                logger.error(
+                    "❌ Failed to resolve parent folder %s when uploading Excel",
+                    parent_path,
                 )
+                return -1
+
+            import tempfile
+            import os as _os
+
+            with tempfile.NamedTemporaryFile(delete=False) as tmp_file:
+                tmp_file.write(data)
+                tmp_path = tmp_file.name
+            try:
+                parent_folder.upload_file(tmp_path, item_name=filename_only)
+                logger.info("📤 Uploaded refreshed Excel file to %s", excel_path)
+            except Exception as exc:
+                # Let the outer retry loop decide how to handle lock vs. other errors.
+                logger.error("❌ Failed to upload Excel file %s: %s", excel_path, exc)
+                raise
+            finally:
+                try:
+                    _os.unlink(tmp_path)
+                except OSError:
+                    pass
 
             logger.info("✅ Appended row to Excel at %s (row %s)", excel_path, start_row_index)
             return start_row_index
 
         except Exception as exc:
             last_exc = exc
-            logger.warning(
-                "⚠️ Excel append attempt %s/%s failed for %s: %s",
+            logger.exception(
+                "⚠️ Excel append attempt %s/%s failed for %s",
                 attempt + 1,
                 max_retries,
                 excel_path,
-                exc,
             )
             if attempt < max_retries - 1:
-                # Patient retry strategy: 5s, then 10s, etc.
-                delay = 5 * (attempt + 1)
-                logger.info("⏳ Waiting %s seconds before retrying Excel append", delay)
+                # Detect OneDrive/Graph file-lock situations (HTTP 423) more robustly.
+                is_locked = False
+                status_code = getattr(getattr(exc, "response", None), "status_code", None)
+                if status_code == 423:
+                    is_locked = True
+                else:
+                    message = str(exc).lower()
+                    if (
+                        "resourcelocked" in message
+                        or " 423 " in message
+                        or "423 client error" in message
+                    ):
+                        is_locked = True
+
+                if is_locked:
+                    delay = 60
+                    logger.info(
+                        "⏳ Excel file appears locked (423). Waiting %s seconds before retrying",
+                        delay,
+                    )
+                else:
+                    delay = 5 * (attempt + 1)
+                    logger.info(
+                        "⏳ Waiting %s seconds before retrying Excel append", delay
+                    )
+
                 from time import sleep
 
                 sleep(delay)
@@ -547,6 +861,8 @@ def _process_single_file(
     history_month_folder,
     failed_folder,
     output_excel_path: str,
+    ocr_prompt: Optional[str],
+    ocr_schema: Optional[dict],
 ) -> bool:
     """Run full pipeline for a single file. Returns True if completed."""
     now = _utcnow()
@@ -580,7 +896,7 @@ def _process_single_file(
             local_path = os.path.join(tmpdir, filename)
 
             # Raw OCR -> JSON
-            ocr_result = extract_text_from_pdf(local_path)
+            ocr_result = _run_gemini_ocr(local_path, filename, ocr_prompt, ocr_schema)
     except Exception as exc:
         logger.error(
             "❌ OCR failed for schedule %s file %s: %s",
@@ -603,17 +919,17 @@ def _process_single_file(
         return False
 
     # Persist OCR JSON if desired (optional; for now just store inline as JSON string)
+    data_for_excel = ocr_result.get("data") if isinstance(ocr_result, dict) else None
     try:
-        row.ocr_json_path = json.dumps(ocr_result, ensure_ascii=False)
+        row.ocr_json_path = json.dumps(data_for_excel or {}, ensure_ascii=False)
     except Exception:
-        # Best-effort; keep going even if we cannot serialize
         row.ocr_json_path = None
 
     # Excel append (with lock-aware retries)
     excel_row_index = _append_rows_to_excel_on_onedrive(
         onedrive_client,
         output_excel_path,
-        ocr_result or {},
+        data_for_excel or {},
     )
     if excel_row_index <= 0:
         row.status = ScheduledFileStatus.WAITING_FOR_EXCEL
@@ -738,6 +1054,8 @@ def process_schedule(schedule_id: int) -> None:
                 }
             )
 
+            ocr_prompt, ocr_schema = _load_prompt_and_schema_for_schedule(schedule)
+
             candidates = _discover_candidates(
                 db=db,
                 schedule=schedule,
@@ -773,6 +1091,8 @@ def process_schedule(schedule_id: int) -> None:
                     history_month_folder=history_month,
                     failed_folder=failed_folder,
                     output_excel_path=output_excel_path,
+                    ocr_prompt=ocr_prompt,
+                    ocr_schema=ocr_schema,
                 )
                 if success:
                     files_processed += 1

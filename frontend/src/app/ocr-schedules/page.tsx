@@ -1,7 +1,7 @@
 'use client';
 
-import { useState, useEffect } from 'react';
-import { DocumentType } from '@/lib/api';
+import { useState, useEffect, useMemo } from 'react';
+import { DocumentType, Company, companiesApi } from '@/lib/api';
 
 // --- Types ---
 
@@ -77,6 +77,18 @@ interface OcrScheduleRunView {
     updated_at: string | null;
 }
 
+interface ScheduleStructurePreview {
+    schedule_id: number;
+    name: string;
+    month_str: string;
+    auto_month_folders: boolean;
+    month_folder_path: string;
+    material_folder_path: string;
+    history_folder_path: string;
+    failed_folder_path: string;
+    output_excel_path: string;
+}
+
 // --- API Helpers ---
 
 const API_BASE_URL = '/api';
@@ -135,6 +147,14 @@ async function fetchScheduleRuns(scheduleId: number, limit: number = 20): Promis
     return res.json();
 }
 
+async function fetchScheduleStructurePreview(scheduleId: number, month?: string): Promise<ScheduleStructurePreview> {
+    const params = new URLSearchParams();
+    if (month) params.append('month', month);
+    const res = await fetch(`${API_BASE_URL}/ocr-schedules/${scheduleId}/structure-preview?${params}`);
+    if (!res.ok) throw new Error('Failed to fetch structure preview');
+    return res.json();
+}
+
 // --- Components ---
 
 export default function OcrSchedulesPage() {
@@ -158,11 +178,13 @@ export default function OcrSchedulesPage() {
     const [selectedScheduleForRuns, setSelectedScheduleForRuns] = useState<OcrSchedule | null>(null);
     const [scheduleRuns, setScheduleRuns] = useState<OcrScheduleRunView[]>([]);
     const [runsLoading, setRunsLoading] = useState(false);
+    const [companies, setCompanies] = useState<Company[]>([]);
 
     // Initial Data Load
     useEffect(() => {
         loadSchedules();
         loadDocTypes();
+        loadCompanies();
     }, []);
 
     const loadSchedules = async () => {
@@ -185,6 +207,15 @@ export default function OcrSchedulesPage() {
             setDocTypes(data);
         } catch (err) {
             console.error('Failed to load doc types', err);
+        }
+    };
+
+    const loadCompanies = async () => {
+        try {
+            const data = await companiesApi.getAll();
+            setCompanies(data);
+        } catch (err) {
+            console.error('Failed to load companies', err);
         }
     };
 
@@ -296,6 +327,7 @@ export default function OcrSchedulesPage() {
                     isCreating={isCreating}
                     initialData={editingSchedule}
                     docTypes={docTypes}
+                    companies={companies}
                     onCancel={() => {
                         setIsCreating(false);
                         setEditingSchedule(null);
@@ -646,47 +678,74 @@ function ScheduleForm({
     isCreating,
     initialData,
     docTypes,
+    companies,
     onCancel,
     onSuccess
 }: {
     isCreating: boolean;
     initialData: OcrSchedule | null;
     docTypes: DocumentType[];
+    companies: Company[];
     onCancel: () => void;
     onSuccess: () => void;
 }) {
-    const [formData, setFormData] = useState<any>({
-        name: '',
-        doc_type_id: '',
-        enabled: true,
-        material_root_path: '',
-        history_root_path: '',
-        output_root_path: '',
-        failed_subfolder_name: '_Failed',
-        schedule_root_path: initialData?.schedule_root_path || '',
-        auto_month_folders: initialData?.auto_month_folders ?? false,
-        material_subfolder_name: initialData?.material_subfolder_name || 'Material',
-        history_subfolder_name: initialData?.history_subfolder_name || 'history',
-        output_filename_pattern: initialData?.output_filename_pattern || '{YYYYMM}.xlsx',
-        month_folder_pattern: initialData?.month_folder_pattern || '{YYYYMM}',
-        schedule_mode: 'INTERVAL',
-        start_at: '', // datetime-local string
-        interval_seconds: 3600,
-        period_unit: 'hour',
-        period_value: 1,
-        runs_per_period: 1,
-        window_start_time: '09:00',
-        window_end_time: '18:00',
-        allowed_weekdays: '0,1,2,3,4', // Mon-Fri
-        max_files_per_cycle: 10,
-        ...initialData,
-        // Handle nulls for controlled inputs
-        doc_type_id: initialData?.doc_type_id || '',
-        start_at: initialData?.start_at ? new Date(initialData.start_at).toISOString().slice(0, 16) : '',
+    const buildInitialFormState = (seed: OcrSchedule | null) => ({
+        name: seed?.name || '',
+        company_id: seed?.company_id || '',
+        doc_type_id: seed?.doc_type_id || '',
+        enabled: seed?.enabled ?? true,
+        material_root_path: seed?.material_root_path || seed?.schedule_root_path || '',
+        history_root_path: seed?.history_root_path || seed?.schedule_root_path || '',
+        output_root_path: seed?.output_root_path || seed?.schedule_root_path || '',
+        failed_subfolder_name: seed?.failed_subfolder_name || '_Failed',
+        schedule_root_path: seed?.schedule_root_path || '',
+        auto_month_folders: seed?.auto_month_folders ?? false,
+        material_subfolder_name: seed?.material_subfolder_name || 'Material',
+        history_subfolder_name: seed?.history_subfolder_name || 'history',
+        output_filename_pattern: seed?.output_filename_pattern || '{YYYYMM}.xlsx',
+        month_folder_pattern: seed?.month_folder_pattern || '{YYYYMM}',
+        schedule_mode: seed?.schedule_mode || 'INTERVAL',
+        start_at: seed?.start_at ? new Date(seed.start_at).toISOString().slice(0, 16) : '',
+        interval_seconds: seed?.interval_seconds || 3600,
+        period_unit: seed?.period_unit || 'hour',
+        period_value: seed?.period_value || 1,
+        runs_per_period: seed?.runs_per_period || 1,
+        window_start_time: seed?.window_start_time || '09:00',
+        window_end_time: seed?.window_end_time || '18:00',
+        allowed_weekdays: seed?.allowed_weekdays || '0,1,2,3,4',
+        max_files_per_cycle: seed?.max_files_per_cycle || 10,
     });
+
+    const [formData, setFormData] = useState<any>(buildInitialFormState(initialData));
 
     const [error, setError] = useState('');
     const [saving, setSaving] = useState(false);
+    const [serverPreview, setServerPreview] = useState<ScheduleStructurePreview | null>(null);
+    const [serverPreviewError, setServerPreviewError] = useState('');
+    const [serverPreviewLoading, setServerPreviewLoading] = useState(false);
+
+    useEffect(() => {
+        setFormData(buildInitialFormState(initialData));
+    }, [initialData, isCreating]);
+
+    const previewMonthStr = useMemo(() => {
+        const now = new Date();
+        const month = String(now.getMonth() + 1).padStart(2, '0');
+        return `${now.getFullYear()}${month}`;
+    }, []);
+
+    useEffect(() => {
+        if (!initialData?.schedule_id) {
+            setServerPreview(null);
+            return;
+        }
+        setServerPreviewLoading(true);
+        setServerPreviewError('');
+        fetchScheduleStructurePreview(initialData.schedule_id, previewMonthStr)
+            .then((data) => setServerPreview(data))
+            .catch(() => setServerPreviewError('Failed to load current structure'))
+            .finally(() => setServerPreviewLoading(false));
+    }, [initialData?.schedule_id, previewMonthStr]);
 
     const slugifyFolderName = (value: string) => {
         const safe = (value || '').trim();
@@ -783,6 +842,12 @@ function ScheduleForm({
                 payload.start_at = null;
             }
 
+            if (payload.company_id) {
+                payload.company_id = Number(payload.company_id);
+            } else {
+                payload.company_id = null;
+            }
+
             if (payload.auto_month_folders) {
                 if (!payload.schedule_root_path) {
                     payload.schedule_root_path = deriveAutoRootPath(payload.name || 'Schedule');
@@ -810,7 +875,6 @@ function ScheduleForm({
         }
     };
 
-    const previewMonthStr = new Date().toISOString().slice(0, 7).replace('-', '');
     const previewMonthFolder = renderPatternValue(formData.month_folder_pattern, '{YYYYMM}', previewMonthStr);
     const previewOutputName = renderPatternValue(formData.output_filename_pattern, '{YYYYMM}.xlsx', previewMonthStr);
     const previewRoot = formData.schedule_root_path || deriveAutoRootPath(formData.name || 'Schedule');
@@ -845,6 +909,22 @@ function ScheduleForm({
                         />
                     </div>
                     <div>
+                        <label className="block text-sm font-medium text-gray-700">Company</label>
+                        <select
+                            name="company_id"
+                            value={formData.company_id}
+                            onChange={handleChange}
+                            className="mt-1 block w-full border border-gray-300 rounded-md shadow-sm py-2 px-3 focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm"
+                        >
+                            <option value="">Select Company...</option>
+                            {companies.map((c) => (
+                                <option key={c.company_id} value={c.company_id}>
+                                    {c.company_name} ({c.company_code})
+                                </option>
+                            ))}
+                        </select>
+                    </div>
+                    <div>
                         <label className="block text-sm font-medium text-gray-700">Document Type</label>
                         <select
                             name="doc_type_id"
@@ -875,7 +955,7 @@ function ScheduleForm({
                         />
                         <div>
                             <p className="text-sm text-gray-900 font-medium">Auto-manage monthly folders</p>
-                            <p className="text-xs text-gray-500">Create {DEFAULT_AUTO_BASE}/&lt;Schedule&gt;/YYYYMM/{'{'}Material, history, Excel{'}'} automatically.</p>
+                            <p className="text-xs text-gray-500">Create {DEFAULT_AUTO_BASE}/&lt;Schedule&gt;/YYYYMM/{'{'}material, history, excel{'}'} automatically.</p>
                         </div>
                     </div>
 
@@ -953,6 +1033,20 @@ function ScheduleForm({
                                 <div className="font-mono break-all">Material ➜ {previewMaterialPath}</div>
                                 <div className="font-mono break-all">History ➜ {previewHistoryPath}</div>
                                 <div className="font-mono break-all">Output ➜ {previewOutputPath}</div>
+                                {!isCreating && (
+                                    <div className="mt-2 space-y-1">
+                                        <div className="font-medium text-slate-700">Persisted (server{serverPreview?.month_str ? ` · ${serverPreview.month_str}` : ''})</div>
+                                        {serverPreviewLoading && <div className="text-gray-500">Loading preview...</div>}
+                                        {serverPreviewError && <div className="text-red-500">{serverPreviewError}</div>}
+                                        {serverPreview && !serverPreviewLoading && !serverPreviewError && (
+                                            <>
+                                                <div className="font-mono break-all">Material ➜ {serverPreview.material_folder_path}</div>
+                                                <div className="font-mono break-all">History ➜ {serverPreview.history_folder_path}</div>
+                                                <div className="font-mono break-all">Output ➜ {serverPreview.output_excel_path}</div>
+                                            </>
+                                        )}
+                                    </div>
+                                )}
                             </div>
                         </div>
                     ) : (
@@ -1002,6 +1096,20 @@ function ScheduleForm({
                                     className="mt-1 block w-full border border-gray-300 rounded-md shadow-sm py-2 px-3 sm:text-sm"
                                 />
                             </div>
+                            {!isCreating && (
+                                <div className="text-xs text-slate-600 bg-white border border-dashed border-slate-200 rounded-md p-3 space-y-1">
+                                    <div className="font-medium text-slate-700">Persisted (server{serverPreview?.month_str ? ` · ${serverPreview.month_str}` : ''})</div>
+                                    {serverPreviewLoading && <div className="text-gray-500">Loading preview...</div>}
+                                    {serverPreviewError && <div className="text-red-500">{serverPreviewError}</div>}
+                                    {serverPreview && !serverPreviewLoading && !serverPreviewError && (
+                                        <>
+                                            <div className="font-mono break-all">Material ➜ {serverPreview.material_folder_path}</div>
+                                            <div className="font-mono break-all">History ➜ {serverPreview.history_folder_path}</div>
+                                            <div className="font-mono break-all">Output ➜ {serverPreview.output_excel_path}</div>
+                                        </>
+                                    )}
+                                </div>
+                            )}
                         </div>
                     )}
                 </div>

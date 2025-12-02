@@ -1,0 +1,13 @@
+Please analyze the provided image, which contains one or more "Hana-Musubi" (華御結) food retail receipts.
+
+Your task is to extract specific transaction details for EACH receipt visible in the image separately.
+
+**Extraction Rules:**
+
+1.  **Scope:** Identify each distinct receipt paper. Do not mix information between two different receipts.
+2.  **Handwritten Telephone:** Look at the very top of each receipt paper (above the logo). There is often a handwritten 8-digit phone number. Extract this accurately.
+3.  **Shop Code:** This is not explicitly labeled as "Shop Code". You must extract the first 3 characters of the "Invoice Number" (賬單號碼) to use as the Shop Code (e.g., if the invoice number is "PP312345...", the Shop Code is "PP3").
+4.  **Date:** The date on the receipt is usually in DD/MM/YYYY format. Ensure you convert it to YYYY-MM-DD format as requested in the schema.
+5.  **Payment Method:** Extract the text clearly indicating the payment source (e.g., Octopus/八達通, Visa, Master).
+
+Return the data strictly following the provided JSON schema.

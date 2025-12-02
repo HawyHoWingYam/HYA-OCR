@@ -108,6 +108,7 @@ from utils.ocr_schedule_runner import (
     DEFAULT_MATERIAL_SUBFOLDER,
     DEFAULT_MONTH_PATTERN,
     DEFAULT_OUTPUT_PATTERN,
+    describe_month_structure,
     ensure_month_structure,
 )
 
@@ -452,6 +453,18 @@ def _provision_auto_month(schedule: OcrSchedule, month_str: str) -> None:
             pass
 
 
+def _normalize_month_param(month: Optional[str]) -> str:
+    if not month:
+        return datetime.utcnow().strftime("%Y%m")
+
+    token = month.strip()
+    if re.fullmatch(r"\d{6}", token):
+        return token
+    if re.fullmatch(r"\d{4}-\d{2}", token):
+        return token.replace("-", "")
+    raise HTTPException(status_code=400, detail="month must be in YYYYMM or YYYY-MM format")
+
+
 def _serialize_ocr_schedule(s: OcrSchedule) -> dict:
     """Serialize OcrSchedule to an API-friendly dict."""
     latest_run = _latest_run(s)
@@ -634,6 +647,30 @@ def health_check():
 def list_ocr_schedules(db: Session = Depends(get_db)):
     schedules = db.query(OcrSchedule).all()
     return [_serialize_ocr_schedule(s) for s in schedules]
+
+
+@app.get("/ocr-schedules/{schedule_id}/structure-preview", response_model=dict)
+def preview_ocr_schedule_structure(
+    schedule_id: int,
+    month: Optional[str] = Query(None, description="Target month (YYYYMM or YYYY-MM)"),
+    db: Session = Depends(get_db),
+):
+    schedule = db.query(OcrSchedule).filter(OcrSchedule.schedule_id == schedule_id).first()
+    if not schedule:
+        raise HTTPException(status_code=404, detail="OCR schedule not found")
+
+    month_str = _normalize_month_param(month)
+    try:
+        preview = describe_month_structure(schedule, month_str)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    return {
+        "schedule_id": schedule.schedule_id,
+        "name": schedule.name,
+        "month_str": month_str,
+        **preview,
+    }
 
 
 @app.post("/ocr-schedules", response_model=dict)

@@ -1,0 +1,42 @@
+{
+  "type": "array",
+  "description": "A list of distinct receipts identified in the image. Extract data for each receipt separately.",
+  "items": {
+    "type": "object",
+    "properties": {
+      "remarked_telephone": {
+        "type": "string",
+        "description": "The handwritten 8-digit number written at the very top of the receipt paper (e.g., '92300131'). If not strictly 8 digits or not found, return null.",
+        "nullable": true
+      },
+      "invoice_number": {
+        "type": "string",
+        "description": "The printed Invoice Number (e.g., found next to '賬單號碼', starting with characters like 'PP3')."
+      },
+      "shop_code": {
+        "type": "string",
+        "description": "The 3-character shop abbreviation derived from the first 3 letters of the Invoice Number (e.g., if Invoice No is 'PP31206...', shop code is 'PP3')."
+      },
+      "invoice_issue_date": {
+        "type": "string",
+        "description": "The checkout date and time found next to '結賬時間'. Convert the format to strict ISO 8601: 'YYYY-MM-DD HH:mm:ss'."
+      },
+      "payment_method": {
+        "type": "string",
+        "description": "The method of payment found under '付款方法' (e.g., '八達通付款', 'Spectra-Visa/Master')."
+      },
+      "total_amount": {
+        "type": "number",
+        "description": "The Grand Total amount found next to '總計'."
+      }
+    },
+    "required": [
+      "remarked_telephone",
+      "invoice_number",
+      "shop_code",
+      "invoice_issue_date",
+      "total_amount",
+      "payment_method"
+    ]
+  }
+}
