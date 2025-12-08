@@ -43,7 +43,7 @@ from botocore.exceptions import ClientError
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from db.database import SessionLocal
-from db.models import Company, DocumentType, CompanyDocumentConfig
+from db.models import Company, DocumentType, CompanyDocTypeConfig
 from utils.company_file_manager import CompanyFileManager, FileType
 from config_loader import config_loader
 
@@ -107,7 +107,7 @@ class S3MigrationManager:
         
         # Load configurations for config_id mapping
         self.configs = {}  # (company_id, doc_type_id) -> config_id mapping
-        for config in self.db_session.query(CompanyDocumentConfig).all():
+        for config in self.db_session.query(CompanyDocTypeConfig).all():
             key = (config.company_id, config.doc_type_id)
             self.configs[key] = config.config_id
             

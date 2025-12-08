@@ -82,16 +82,9 @@ class DocumentType(Base):
         secondary="department_doc_type_access",
         back_populates="document_types",
     )
-    configs = relationship("CompanyDocumentConfig", back_populates="document_type")
     jobs = relationship("ProcessingJob", back_populates="document_type")
     batch_jobs = relationship("BatchJob", back_populates="document_type")
-    mapping_templates = relationship("MappingTemplate", back_populates="document_type")
-    mapping_defaults = relationship("CompanyDocMappingDefault", back_populates="document_type")
-    primary_orders = relationship(
-        "OcrOrder",
-        back_populates="primary_doc_type",
-        foreign_keys="OcrOrder.primary_doc_type_id",
-    )
+    doc_type_configs = relationship("CompanyDocTypeConfig", back_populates="document_type")
 
 
 class DepartmentDocTypeAccess(Base):
@@ -119,37 +112,118 @@ class Company(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
-    configs = relationship("CompanyDocumentConfig", back_populates="company")
     jobs = relationship("ProcessingJob", back_populates="company")
     batch_jobs = relationship("BatchJob", back_populates="company")
-    mapping_templates = relationship("MappingTemplate", back_populates="company")
-    mapping_defaults = relationship("CompanyDocMappingDefault", back_populates="company")
+    doc_type_configs = relationship("CompanyDocTypeConfig", back_populates="company")
 
 
-class CompanyDocumentConfig(Base):
-    __tablename__ = "company_document_configs"
+class CompanyDocTypeConfig(Base):
+    __tablename__ = "company_doc_type_configs"
 
     config_id = Column(Integer, primary_key=True)
     company_id = Column(Integer, ForeignKey("companies.company_id"), nullable=False)
-    doc_type_id = Column(
-        Integer, ForeignKey("document_types.doc_type_id"), nullable=False
+    doc_type_id = Column(Integer, ForeignKey("document_types.doc_type_id"), nullable=False)
+    item_type = Column(
+        String(32),
+        nullable=False,
+        comment="Item type: single_source or multi_source",
     )
-    prompt_path = Column(String(500), nullable=True, comment='Path to prompt file (supports local paths and S3 URIs like s3://bucket/prompts/...)')
-    schema_path = Column(String(500), nullable=True, comment='Path to schema file (supports local paths and S3 URIs like s3://bucket/schemas/...)')
-    storage_type = Column(Enum(StorageType), nullable=False, default=StorageType.local, comment='Storage backend type for prompts and schemas')
-    storage_metadata = Column(JSON, nullable=True, comment='Additional metadata for storage backend (e.g., S3 bucket info, cache settings)')
-    original_prompt_filename = Column(String(255), nullable=True, comment='Original filename of uploaded prompt file (e.g., invoice_prompt.txt)')
-    original_schema_filename = Column(String(255), nullable=True, comment='Original filename of uploaded schema file (e.g., invoice_schema.json)')
-    # Removed auto-mapping legacy fields: default_mapping_keys, auto_mapping_enabled
-    # Removed cross-field mapping (legacy)
+
+    # OCR settings (aligned with CompanyDocumentConfig and PromptSchemaManager expectations)
+    prompt_path = Column(
+        String(500),
+        nullable=True,
+        comment="Path to prompt file (supports local paths and S3 URIs like s3://bucket/prompts/...)",
+    )
+    schema_path = Column(
+        String(500),
+        nullable=True,
+        comment="Path to schema file (supports local paths and S3 URIs like s3://bucket/schemas/...)",
+    )
+    storage_type = Column(
+        Enum(StorageType),
+        nullable=False,
+        default=StorageType.local,
+        comment="Storage backend type for prompts and schemas",
+    )
+    storage_metadata = Column(
+        JSON,
+        nullable=True,
+        comment="Additional metadata for storage backend (e.g., S3 bucket info, cache settings)",
+    )
+    original_prompt_filename = Column(
+        String(255),
+        nullable=True,
+        comment="Original filename of uploaded prompt file (e.g., invoice_prompt.txt)",
+    )
+    original_schema_filename = Column(
+        String(255),
+        nullable=True,
+        comment="Original filename of uploaded schema file (e.g., invoice_schema.json)",
+    )
+
+    # External references (OneDrive / templates)
+    master_csv_path = Column(
+        String(500),
+        nullable=True,
+        comment="OneDrive path to master CSV/Excel used for final join",
+    )
+    output_template_path = Column(
+        String(500),
+        nullable=True,
+        comment="Path to output template definition (local path or S3 URI)",
+    )
+
+    # Single-source mapping configuration
+    single_source_config = Column(
+        JSON,
+        nullable=True,
+        comment="Mapping configuration for single_source items (external_join_keys, column_aliases, join_normalize, output_meta, merge_suffix)",
+    )
+
+    # Multi-source mapping - Step 1: OCR -> month Excel (YYYYMM.xlsx)
+    multi_source_step1_config = Column(
+        JSON,
+        nullable=True,
+        comment="Multi-source step 1 mapping (OCR data -> month Excel). Schema: {join_keys, column_aliases, join_normalize, merge_suffix}",
+    )
+
+    # Multi-source mapping - Step 2: Step1 result -> master CSV
+    multi_source_step2_config = Column(
+        JSON,
+        nullable=True,
+        comment="Multi-source step 2 mapping (step1 result -> master CSV). Schema: {join_keys, column_aliases, join_normalize, output_meta, merge_suffix}",
+    )
+
+    # Multi-source attachment settings (for primary + attachments aggregation)
+    internal_join_key = Column(
+        String(100),
+        nullable=True,
+        comment="Default join key between primary OCR rows and attachment-derived rows",
+    )
+    attachment_sources = Column(
+        JSON,
+        nullable=True,
+        comment="Attachment source definitions for multi-source mapping (e.g. OneDrive folders, filename_contains, per-source join_key)",
+    )
+
+    # Status and bookkeeping
     active = Column(Boolean, default=True)
+    priority = Column(
+        Integer,
+        nullable=False,
+        default=100,
+        comment="Optional priority for future resolution strategies (lower = higher priority)",
+    )
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
-    company = relationship("Company", back_populates="configs")
-    document_type = relationship("DocumentType", back_populates="configs")
+    company = relationship("Company", back_populates="doc_type_configs")
+    document_type = relationship("DocumentType", back_populates="doc_type_configs")
 
-    __table_args__ = (UniqueConstraint("company_id", "doc_type_id"),)
+    __table_args__ = (
+        UniqueConstraint("company_id", "doc_type_id", "item_type", name="uq_company_doc_type_item_type"),
+    )
 
 
 class OrderItemType(enum.Enum):
@@ -163,43 +237,6 @@ ItemTypeEnum = Enum(
     native_enum=False,
     name="orderitemtype",
 )
-
-
-class MappingTemplate(Base):
-    __tablename__ = "mapping_templates"
-
-    template_id = Column(Integer, primary_key=True)
-    template_name = Column(String(255), nullable=False)
-    company_id = Column(Integer, ForeignKey("companies.company_id"), nullable=True)
-    doc_type_id = Column(Integer, ForeignKey("document_types.doc_type_id"), nullable=True)
-    item_type = Column(ItemTypeEnum, nullable=False, default=OrderItemType.SINGLE_SOURCE)
-    config = Column(JSON, nullable=False, comment='Serialized mapping configuration (join keys, OneDrive references, column policies)')
-    priority = Column(Integer, nullable=False, default=100, comment='Lower number = higher precedence when resolving defaults')
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-
-    company = relationship("Company", back_populates="mapping_templates")
-    document_type = relationship("DocumentType", back_populates="mapping_templates")
-    defaults = relationship("CompanyDocMappingDefault", back_populates="template")
-
-
-class CompanyDocMappingDefault(Base):
-    __tablename__ = "company_doc_mapping_defaults"
-
-    default_id = Column(Integer, primary_key=True)
-    company_id = Column(Integer, ForeignKey("companies.company_id"), nullable=False)
-    doc_type_id = Column(Integer, ForeignKey("document_types.doc_type_id"), nullable=False)
-    item_type = Column(ItemTypeEnum, nullable=False, default=OrderItemType.SINGLE_SOURCE)
-    template_id = Column(Integer, ForeignKey("mapping_templates.template_id"), nullable=True)
-    config_override = Column(JSON, nullable=True, comment='Optional override applied after template resolution')
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-
-    company = relationship("Company", back_populates="mapping_defaults")
-    document_type = relationship("DocumentType", back_populates="mapping_defaults")
-    template = relationship("MappingTemplate", back_populates="defaults")
-
-    __table_args__ = (UniqueConstraint("company_id", "doc_type_id", "item_type"),)
 
 
 class File(Base):
@@ -356,7 +393,7 @@ class OrderStatus(enum.Enum):
     MAPPING = "MAPPING"
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
-    LOCKED = "LOCKED"  # NEW: Order is locked, no modifications allowed
+    LOCKED = "LOCKED"  # Deprecated - no longer used by UI, kept for DB compatibility
 
 
 class OrderItemStatus(enum.Enum):
@@ -631,29 +668,16 @@ class OcrOrder(Base):
     order_id = Column(Integer, primary_key=True)
     order_name = Column(String(255), nullable=True, comment='User-friendly name for the order')
     status = Column(Enum(OrderStatus), nullable=False, default=OrderStatus.DRAFT, comment='Current status of the order')
-    mapping_file_path = Column(String(500), nullable=True, comment='[Deprecated] Order-level mapping file path - use item-level mapping_config instead')
-    mapping_keys = Column(JSON, nullable=True, comment='[Deprecated] Order-level mapping keys - use item-level mapping_config instead')
     final_report_paths = Column(JSON, nullable=True, comment='Paths to final consolidated reports (NetSuite CSV, Excel reports)')
     total_items = Column(Integer, nullable=False, default=0, comment='Total number of order items')
     completed_items = Column(Integer, nullable=False, default=0, comment='Number of completed order items')
     failed_items = Column(Integer, nullable=False, default=0, comment='Number of failed order items')
     error_message = Column(Text, nullable=True, comment='Error message if order processing fails')
-    primary_doc_type_id = Column(
-        Integer,
-        ForeignKey("document_types.doc_type_id", ondelete="SET NULL"),
-        nullable=True,
-        comment='Primary document type driving template-based special CSV generation',
-    )
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     # Relationships
     items = relationship("OcrOrderItem", back_populates="order", cascade="all, delete-orphan")
-    primary_doc_type = relationship(
-        "DocumentType",
-        back_populates="primary_orders",
-        foreign_keys=[primary_doc_type_id],
-    )
 
 
 class OcrOrderItem(Base):
@@ -667,11 +691,15 @@ class OcrOrderItem(Base):
     item_name = Column(String(255), nullable=True, comment='User-friendly name for this item')
     status = Column(Enum(OrderItemStatus), nullable=False, default=OrderItemStatus.PENDING)
     item_type = Column(ItemTypeEnum, nullable=False, default=OrderItemType.SINGLE_SOURCE, comment='single_source or multi_source mapping mode')
-    applied_template_id = Column(Integer, ForeignKey("mapping_templates.template_id"), nullable=True, comment='Mapping template applied to generate current config')
     file_count = Column(Integer, nullable=False, default=0, comment='Number of attachment files in this item (excludes primary file)')
     ocr_result_json_path = Column(String(500), nullable=True, comment='S3 path to primary file OCR result JSON')
     ocr_result_csv_path = Column(String(500), nullable=True, comment='S3 path to mapped CSV result (primary + attachments)')
     mapping_config = Column(JSON, nullable=True, comment='Per-item mapping configuration (join keys, master CSV path, template references)')
+    selected_month_excel_path = Column(
+        String(500),
+        nullable=True,
+        comment="User-selected month Excel (e.g., YYYYMM.xlsx) OneDrive path for multi-source step 1 join",
+    )
     processing_started_at = Column(DateTime, nullable=True)
     processing_completed_at = Column(DateTime, nullable=True)
     processing_time_seconds = Column(Float, nullable=True)
@@ -685,7 +713,6 @@ class OcrOrderItem(Base):
     document_type = relationship("DocumentType")
     primary_file = relationship("File", foreign_keys=[primary_file_id])
     files = relationship("OrderItemFile", back_populates="order_item", cascade="all, delete-orphan")
-    applied_template = relationship("MappingTemplate")
     api_usages = relationship("ApiUsage", back_populates="order_item")
 
 

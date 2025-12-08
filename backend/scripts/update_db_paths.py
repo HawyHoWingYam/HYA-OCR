@@ -29,7 +29,7 @@ from datetime import datetime
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from db.database import SessionLocal
-from db.models import CompanyDocumentConfig, File
+from db.models import CompanyDocTypeConfig, File
 from utils.company_file_manager import CompanyFileManager, FileType
 from config_loader import config_loader
 
@@ -124,12 +124,12 @@ class DatabasePathMigrator:
             'original_path': path
         }
     
-    def _generate_new_s3_path(self, config: CompanyDocumentConfig, file_type: str, original_path: str) -> Optional[str]:
+    def _generate_new_s3_path(self, config: CompanyDocTypeConfig, file_type: str, original_path: str) -> Optional[str]:
         """
         Generate new S3 URI for a configuration file
-        
+
         Args:
-            config: CompanyDocumentConfig object
+            config: CompanyDocTypeConfig object
             file_type: "prompt" or "schema"
             original_path: Original file path
             
@@ -195,7 +195,7 @@ class DatabasePathMigrator:
         }
         
         # Query all configurations
-        configs = self.db_session.query(CompanyDocumentConfig).all()
+        configs = self.db_session.query(CompanyDocTypeConfig).all()
         logger.info(f"Found {len(configs)} configurations to check")
         
         for config in configs:

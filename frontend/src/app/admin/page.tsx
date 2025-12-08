@@ -30,23 +30,13 @@ export default function AdminHome() {
           <h2 className="text-lg font-medium mb-2">Configurations</h2>
           <p className="text-gray-600 mb-4">Link companies with document types and configure processing parameters.</p>
           <a 
-            href="/admin/configs" 
+            href="/admin/ocr-configs" 
             className="text-blue-600 hover:text-blue-800 font-medium"
           >
             Manage Configurations →
           </a>
         </div>
 
-        <div className="bg-white shadow-md rounded-lg p-6">
-          <h2 className="text-lg font-medium mb-2">Mapping Templates</h2>
-          <p className="text-gray-600 mb-4">Define reusable mapping presets and per-company overrides.</p>
-          <a
-            href="/admin/mapping"
-            className="text-blue-600 hover:text-blue-800 font-medium"
-          >
-            Manage Mapping Templates →
-          </a>
-        </div>
       </div>
     </div>
   );

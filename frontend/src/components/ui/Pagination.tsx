@@ -1,14 +1,6 @@
 'use client';
 
-interface PaginationInfo {
-  current_page: number;
-  total_pages: number;
-  has_previous: boolean;
-  has_next: boolean;
-  offset: number;
-  limit: number;
-  total_count: number;
-}
+import type { PaginationInfo } from '@/types/pagination';
 
 interface PaginationProps {
   pagination: PaginationInfo;
@@ -18,7 +10,7 @@ interface PaginationProps {
 }
 
 export default function Pagination({ pagination, onPageChange, maxPages = 5, disabled = false }: PaginationProps) {
-  const { current_page, total_pages, has_previous, has_next } = pagination;
+  const { current_page, total_pages, has_prev, has_next, page_size, total_count } = pagination;
   
   // Limit total pages to maxPages
   const effectiveTotalPages = Math.min(total_pages, maxPages);
@@ -48,7 +40,7 @@ export default function Pagination({ pagination, onPageChange, maxPages = 5, dis
         {/* Mobile pagination */}
         <button
           onClick={() => onPageChange(current_page - 1)}
-          disabled={!has_previous || disabled}
+          disabled={!has_prev || disabled}
           className="relative inline-flex items-center px-4 py-2 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded-md hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed"
         >
           Previous
@@ -66,18 +58,18 @@ export default function Pagination({ pagination, onPageChange, maxPages = 5, dis
         <div>
           <p className="text-sm text-gray-700">
             Showing{' '}
-            <span className="font-medium">{Math.min(pagination.offset + 1, pagination.total_count)}</span>{' '}
+            <span className="font-medium">{Math.min((current_page - 1) * page_size + 1, total_count || 0)}</span>{' '}
             to{' '}
             <span className="font-medium">
-              {Math.min(pagination.offset + pagination.limit, pagination.total_count)}
+              {Math.min(current_page * page_size, total_count || 0)}
             </span>{' '}
             of{' '}
             <span className="font-medium">
-              {Math.min(pagination.total_count, maxPages * pagination.limit)}
+              {Math.min(total_count || 0, maxPages * page_size)}
             </span>{' '}
             results
-            {pagination.total_count > maxPages * pagination.limit && (
-              <span className="text-gray-500"> (showing first {maxPages * pagination.limit})</span>
+            {(total_count || 0) > maxPages * page_size && (
+              <span className="text-gray-500"> (showing first {maxPages * page_size})</span>
             )}
           </p>
         </div>
@@ -87,7 +79,7 @@ export default function Pagination({ pagination, onPageChange, maxPages = 5, dis
             {/* Previous button */}
             <button
               onClick={() => onPageChange(current_page - 1)}
-              disabled={!has_previous || disabled}
+              disabled={!has_prev || disabled}
               className="relative inline-flex items-center px-2 py-2 text-sm font-medium text-gray-500 bg-white border border-gray-300 rounded-l-md hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed"
             >
               <span className="sr-only">Previous</span>

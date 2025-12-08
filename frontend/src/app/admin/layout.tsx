@@ -19,23 +19,17 @@ export default function AdminLayout({
           >
             Companies
           </Link>
-          <Link 
-            href="/admin/document-types" 
+          <Link
+            href="/admin/document-types"
             className="block py-2 px-4 rounded hover:bg-slate-700"
           >
             Document Types
           </Link>
-          <Link 
-            href="/admin/configs" 
-            className="block py-2 px-4 rounded hover:bg-slate-700"
-          >
-            Configurations
-          </Link>
           <Link
-            href="/admin/mapping"
+            href="/admin/ocr-configs"
             className="block py-2 px-4 rounded hover:bg-slate-700"
           >
-            Mapping Templates
+            OCR Configs (Unified)
           </Link>
           <Link
             href="/admin/usage"

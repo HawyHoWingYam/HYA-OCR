@@ -6,7 +6,7 @@ from typing import Dict, Any, List
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 from db.models import (
-    Company, DocumentType, CompanyDocumentConfig,
+    Company, DocumentType, CompanyDocTypeConfig,
     ProcessingJob, BatchJob, File as DBFile, DocumentFile, ApiUsage
 )
 from utils.s3_storage import get_s3_manager
@@ -88,9 +88,9 @@ class ForceDeleteManager:
                 self.db.delete(batch_job)
                 deletion_stats["batch_jobs"] += 1
             
-            # 3. 刪除 CompanyDocumentConfig 記錄和相關 S3 文件
-            configs = self.db.query(CompanyDocumentConfig).filter(
-                CompanyDocumentConfig.doc_type_id == doc_type_id
+            # 3. 刪除 CompanyDocTypeConfig 記錄和相關 S3 文件
+            configs = self.db.query(CompanyDocTypeConfig).filter(
+                CompanyDocTypeConfig.doc_type_id == doc_type_id
             ).all()
             
             for config in configs:
@@ -192,9 +192,9 @@ class ForceDeleteManager:
                 self.db.delete(batch_job)
                 deletion_stats["batch_jobs"] += 1
             
-            # 3. 刪除 CompanyDocumentConfig 記錄和相關 S3 文件
-            configs = self.db.query(CompanyDocumentConfig).filter(
-                CompanyDocumentConfig.company_id == company_id
+            # 3. 刪除 CompanyDocTypeConfig 記錄和相關 S3 文件
+            configs = self.db.query(CompanyDocTypeConfig).filter(
+                CompanyDocTypeConfig.company_id == company_id
             ).all()
             
             for config in configs:
@@ -238,8 +238,8 @@ class ForceDeleteManager:
             self.db.begin()
             
             # 獲取配置信息
-            config = self.db.query(CompanyDocumentConfig).filter(
-                CompanyDocumentConfig.config_id == config_id
+            config = self.db.query(CompanyDocTypeConfig).filter(
+                CompanyDocTypeConfig.config_id == config_id
             ).first()
             if not config:
                 raise ValueError(f"Configuration with ID {config_id} not found")
@@ -278,7 +278,7 @@ class ForceDeleteManager:
             logger.error(f"Failed to force delete config {config_id}: {str(e)}")
             raise Exception(f"Force delete failed: {str(e)}")
     
-    def _delete_config_s3_files(self, config: CompanyDocumentConfig) -> int:
+    def _delete_config_s3_files(self, config: CompanyDocTypeConfig) -> int:
         """刪除配置相關的 S3 文件"""
         deleted_count = 0
         

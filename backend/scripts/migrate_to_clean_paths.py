@@ -28,7 +28,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
 from sqlalchemy.orm import Session
 from db.database import get_db
-from db.models import CompanyDocumentConfig, Company, DocumentType
+from db.models import CompanyDocTypeConfig, Company, DocumentType
 from utils.s3_storage import get_s3_manager
 
 # Setup logging
@@ -51,7 +51,7 @@ class CleanPathMigrator:
         logger.info("🔍 Identifying migration candidates...")
         
         candidates = []
-        configs = self.db.query(CompanyDocumentConfig).all()
+        configs = self.db.query(CompanyDocTypeConfig).all()
         
         for config in configs:
             needs_migration = False
@@ -283,8 +283,8 @@ class CleanPathMigrator:
         logger.info(f"🔍 Verifying migration for config {config_id}")
         
         try:
-            config = self.db.query(CompanyDocumentConfig).filter(
-                CompanyDocumentConfig.config_id == config_id
+            config = self.db.query(CompanyDocTypeConfig).filter(
+                CompanyDocTypeConfig.config_id == config_id
             ).first()
             
             if not config:
@@ -363,7 +363,7 @@ def main():
         
         if args.verify_only:
             # Verify all configurations
-            configs = db.query(CompanyDocumentConfig).all()
+            configs = db.query(CompanyDocTypeConfig).all()
             for config in configs:
                 migrator.verify_migration(config.config_id)
             return

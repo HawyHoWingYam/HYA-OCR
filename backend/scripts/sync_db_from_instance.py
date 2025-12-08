@@ -50,7 +50,7 @@ Examples
 
   # Data-only sync for specific config/reference tables
   python backend/scripts/sync_db_from_instance.py --data-only \\
-      -t company_document_configs -t mapping_templates -t company_doc_mapping_defaults
+      -t company_document_configs -t company_doc_mapping_defaults
 
   # Non-interactive (unsafe; for automation)
   python backend/scripts/sync_db_from_instance.py --yes

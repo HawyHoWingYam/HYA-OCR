@@ -16,7 +16,7 @@ import uuid
 from .s3_storage import S3StorageManager, get_s3_manager
 from .enhanced_file_manager import EnhancedFileManager, FileRetentionPolicy
 from db.database import get_db
-from db.models import BatchJob, Company, DocumentType, CompanyDocumentConfig
+from db.models import BatchJob, Company, DocumentType, CompanyDocTypeConfig
 from sqlalchemy.orm import Session
 
 logger = logging.getLogger(__name__)
@@ -207,7 +207,7 @@ class S3BackupManager:
             backup_result['files_created'] += 1
             
             # 3. Backup company document configurations
-            configs = db.query(CompanyDocumentConfig).all()
+            configs = db.query(CompanyDocTypeConfig).all()
             configs_data = []
             for config in configs:
                 configs_data.append({
@@ -306,11 +306,11 @@ class S3BackupManager:
             backup_folder = f"backups/configurations/{datetime.now().strftime('%Y-%m-%d')}/{backup_name}"
             
             # Get configurations to backup
-            query = db.query(CompanyDocumentConfig)
+            query = db.query(CompanyDocTypeConfig)
             if company_id:
-                query = query.filter(CompanyDocumentConfig.company_id == company_id)
-            
-            configs = query.filter(CompanyDocumentConfig.active == True).all()
+                query = query.filter(CompanyDocTypeConfig.company_id == company_id)
+
+            configs = query.filter(CompanyDocTypeConfig.active == True).all()
             
             backed_up_files = []
             

@@ -16,8 +16,6 @@ interface Order {
   total_attachments: number;
   completed_attachments: number;
   failed_attachments: number;
-  mapping_file_path: string | null;
-  mapping_keys: string[] | null;
   final_report_paths: any | null;
   created_at: string;
   updated_at: string;
@@ -43,9 +41,6 @@ export default function OrdersPage() {
   const [statusFilter, setStatusFilter] = useState('');
   const [showCreateOrderModal, setShowCreateOrderModal] = useState(false);
   const [newOrderName, setNewOrderName] = useState('');
-  const [primaryDocTypeId, setPrimaryDocTypeId] = useState<number | ''>('');
-  const [docTypes, setDocTypes] = useState<DocumentType[]>([]);
-  const [isLoadingDocTypes, setIsLoadingDocTypes] = useState(false);
   const [isCreatingOrder, setIsCreatingOrder] = useState(false);
   const [createOrderError, setCreateOrderError] = useState('');
 
@@ -83,22 +78,6 @@ export default function OrdersPage() {
     } finally {
       setIsLoading(false);
       setIsPageLoading(false);
-    }
-  };
-
-  const loadDocumentTypes = async () => {
-    try {
-      setIsLoadingDocTypes(true);
-      const response = await fetch('/api/document-types');
-      if (!response.ok) {
-        throw new Error('Failed to fetch document types');
-      }
-      const data = await response.json();
-      setDocTypes(data);
-    } catch (err) {
-      console.error('Error fetching document types:', err);
-    } finally {
-      setIsLoadingDocTypes(false);
     }
   };
 
@@ -170,10 +149,6 @@ export default function OrdersPage() {
     };
   }, []);
 
-  useEffect(() => {
-    loadDocumentTypes();
-  }, []);
-
   const handlePageChange = (page: number) => {
     if (page !== currentPage && page >= 1 && (!pagination || page <= pagination.total_pages)) {
       loadOrders(page, statusFilter, true);
@@ -189,7 +164,6 @@ export default function OrdersPage() {
   const openCreateOrderModal = () => {
     const defaultName = `Order ${new Date().toLocaleDateString()}`;
     setNewOrderName(defaultName);
-    setPrimaryDocTypeId('');
     setCreateOrderError('');
     setShowCreateOrderModal(true);
   };
@@ -208,9 +182,6 @@ export default function OrdersPage() {
       if (trimmedName) {
         payload.order_name = trimmedName;
       }
-      if (typeof primaryDocTypeId === 'number') {
-        payload.primary_doc_type_id = primaryDocTypeId;
-      }
 
       const response = await fetch(`/api/orders`, {
         method: 'POST',
@@ -228,7 +199,6 @@ export default function OrdersPage() {
       const data = await response.json();
       setShowCreateOrderModal(false);
       setNewOrderName('');
-      setPrimaryDocTypeId('');
       router.push(`/orders/${data.order_id}`);
     } catch (error) {
       console.error('Error creating order:', error);
@@ -264,11 +234,6 @@ export default function OrdersPage() {
     if (!order.total_attachments || order.total_attachments === 0) return 0;
     return Math.round((order.completed_attachments / order.total_attachments) * 100);
   };
-
-  const selectedPrimaryDocType =
-    typeof primaryDocTypeId === 'number'
-      ? docTypes.find((dt) => dt.doc_type_id === primaryDocTypeId)
-      : null;
 
   return (
     <div className="container mx-auto px-4 py-8">
@@ -517,43 +482,6 @@ export default function OrdersPage() {
                   className="w-full border border-gray-300 rounded px-3 py-2"
                 />
                 <p className="text-xs text-gray-500 mt-1">Optional. Leave blank for an auto-generated name.</p>
-              </div>
-
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">Primary Document Type</label>
-                <select
-                  value={primaryDocTypeId === '' ? '' : primaryDocTypeId}
-                  onChange={(e) => {
-                    const value = e.target.value;
-                    if (value === '') {
-                      setPrimaryDocTypeId('');
-                    } else {
-                      setPrimaryDocTypeId(parseInt(value, 10));
-                    }
-                  }}
-                  disabled={isLoadingDocTypes}
-                  className="w-full border border-gray-300 rounded px-3 py-2"
-                >
-                  <option value="">None selected</option>
-                  {docTypes.map((docType) => (
-                    <option key={docType.doc_type_id} value={docType.doc_type_id}>
-                      {docType.type_name} {docType.has_template ? '(Template ready)' : '(No template)'}
-                    </option>
-                  ))}
-                </select>
-                {isLoadingDocTypes && (
-                  <p className="text-xs text-gray-500 mt-1">Loading document types…</p>
-                )}
-                <p className="text-xs text-gray-500 mt-1">
-                  Selecting a type with a template will enable automated special CSV generation.
-                </p>
-                {selectedPrimaryDocType && (
-                  <div className={`mt-2 text-xs ${selectedPrimaryDocType.has_template ? 'text-green-600' : 'text-gray-500'}`}>
-                    {selectedPrimaryDocType.has_template
-                      ? `Template configured${selectedPrimaryDocType.template_version ? ` (v${selectedPrimaryDocType.template_version})` : ''}`
-                      : 'This document type does not currently have a template.'}
-                  </div>
-                )}
               </div>
 
               {createOrderError && (

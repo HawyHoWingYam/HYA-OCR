@@ -6,8 +6,8 @@
 from typing import Dict, List, Optional, Tuple
 from sqlalchemy.orm import Session
 from db.models import (
-    Company, DocumentType, ProcessingJob, BatchJob, 
-    CompanyDocumentConfig, DepartmentDocTypeAccess
+    Company, DocumentType, ProcessingJob, BatchJob,
+    CompanyDocTypeConfig, DepartmentDocTypeAccess
 )
 import logging
 
@@ -49,8 +49,8 @@ class DependencyChecker:
         
         # 檢查 company_document_configs 依賴
         config_count = (
-            self.db.query(CompanyDocumentConfig)
-            .filter(CompanyDocumentConfig.company_id == company_id)
+            self.db.query(CompanyDocTypeConfig)
+            .filter(CompanyDocTypeConfig.company_id == company_id)
             .count()
         )
         
@@ -101,8 +101,8 @@ class DependencyChecker:
         
         # 檢查 company_document_configs 依賴
         config_count = (
-            self.db.query(CompanyDocumentConfig)
-            .filter(CompanyDocumentConfig.doc_type_id == doc_type_id)
+            self.db.query(CompanyDocTypeConfig)
+            .filter(CompanyDocTypeConfig.doc_type_id == doc_type_id)
             .count()
         )
         

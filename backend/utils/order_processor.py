@@ -6,9 +6,11 @@ Handles the complete OCR Order workflow from submission to completion
 import asyncio
 import json
 import os
+import shutil
 import tempfile
 import zipfile
 import re
+import hashlib
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Union, Tuple, TYPE_CHECKING
 from enum import Enum
@@ -30,23 +32,22 @@ from db.models import (
     OrderItemType,
     Company,
     DocumentType,
-    CompanyDocumentConfig,
+    CompanyDocTypeConfig,
     File,
     ApiUsage,
-    CompanyDocMappingDefault,
-    MappingTemplate,
 )
 from main import extract_text_from_image, extract_text_from_pdf
 from utils.s3_storage import get_s3_manager
 from utils.special_csv_generator import SpecialCsvGenerator
 from utils.template_service import sanitize_template_version
-from utils.prompt_schema_manager import get_prompt_schema_manager
+from utils.prompt_schema_manager import get_prompt_schema_manager, PromptSchemaManager
+from utils.company_doc_type_config_resolver import CompanyDocTypeConfigResolver
 from utils.excel_converter import json_to_excel, json_to_csv
+from utils.file_storage import get_file_storage
 # Lazy import OneDrive client to avoid hard dependency at module import time
 if TYPE_CHECKING:
     from utils.onedrive_client import OneDriveClient  # pragma: no cover - typing only
-from utils.mapping_config import MappingItemType
-from utils.mapping_config_resolver import MappingConfigResolver
+from utils.mapping_config import MASTER_CSV_ROOT, MappingItemType
 from utils.order_stats import build_order_update_payload
 from utils.ws_notify import broadcast as ws_broadcast, broadcast_summary as ws_broadcast_summary
 from config_loader import config_loader
@@ -460,43 +461,20 @@ class MatchingEngine:
             )
 
 
-def _has_applicable_mapping_template(
-    db: Session,
-    company_id: int,
-    doc_type_id: int,
-    item_type: OrderItemType,
-) -> bool:
-    """
-    Check whether there is any MappingTemplate that could apply to this item.
-
-    Follows the same matching rules as MappingConfigResolver._resolve_template:
-    - item_type must match
-    - company_id/doc_type_id can be exact match or NULL (global)
-    """
-    templates = (
-        db.query(MappingTemplate)
-        .filter(MappingTemplate.item_type == item_type)
-        .filter(
-            (MappingTemplate.company_id.is_(None)) | (MappingTemplate.company_id == company_id),
-            (MappingTemplate.doc_type_id.is_(None)) | (MappingTemplate.doc_type_id == doc_type_id),
-        )
-        .limit(1)
-        .all()
-    )
-    return bool(templates)
-
-
 def _order_requires_mapping(db: Session, order: OcrOrder) -> bool:
     """
     Determine whether an order should run mapping stage.
 
+    Returns True only if at least one item has a valid, resolvable mapping config.
+    Incomplete or invalid configs are treated as "no mapping available".
+
     Rules:
     - If any item already has mapping_config -> require mapping
-    - Else if order has legacy mapping_file_path/mapping_keys -> require mapping
-    - Else if there is any CompanyDocMappingDefault for items -> require mapping
-    - Else if there is any applicable MappingTemplate for items -> require mapping
+    - Else if there is any VALID CompanyDocTypeConfig for items -> require mapping
     - Otherwise, treat as OCR-only (mapping skipped)
     """
+    from utils.company_doc_type_config_resolver import CompanyDocTypeConfigResolver
+
     items = db.query(OcrOrderItem).filter(OcrOrderItem.order_id == order.order_id).all()
     if not items:
         return False
@@ -506,29 +484,35 @@ def _order_requires_mapping(db: Session, order: OcrOrder) -> bool:
         if item.mapping_config:
             return True
 
-    # Legacy order-level mapping settings
-    if order.mapping_file_path or (order.mapping_keys and len(order.mapping_keys) > 0):
-        return True
+    # Check if any item has a valid resolvable CompanyDocTypeConfig
+    resolver = CompanyDocTypeConfigResolver(db)
 
-    # Defaults or templates for any item
     for item in items:
-        # Explicit default record
-        default_exists = (
-            db.query(CompanyDocMappingDefault)
-            .filter(
-                CompanyDocMappingDefault.company_id == item.company_id,
-                CompanyDocMappingDefault.doc_type_id == item.doc_type_id,
-                CompanyDocMappingDefault.item_type == item.item_type,
-            )
-            .first()
-            is not None
-        )
-        if default_exists:
-            return True
+        # Normalize item_type to enum
+        if isinstance(item.item_type, OrderItemType):
+            item_type_enum = item.item_type
+        else:
+            item_type_enum = OrderItemType(str(item.item_type))
 
-        # Applicable template (company/doc_type specific or global)
-        if _has_applicable_mapping_template(db, item.company_id, item.doc_type_id, item.item_type):
-            return True
+        try:
+            # Try to resolve mapping config
+            resolved = resolver.resolve_for_item(
+                company_id=item.company_id,
+                doc_type_id=item.doc_type_id,
+                item_type=item_type_enum,
+                current_config=item.mapping_config,
+            )
+
+            # If resolution succeeds and returns a config, mapping is required
+            if resolved is not None:
+                return True
+
+        except ValueError as exc:
+            # Invalid/incomplete config -> treat as not present
+            logger.debug(
+                f"Item {item.item_id} has incomplete mapping config, treating as no mapping: {exc}"
+            )
+            continue
 
     return False
 
@@ -538,11 +522,14 @@ class OrderProcessor:
 
     def __init__(self):
         self.s3_manager = get_s3_manager()
+        # Unified file storage (local filesystem or S3 depending on STORAGE_BACKEND)
+        self.file_storage = get_file_storage()
         self.prompt_schema_manager = get_prompt_schema_manager()
         self.app_config = config_loader.get_app_config()
         self.special_csv_generator = SpecialCsvGenerator()
         self.onedrive_client: Optional['OneDriveClient'] = None
         self._master_csv_cache: Dict[str, pd.DataFrame] = {}
+        self.storage_backend = os.getenv("STORAGE_BACKEND", "").lower()
 
         # Initialize intelligent matching engine with default configuration
         default_config = MatchingConfig(
@@ -553,6 +540,11 @@ class OrderProcessor:
             case_sensitive=False
         )
         self.matching_engine = MatchingEngine(default_config)
+
+    @property
+    def use_s3(self) -> bool:
+        """Check if S3 storage is configured and should be used."""
+        return self.s3_manager is not None and self.storage_backend == "s3"
 
     # ------------------------------------------------------------------
     # Mapping helpers
@@ -634,6 +626,11 @@ class OrderProcessor:
             logger.warning(f"Failed to apply output metadata mapping: {e}")
 
     def _get_master_csv_dataframe(self, path: str) -> pd.DataFrame:
+        # Runtime safety guard: ensure path starts with MASTER_CSV_ROOT
+        path = path.strip()
+        if not (path.startswith(MASTER_CSV_ROOT + "/") or path == MASTER_CSV_ROOT):
+            raise RuntimeError(f"master_csv_path must start with '{MASTER_CSV_ROOT}', got: {path}")
+
         cached = self._master_csv_cache.get(path)
         if cached is not None:
             return cached.copy()
@@ -660,18 +657,32 @@ class OrderProcessor:
         if not uri:
             return None
 
-        if uri.startswith("s3://"):
-            key = uri.replace(f"s3://{self.s3_manager.bucket_name}/", "")
-            if key.startswith(self.s3_manager.upload_prefix):
-                key = key[len(self.s3_manager.upload_prefix):]
-            return self.s3_manager.download_file(key)
+        # Prefer unified file storage helper so both local paths and s3:// URIs work
+        try:
+            content = self.file_storage.read_file(uri)
+            if content:
+                return content
+        except Exception as exc:
+            logger.warning(f"Failed to load content via file storage for '{uri}': {exc}")
 
-        if os.path.exists(uri):
-            with open(uri, "rb") as file_obj:
-                return file_obj.read()
+        # Legacy S3 fallbacks for older stored paths (relative keys etc.)
+        if self.s3_manager:
+            try:
+                if uri.startswith("s3://"):
+                    key = uri.replace(f"s3://{self.s3_manager.bucket_name}/", "")
+                    if key.startswith(self.s3_manager.upload_prefix):
+                        key = key[len(self.s3_manager.upload_prefix):]
+                    return self.s3_manager.download_file(key)
 
-        # Fallback to file storage helper (handles s3:// formatted paths stored elsewhere)
-        return self.s3_manager.download_file_by_stored_path(uri)
+                if os.path.exists(uri):
+                    with open(uri, "rb") as file_obj:
+                        return file_obj.read()
+
+                return self.s3_manager.download_file_by_stored_path(uri)
+            except Exception as exc:
+                logger.error(f"Fallback S3 download failed for '{uri}': {exc}")
+
+        return None
 
     def _load_item_records(self, item: OcrOrderItem) -> List[Dict[str, Any]]:
         if not item.ocr_result_json_path:
@@ -695,7 +706,15 @@ class OrderProcessor:
             # Attempt to append attachment file-level results if manifest exists
             try:
                 manifest_path = f"upload/results/orders/{item.item_id // 1000}/items/{item.item_id}/item_{item.item_id}_file_results.json"
-                manifest_bytes = self.s3_manager.download_file_by_stored_path(manifest_path)
+                manifest_bytes = None
+
+                # Prefer unified storage for manifest as well (works for local paths if we ever migrate)
+                if self.s3_manager:
+                    try:
+                        manifest_bytes = self.s3_manager.download_file_by_stored_path(manifest_path)
+                    except Exception:
+                        manifest_bytes = None
+
                 if manifest_bytes:
                     manifest_json = json.loads(manifest_bytes.decode("utf-8"))
                     # Manifest v1: list of {file_id, result_json_path}
@@ -742,6 +761,141 @@ class OrderProcessor:
             return records
         except Exception as exc:
             raise RuntimeError(f"Invalid OCR result JSON for item {item.item_id}: {exc}") from exc
+
+    def _resolve_mapping_config_for_item(self, db: Session, item: OcrOrderItem) -> Dict[str, Any]:
+        """Resolve and normalise mapping configuration for an item.
+
+        Prefer the new company_doc_type_configs table. Legacy MappingTemplate /
+        CompanyDocMappingDefault resolution has been removed.
+        """
+        base_config = item.mapping_config or {}
+        item_type_enum = item.item_type if isinstance(item.item_type, OrderItemType) else OrderItemType(item.item_type)
+        mapping_item_type = MappingItemType(item_type_enum.value)
+
+        # First attempt: new CompanyDocTypeConfig
+        new_resolver = CompanyDocTypeConfigResolver(db)
+        try:
+            resolved = new_resolver.resolve_for_item(
+                company_id=item.company_id,
+                doc_type_id=item.doc_type_id,
+                item_type=item_type_enum,
+                current_config=base_config,
+            )
+        except ValueError as exc:
+            raise RuntimeError(f"Invalid mapping configuration for item {item.item_id}: {exc}") from exc
+
+        if resolved is not None:
+            return resolved
+
+        # If absolutely nothing is configured in unified configs, propagate a clear error
+        # so the caller can update item-level mapping_config or create a CompanyDocTypeConfig.
+        raise RuntimeError(
+            f"No unified mapping configuration defined for item {item.item_id} "
+            f"(company_id={item.company_id}, doc_type_id={item.doc_type_id}, item_type={item_type_enum.value})"
+        )
+
+    def _process_multi_source_two_step(
+        self,
+        *,
+        item: OcrOrderItem,
+        records: List[Dict[str, Any]],
+        cfg: CompanyDocTypeConfig,
+    ) -> pd.DataFrame:
+        """Run multi-source mapping in two steps:
+
+        1) Aggregate primary + attachments -> internal multi-source DataFrame.
+           Optionally join with a month Excel (selected_month_excel_path) using
+           cfg.multi_source_step1_config.
+        2) Join the step1 result with the master CSV using cfg.master_csv_path
+           and cfg.multi_source_step2_config / item.mapping_config overrides.
+        """
+        # Step 0: build multi-source base DataFrame from OCR records
+        internal_key = None
+        if isinstance(item.mapping_config, dict):
+            internal_key = item.mapping_config.get("internal_join_key")
+        if not internal_key and getattr(cfg, "internal_join_key", None):
+            internal_key = cfg.internal_join_key
+
+        item_df = self._build_multi_source_dataframe(item, records, internal_key)
+
+        # Step 1: join with month Excel (if configured)
+        month_path = getattr(item, "selected_month_excel_path", None)
+        if not month_path:
+            raise RuntimeError(
+                "selected_month_excel_path is required for two-step multi-source mapping"
+            )
+
+        month_df = self._get_master_csv_dataframe(month_path)
+
+        step1_cfg = cfg.multi_source_step1_config or {}
+        step1_join_keys = step1_cfg.get("join_keys", [])
+        step1_column_aliases = step1_cfg.get("column_aliases")
+        step1_join_normalize = step1_cfg.get("join_normalize")
+        step1_merge_suffix = step1_cfg.get("merge_suffix", "_month")
+
+        step1_df = self._join_with_master_csv(
+            item_df,
+            month_df,
+            step1_join_keys,
+            step1_column_aliases,
+            step1_join_normalize,
+            step1_merge_suffix,
+        )
+
+        # Step 2: join step1 result with master CSV
+        master_path = None
+        if isinstance(item.mapping_config, dict):
+            master_path = item.mapping_config.get("master_csv_path")
+        if not master_path and getattr(cfg, "master_csv_path", None):
+            master_path = cfg.master_csv_path
+        if not master_path:
+            raise RuntimeError("master_csv_path is required for multi-source step 2 mapping")
+
+        master_df = self._get_master_csv_dataframe(master_path)
+
+        step2_cfg = cfg.multi_source_step2_config or {}
+
+        # external_join_keys: item-level override wins, falls back to step2 join_keys
+        external_join_keys = None
+        if isinstance(item.mapping_config, dict):
+            external_join_keys = item.mapping_config.get("external_join_keys")
+        if not external_join_keys:
+            external_join_keys = step2_cfg.get("join_keys", [])
+
+        # column_aliases: item-level override then step2 config
+        column_aliases = None
+        if isinstance(item.mapping_config, dict):
+            column_aliases = item.mapping_config.get("column_aliases")
+        if column_aliases is None:
+            column_aliases = step2_cfg.get("column_aliases")
+
+        # join_normalize: item-level override or legacy join_value_normalization, then step2 config
+        join_normalize = None
+        if isinstance(item.mapping_config, dict):
+            join_normalize = (
+                item.mapping_config.get("join_normalize")
+                or item.mapping_config.get("join_value_normalization")
+            )
+        if join_normalize is None:
+            join_normalize = step2_cfg.get("join_normalize")
+
+        # merge_suffix: item-level override then step2 config
+        merge_suffix = None
+        if isinstance(item.mapping_config, dict):
+            merge_suffix = item.mapping_config.get("merge_suffix")
+        if merge_suffix is None:
+            merge_suffix = step2_cfg.get("merge_suffix")
+
+        final_df = self._join_with_master_csv(
+            step1_df,
+            master_df,
+            external_join_keys,
+            column_aliases,
+            join_normalize,
+            merge_suffix,
+        )
+
+        return final_df
 
     @staticmethod
     def _strip_metadata(record: Dict[str, Any]) -> Dict[str, Any]:
@@ -1365,15 +1519,39 @@ class OrderProcessor:
         item: OcrOrderItem,
         mapped_df: pd.DataFrame,
     ) -> str:
-        s3_base = f"results/orders/{order_id // 1000}/items/{item.item_id}"
-        csv_key = f"{s3_base}/item_{item.item_id}_mapped_final.csv"
+        storage_backend = os.getenv("STORAGE_BACKEND", "").lower()
 
-        csv_bytes = mapped_df.to_csv(index=False).encode("utf-8")
-        upload_success = self.s3_manager.upload_file(csv_bytes, csv_key)
-        if not upload_success:
-            raise RuntimeError("Failed to upload mapped CSV to storage")
+        # S3-backed storage
+        if self.s3_manager and storage_backend == "s3":
+            s3_base = f"results/orders/{order_id // 1000}/items/{item.item_id}"
+            csv_key = f"{s3_base}/item_{item.item_id}_mapped_final.csv"
 
-        return f"s3://{self.s3_manager.bucket_name}/{self.s3_manager.upload_prefix}{csv_key}"
+            csv_bytes = mapped_df.to_csv(index=False).encode("utf-8")
+            upload_success = self.s3_manager.upload_file(csv_bytes, csv_key)
+            if not upload_success:
+                raise RuntimeError("Failed to upload mapped CSV to storage")
+
+            return f"s3://{self.s3_manager.bucket_name}/{self.s3_manager.upload_prefix}{csv_key}"
+
+        # Local filesystem storage
+        base_dir = os.getenv("LOCAL_RESULT_CSV_DIR") or os.path.join(
+            os.getenv("LOCAL_STORAGE_ROOT", "../storage"),
+            "results",
+            "csv",
+        )
+        item_dir = os.path.join(
+            base_dir,
+            "orders",
+            str(order_id // 1000),
+            "items",
+            str(item.item_id),
+        )
+        os.makedirs(item_dir, exist_ok=True)
+
+        csv_path = os.path.join(item_dir, f"item_{item.item_id}_mapped_final.csv")
+        mapped_df.to_csv(csv_path, index=False, encoding="utf-8")
+        logger.info(f"✅ Saved mapped CSV locally for order {order_id} item {item.item_id}: {csv_path}")
+        return csv_path
 
     async def process_order(self, order_id: int):
         """Process an entire OCR order"""
@@ -1483,11 +1661,6 @@ class OrderProcessor:
                 order = db.query(OcrOrder).filter(OcrOrder.order_id == order_id).first()
                 if not order:
                     logger.error(f"Order {order_id} not found")
-                    return
-
-                # Check if order is locked
-                if order.status == OrderStatus.LOCKED:
-                    logger.error(f"Order {order_id} is locked and cannot be processed for OCR")
                     return
 
                 if order.status != OrderStatus.PROCESSING:
@@ -1618,7 +1791,6 @@ class OrderProcessor:
                     return None
 
                 # Generate CSV
-                s3_base = f"results/orders/{item_id // 1000}/items/{item_id}"
                 with tempfile.NamedTemporaryFile(suffix='.csv', delete=False) as temp_csv:
                     temp_csv_path = temp_csv.name
 
@@ -1627,19 +1799,43 @@ class OrderProcessor:
                     df = pd.DataFrame(csv_rows)
                     df.to_csv(temp_csv_path, index=False, encoding='utf-8')
 
-                    # Upload to S3
-                    with open(temp_csv_path, 'rb') as csv_file:
-                        csv_content = csv_file.read()
-                        csv_s3_key = f"{s3_base}/item_{item_id}_mapped.csv"
-                        csv_upload_success = self.s3_manager.upload_file(csv_content, csv_s3_key)
+                    storage_backend = os.getenv("STORAGE_BACKEND", "").lower()
 
-                        if csv_upload_success:
-                            csv_path = f"s3://{self.s3_manager.bucket_name}/{self.s3_manager.upload_prefix}{csv_s3_key}"
-                            logger.info(f"Generated mapped CSV for item {item_id}: {csv_s3_key}")
-                            return csv_path
-                        else:
-                            logger.error(f"Failed to upload mapped CSV for item {item_id}")
-                            return None
+                    # S3-backed storage
+                    if self.s3_manager and storage_backend == "s3":
+                        s3_base = f"results/orders/{item_id // 1000}/items/{item_id}"
+                        with open(temp_csv_path, 'rb') as csv_file:
+                            csv_content = csv_file.read()
+                            csv_s3_key = f"{s3_base}/item_{item_id}_mapped.csv"
+                            csv_upload_success = self.s3_manager.upload_file(csv_content, csv_s3_key)
+
+                            if csv_upload_success:
+                                csv_path = f"s3://{self.s3_manager.bucket_name}/{self.s3_manager.upload_prefix}{csv_s3_key}"
+                                logger.info(f"Generated mapped CSV for item {item_id}: {csv_s3_key}")
+                                return csv_path
+                            else:
+                                logger.error(f"Failed to upload mapped CSV for item {item_id}")
+                                return None
+
+                    # Local filesystem storage
+                    base_dir = os.getenv("LOCAL_RESULT_CSV_DIR") or os.path.join(
+                        os.getenv("LOCAL_STORAGE_ROOT", "../storage"),
+                        "results",
+                        "csv",
+                    )
+                    item_dir = os.path.join(
+                        base_dir,
+                        "orders",
+                        str(item_id // 1000),
+                        "items",
+                        str(item_id),
+                    )
+                    os.makedirs(item_dir, exist_ok=True)
+
+                    csv_path = os.path.join(item_dir, f"item_{item_id}_mapped.csv")
+                    shutil.copyfile(temp_csv_path, csv_path)
+                    logger.info(f"Generated mapped CSV for item {item_id} at local path: {csv_path}")
+                    return csv_path
                 finally:
                     try:
                         os.unlink(temp_csv_path)
@@ -1673,8 +1869,52 @@ class OrderProcessor:
                     raise Exception("Company or document type not found")
 
                 # Load prompt and schema for this company/doc type. These are required for OCR.
-                prompt = await self.prompt_schema_manager.get_prompt(company.company_code, doc_type.type_code)
-                schema = await self.prompt_schema_manager.get_schema(company.company_code, doc_type.type_code)
+                company_code = company.company_code
+                doc_type_code = doc_type.type_code
+
+                config = CompanyDocTypeConfigResolver.get_active_row(
+                    db,
+                    item.company_id,
+                    item.doc_type_id,
+                    item.item_type,
+                )
+                item._resolved_config_id = config.config_id if config else None
+
+                prompt = None
+                schema = None
+
+                if config and config.prompt_path and config.schema_path:
+                    try:
+                        prompt, schema = await PromptSchemaManager.load_from_paths(
+                            config.prompt_path,
+                            config.schema_path,
+                            cache_key=f"config:{config.config_id}",
+                        )
+                        if prompt and schema:
+                            logger.info(
+                                "📄 Using CompanyDocTypeConfig %s for order item %s",
+                                config.config_id,
+                                item_id,
+                            )
+                        else:
+                            logger.warning(
+                                "⚠️ CompanyDocTypeConfig %s missing prompt/schema for order item %s; falling back",
+                                config.config_id,
+                                item_id,
+                            )
+                    except Exception as cfg_exc:
+                        logger.error(
+                            "⚠️ Failed to load prompt/schema from CompanyDocTypeConfig %s for order item %s: %s",
+                            config.config_id,
+                            item_id,
+                            cfg_exc,
+                        )
+                        prompt = None
+                        schema = None
+
+                if not prompt or not schema:
+                    prompt = await self.prompt_schema_manager.get_prompt(company_code, doc_type_code)
+                    schema = await self.prompt_schema_manager.get_schema(company_code, doc_type_code)
 
                 # Provide a clearer error so the UI can surface an actionable message
                 if not prompt or not schema:
@@ -1682,6 +1922,28 @@ class OrderProcessor:
                         f"Prompt or schema not found for {company.company_code}/{doc_type.type_code}. "
                         f"Please create and activate a configuration in Admin > Configs."
                     )
+
+                # Log detailed prompt/schema context for debugging
+                schema_fields = []
+                required_fields = []
+                if schema:
+                    props = schema.get("properties", {})
+                    schema_fields = list(props.keys())
+                    required_fields = schema.get("required", [])
+
+                logger.info(
+                    "📄 Config loaded - order=%s, item=%s, config_id=%s, prompt_path=%s, schema_path=%s, "
+                    "prompt_chars=%d, schema_fields=%d, required_fields=%d, fallback=%s",
+                    item.order_id,
+                    item_id,
+                    config.config_id if config else None,
+                    config.prompt_path if config else "legacy",
+                    config.schema_path if config else "legacy",
+                    len(prompt) if prompt else 0,
+                    len(schema_fields),
+                    len(required_fields),
+                    "no" if (config and config.prompt_path and config.schema_path) else "yes",
+                )
 
                 # Get files for this item (use helper to prioritize primary file)
                 primary_file_data, attachment_files = self._get_ordered_file_links(item)
@@ -1700,6 +1962,7 @@ class OrderProcessor:
                 all_results = []
                 temp_files_to_cleanup = []
                 is_awb = doc_type.type_code == "AIRWAY_BILL"  # Check if this is an AWB item
+                has_timeout = False  # Track if any file timed out
 
                 # Resolve model name once per item for API usage tracking
                 try:
@@ -1710,11 +1973,36 @@ class OrderProcessor:
 
                 for file_record, is_primary_file in all_files:
                     try:
-                        # Download file from S3 to temporary location
-                        file_content = self.s3_manager.download_file_by_stored_path(file_record.file_path)
+                        # Download file from storage (local path or S3 URI)
+                        file_content = None
+                        try:
+                            file_content = self.file_storage.read_file(file_record.file_path)
+                        except Exception as read_exc:
+                            logger.error(f"Failed to read file {file_record.file_path} from storage: {read_exc}")
+
+                        # Legacy S3-only fallback for older records
+                        if not file_content and self.s3_manager:
+                            try:
+                                file_content = self.s3_manager.download_file_by_stored_path(file_record.file_path)
+                            except Exception as s3_exc:
+                                logger.error(f"Failed to download file via S3 manager {file_record.file_path}: {s3_exc}")
                         if not file_content:
                             logger.error(f"Failed to download file: {file_record.file_path}")
                             continue
+
+                        # Log successful file acquisition with diagnostic info
+                        file_hash = hashlib.sha256(file_content).hexdigest()[:16]
+                        storage_backend = "s3" if (self.s3_manager and not self.file_storage) else "local"
+                        logger.info(
+                            "📥 File acquired - order=%s, item=%s, file_id=%s, filename=%s, storage=%s, size=%d bytes, hash=%s",
+                            item.order_id,
+                            item_id,
+                            file_record.file_id,
+                            file_record.file_name,
+                            storage_backend,
+                            len(file_content),
+                            file_hash,
+                        )
 
                         # Create temporary file
                         file_ext = os.path.splitext(file_record.file_name)[1].lower()
@@ -1723,9 +2011,29 @@ class OrderProcessor:
                             temp_file_path = temp_file.name
                             temp_files_to_cleanup.append(temp_file_path)
 
+                        # Validate temp file was written correctly
+                        temp_file_size = os.path.getsize(temp_file_path)
+                        if temp_file_size != len(file_content):
+                            logger.error(
+                                "⚠️ Temp file size mismatch - order=%s, item=%s, file_id=%s, expected=%d, actual=%d",
+                                item.order_id,
+                                item_id,
+                                file_record.file_id,
+                                len(file_content),
+                                temp_file_size,
+                            )
+
                         # Process the file via Gemini
                         if file_ext == '.pdf':
-                            result = await extract_text_from_pdf(temp_file_path, prompt, schema)
+                            result = await extract_text_from_pdf(
+                                temp_file_path, prompt, schema,
+                                context={
+                                    "order_id": item.order_id,
+                                    "item_id": item_id,
+                                    "file_id": file_record.file_id,
+                                    "filename": file_record.file_name,
+                                }
+                            )
                         else:
                             result = await extract_text_from_image(temp_file_path, prompt, schema)
 
@@ -1741,6 +2049,14 @@ class OrderProcessor:
                             processing_time = result.get("processing_time")
                             status_updates = result.get("status_updates") or {}
                             status = status_updates.get("status")
+
+                            # Check for timeout status
+                            if status == "timeout":
+                                has_timeout = True
+                                logger.error(
+                                    "⚠️ TIMEOUT DETECTED for order=%s, item=%s, file=%s - will mark item as FAILED",
+                                    item.order_id, item_id, file_record.file_name
+                                )
 
                         api_usage = ApiUsage(
                             item_id=item_id,
@@ -1860,8 +2176,21 @@ class OrderProcessor:
                 # Save item results to S3
                 await self._save_item_results(item_id, company.company_code, doc_type.type_code, all_results)
 
-                # Update item status
-                item.status = OrderItemStatus.COMPLETED
+                # Update item status - check for timeout first
+                if has_timeout:
+                    item.status = OrderItemStatus.FAILED
+                    item.error_message = "OCR processing timed out"
+                    logger.error(
+                        "❌ Item %s marked as FAILED due to timeout (order=%s)",
+                        item_id, item.order_id
+                    )
+                else:
+                    item.status = OrderItemStatus.COMPLETED
+                    logger.info(
+                        "✅ Item %s marked as COMPLETED (order=%s)",
+                        item_id, item.order_id
+                    )
+
                 item.processing_completed_at = datetime.utcnow()
 
                 if item.processing_started_at:
@@ -1869,7 +2198,7 @@ class OrderProcessor:
                     item.processing_time_seconds = processing_time
 
                 db.commit()
-                logger.info(f"Order item {item_id} processed successfully with {len(all_results)} results")
+                logger.info(f"✅ Order item {item_id} processed with {len(all_results)} results (order={item.order_id}, status={item.status})")
                 return True
 
             except Exception as e:
@@ -1895,24 +2224,49 @@ class OrderProcessor:
             result_data: OCR result data for this file
 
         Returns:
-            S3 path to the saved file result, or None if failed
+            Path/URI to the saved file result, or None if failed
         """
         try:
-            # Generate S3 path for file-level result
-            s3_base = f"results/orders/{item_id // 1000}/items/{item_id}"
-            file_result_key = f"{s3_base}/files/file_{file_id}_result.json"
+            storage_backend = os.getenv("STORAGE_BACKEND", "").lower()
 
-            # Save file-level JSON result
-            json_content = json.dumps(result_data, indent=2, ensure_ascii=False)
-            json_upload_success = self.s3_manager.upload_file(json_content.encode('utf-8'), file_result_key)
+            # S3-backed storage
+            if self.s3_manager and storage_backend == "s3":
+                s3_base = f"results/orders/{item_id // 1000}/items/{item_id}"
+                file_result_key = f"{s3_base}/files/file_{file_id}_result.json"
 
-            if json_upload_success:
-                file_result_path = f"s3://{self.s3_manager.bucket_name}/{self.s3_manager.upload_prefix}{file_result_key}"
-                logger.info(f"✅ Saved file-level result for item {item_id}, file {file_id}: {file_result_key}")
-                return file_result_path
-            else:
-                logger.error(f"Failed to upload file-level result for item {item_id}, file {file_id}")
-                return None
+                json_content = json.dumps(result_data, indent=2, ensure_ascii=False)
+                json_upload_success = self.s3_manager.upload_file(json_content.encode('utf-8'), file_result_key)
+
+                if json_upload_success:
+                    file_result_path = f"s3://{self.s3_manager.bucket_name}/{self.s3_manager.upload_prefix}{file_result_key}"
+                    logger.info(f"✅ Saved file-level result for item {item_id}, file {file_id}: {file_result_key}")
+                    return file_result_path
+                else:
+                    logger.error(f"Failed to upload file-level result for item {item_id}, file {file_id}")
+                    return None
+
+            # Local filesystem storage
+            base_dir = os.getenv("LOCAL_RESULT_JSON_DIR") or os.path.join(
+                os.getenv("LOCAL_STORAGE_ROOT", "../storage"),
+                "results",
+                "json",
+            )
+            files_dir = os.path.join(
+                base_dir,
+                "orders",
+                str(item_id // 1000),
+                "items",
+                str(item_id),
+                "files",
+            )
+            os.makedirs(files_dir, exist_ok=True)
+
+            file_result_path = os.path.join(files_dir, f"file_{file_id}_result.json")
+            with open(file_result_path, "w", encoding="utf-8") as f:
+                json.dump(result_data, f, indent=2, ensure_ascii=False)
+
+            logger.info(f"✅ Saved file-level result locally for item {item_id}, file {file_id}: {file_result_path}")
+            return file_result_path
 
         except Exception as e:
             logger.error(f"Error saving file-level result for item {item_id}, file {file_id}: {str(e)}")
@@ -1926,9 +2280,11 @@ class OrderProcessor:
             file_results_map: Dict mapping file_id to result_json_path
 
         Returns:
-            S3 path to the manifest file, or None if failed
+            Path/URI to the manifest file, or None if failed
         """
         try:
+            storage_backend = os.getenv("STORAGE_BACKEND", "").lower()
+
             # Build manifest structure
             manifest = [
                 {
@@ -1938,39 +2294,58 @@ class OrderProcessor:
                 for file_id, result_path in file_results_map.items()
             ]
 
-            # Generate S3 path for manifest
-            s3_base = f"results/orders/{item_id // 1000}/items/{item_id}"
-            manifest_key = f"{s3_base}/item_{item_id}_file_results.json"
+            # S3-backed storage
+            if self.s3_manager and storage_backend == "s3":
+                s3_base = f"results/orders/{item_id // 1000}/items/{item_id}"
+                manifest_key = f"{s3_base}/item_{item_id}_file_results.json"
 
-            # Save manifest
-            json_content = json.dumps(manifest, indent=2, ensure_ascii=False)
-            manifest_upload_success = self.s3_manager.upload_file(json_content.encode('utf-8'), manifest_key)
+                json_content = json.dumps(manifest, indent=2, ensure_ascii=False)
+                manifest_upload_success = self.s3_manager.upload_file(json_content.encode('utf-8'), manifest_key)
 
-            if manifest_upload_success:
-                manifest_path = f"s3://{self.s3_manager.bucket_name}/{self.s3_manager.upload_prefix}{manifest_key}"
-                logger.info(f"✅ Generated file results manifest for item {item_id} with {len(manifest)} files")
-                return manifest_path
-            else:
-                logger.error(f"Failed to upload manifest for item {item_id}")
-                return None
+                if manifest_upload_success:
+                    manifest_path = f"s3://{self.s3_manager.bucket_name}/{self.s3_manager.upload_prefix}{manifest_key}"
+                    logger.info(f"✅ Generated file results manifest for item {item_id} with {len(manifest)} files")
+                    return manifest_path
+                else:
+                    logger.error(f"Failed to upload manifest for item {item_id}")
+                    return None
+
+            # Local filesystem storage
+            base_dir = os.getenv("LOCAL_RESULT_JSON_DIR") or os.path.join(
+                os.getenv("LOCAL_STORAGE_ROOT", "../storage"),
+                "results",
+                "json",
+            )
+            item_dir = os.path.join(
+                base_dir,
+                "orders",
+                str(item_id // 1000),
+                "items",
+                str(item_id),
+            )
+            os.makedirs(item_dir, exist_ok=True)
+
+            manifest_path = os.path.join(item_dir, f"item_{item_id}_file_results.json")
+            with open(manifest_path, "w", encoding="utf-8") as f:
+                json.dump(manifest, f, indent=2, ensure_ascii=False)
+
+            logger.info(f"✅ Generated local file results manifest for item {item_id}: {manifest_path}")
+            return manifest_path
 
         except Exception as e:
             logger.error(f"Error generating file results manifest for item {item_id}: {str(e)}")
             return None
 
     async def _save_item_results(self, item_id: int, company_code: str, doc_type_code: str, results: List[Dict[str, Any]]):
-        """Save individual item results to S3, with file-level results for AWB items and CSV mapping"""
+        """Save individual item results to storage, with file-level results for AWB items and CSV mapping"""
         try:
-            # Generate S3 paths for item results
+            storage_backend = os.getenv("STORAGE_BACKEND", "").lower()
+            use_s3 = self.s3_manager is not None and storage_backend == "s3"
+
             s3_base = f"results/orders/{item_id // 1000}/items/{item_id}"
             is_awb = doc_type_code == "AIRWAY_BILL"
 
             # Separate primary file result from attachments.
-            # - The *first* record marked as primary is treated as the canonical
-            #   primary_result for backward compatibility.
-            # - Any additional primary-marked records (e.g. multiple invoices
-            #   parsed from the same primary file) are stored in attachment_results
-            #   so that they still appear in CSV/aggregated JSON.
             primary_result = None
             attachment_results = []
             for result in results:
@@ -1980,18 +2355,16 @@ class OrderProcessor:
                     attachment_results.append(result)
 
             # For AWB items, save file-level results (legacy behaviour used by AWB mapping)
-            file_results_map = {}
+            file_results_map: Dict[int, str] = {}
             if is_awb:
                 for result in results:
                     if "__file_id" in result:
                         file_id = result["__file_id"]
                         file_name = result.get("__filename", "unknown")
-                        # Save file-level result (single record per file for AWB)
                         file_result_path = await self._save_file_result(item_id, file_id, file_name, result)
                         if file_result_path:
                             file_results_map[file_id] = file_result_path
 
-                # Generate manifest for file results (AWB only)
                 if file_results_map:
                     await self._generate_file_results_manifest(item_id, file_results_map)
             else:
@@ -2014,40 +2387,69 @@ class OrderProcessor:
                     if not file_name:
                         file_name = "unknown"
 
-                    # Save the list of records for this file. The helper accepts arbitrary
-                    # JSON-serialisable data, so a list is fine.
                     await self._save_file_result(item_id, file_id, file_name, file_records)
 
             # Save JSON results:
-            # - Primary-only JSON for backward compatibility and mapping (if primary exists)
-            # - Aggregated JSON (all files) for combined result downloads
-            json_path = None
+            json_path: Optional[str] = None
 
-            if primary_result:
-                # Save primary file result (used by existing mapping and header preview logic)
-                primary_json_content = json.dumps(primary_result, indent=2, ensure_ascii=False)
-                primary_json_key = f"{s3_base}/item_{item_id}_primary.json"
-                primary_upload_success = self.s3_manager.upload_file(primary_json_content.encode('utf-8'), primary_json_key)
+            if use_s3:
+                if primary_result:
+                    primary_json_content = json.dumps(primary_result, indent=2, ensure_ascii=False)
+                    primary_json_key = f"{s3_base}/item_{item_id}_primary.json"
+                    primary_upload_success = self.s3_manager.upload_file(primary_json_content.encode('utf-8'), primary_json_key)
 
-                if primary_upload_success:
-                    json_path = f"s3://{self.s3_manager.bucket_name}/{self.s3_manager.upload_prefix}{primary_json_key}"
+                    if primary_upload_success:
+                        json_path = f"s3://{self.s3_manager.bucket_name}/{self.s3_manager.upload_prefix}{primary_json_key}"
 
-                # Additionally, save aggregated results (primary + attachments) for combined JSON view
-                try:
-                    aggregated_json_content = json.dumps(results, indent=2, ensure_ascii=False)
+                    # Additionally, save aggregated results (primary + attachments) for combined JSON view
+                    try:
+                        aggregated_json_content = json.dumps(results, indent=2, ensure_ascii=False)
+                        aggregated_json_key = f"{s3_base}/item_{item_id}_results.json"
+                        self.s3_manager.upload_file(aggregated_json_content.encode('utf-8'), aggregated_json_key)
+                    except Exception as e:
+                        logger.warning(f"Failed to save aggregated JSON results for item {item_id}: {e}")
+                else:
+                    aggregated_data = attachment_results if attachment_results else results
+                    aggregated_json_content = json.dumps(aggregated_data, indent=2, ensure_ascii=False)
                     aggregated_json_key = f"{s3_base}/item_{item_id}_results.json"
-                    self.s3_manager.upload_file(aggregated_json_content.encode('utf-8'), aggregated_json_key)
-                except Exception as e:
-                    logger.warning(f"Failed to save aggregated JSON results for item {item_id}: {e}")
-            else:
-                # No primary file, keep existing behavior: save aggregated results only
-                aggregated_data = attachment_results if attachment_results else results
-                aggregated_json_content = json.dumps(aggregated_data, indent=2, ensure_ascii=False)
-                aggregated_json_key = f"{s3_base}/item_{item_id}_results.json"
-                aggregated_upload_success = self.s3_manager.upload_file(aggregated_json_content.encode('utf-8'), aggregated_json_key)
+                    aggregated_upload_success = self.s3_manager.upload_file(aggregated_json_content.encode('utf-8'), aggregated_json_key)
 
-                if aggregated_upload_success:
-                    json_path = f"s3://{self.s3_manager.bucket_name}/{self.s3_manager.upload_prefix}{aggregated_json_key}"
+                    if aggregated_upload_success:
+                        json_path = f"s3://{self.s3_manager.bucket_name}/{self.s3_manager.upload_prefix}{aggregated_json_key}"
+            else:
+                # Local filesystem JSON storage
+                base_dir = os.getenv("LOCAL_RESULT_JSON_DIR") or os.path.join(
+                    os.getenv("LOCAL_STORAGE_ROOT", "../storage"),
+                    "results",
+                    "json",
+                )
+                item_dir = os.path.join(
+                    base_dir,
+                    "orders",
+                    str(item_id // 1000),
+                    "items",
+                    str(item_id),
+                )
+                os.makedirs(item_dir, exist_ok=True)
+
+                if primary_result:
+                    primary_json_path = os.path.join(item_dir, f"item_{item_id}_primary.json")
+                    with open(primary_json_path, "w", encoding="utf-8") as f:
+                        json.dump(primary_result, f, indent=2, ensure_ascii=False)
+                    json_path = primary_json_path
+
+                    try:
+                        aggregated_json_path = os.path.join(item_dir, f"item_{item_id}_results.json")
+                        with open(aggregated_json_path, "w", encoding="utf-8") as f:
+                            json.dump(results, f, indent=2, ensure_ascii=False)
+                    except Exception as e:
+                        logger.warning(f"Failed to save aggregated JSON results locally for item {item_id}: {e}")
+                else:
+                    aggregated_data = attachment_results if attachment_results else results
+                    aggregated_json_path = os.path.join(item_dir, f"item_{item_id}_results.json")
+                    with open(aggregated_json_path, "w", encoding="utf-8") as f:
+                        json.dump(aggregated_data, f, indent=2, ensure_ascii=False)
+                    json_path = aggregated_json_path
 
             # Generate CSV results using new mapping function
             csv_path = await self._generate_item_csv_quick(item_id, primary_result, attachment_results)
@@ -2060,7 +2462,16 @@ class OrderProcessor:
                     item.ocr_result_csv_path = csv_path
                     db.commit()
 
-            logger.info(f"Item {item_id} results saved to S3" + (f" with {len(file_results_map)} file-level results" if is_awb and file_results_map else ""))
+            if use_s3:
+                logger.info(
+                    f"Item {item_id} results saved to S3"
+                    + (f" with {len(file_results_map)} file-level results" if is_awb and file_results_map else "")
+                )
+            else:
+                logger.info(
+                    f"Item {item_id} results saved to local storage"
+                    + (f" with {len(file_results_map)} file-level results" if is_awb and file_results_map else "")
+                )
 
         except Exception as e:
             logger.error(f"Error saving item {item_id} results: {str(e)}")
@@ -2182,48 +2593,102 @@ class OrderProcessor:
         try:
             s3_base = f"results/orders/{order_id // 1000}/consolidated"
 
-            # Save consolidated JSON
-            json_content = json.dumps(results, indent=2, ensure_ascii=False)
-            json_s3_key = f"{s3_base}/order_{order_id}_consolidated.json"
-            json_upload_success = self.s3_manager.upload_file(json_content.encode('utf-8'), json_s3_key)
-
-            # Save consolidated Excel
+            # Determine storage paths based on backend
+            consolidated_json_path = None
             excel_path = None
-            with tempfile.NamedTemporaryFile(suffix='.xlsx', delete=False) as temp_excel:
-                temp_excel_path = temp_excel.name
-
-            try:
-                json_to_excel(results, temp_excel_path)
-
-                with open(temp_excel_path, 'rb') as excel_file:
-                    excel_content = excel_file.read()
-                    excel_s3_key = f"{s3_base}/order_{order_id}_consolidated.xlsx"
-                    excel_upload_success = self.s3_manager.upload_file(excel_content, excel_s3_key)
-
-                    if excel_upload_success:
-                        excel_path = f"s3://{self.s3_manager.bucket_name}/{self.s3_manager.upload_prefix}{excel_s3_key}"
-
-            finally:
-                os.unlink(temp_excel_path)
-
-            # Save consolidated CSV
             csv_path = None
-            with tempfile.NamedTemporaryFile(suffix='.csv', delete=False) as temp_csv:
-                temp_csv_path = temp_csv.name
 
-            try:
-                json_to_csv(results, temp_csv_path)
+            if self.use_s3:
+                # S3 storage mode
+                # Save consolidated JSON
+                json_content = json.dumps(results, indent=2, ensure_ascii=False)
+                json_s3_key = f"{s3_base}/order_{order_id}_consolidated.json"
+                json_upload_success = self.s3_manager.upload_file(json_content.encode('utf-8'), json_s3_key)
+                if json_upload_success:
+                    consolidated_json_path = f"s3://{self.s3_manager.bucket_name}/{self.s3_manager.upload_prefix}{json_s3_key}"
 
-                with open(temp_csv_path, 'rb') as csv_file:
-                    csv_content = csv_file.read()
-                    csv_s3_key = f"{s3_base}/order_{order_id}_consolidated.csv"
-                    csv_upload_success = self.s3_manager.upload_file(csv_content, csv_s3_key)
+                # Save consolidated Excel
+                with tempfile.NamedTemporaryFile(suffix='.xlsx', delete=False) as temp_excel:
+                    temp_excel_path = temp_excel.name
 
-                    if csv_upload_success:
-                        csv_path = f"s3://{self.s3_manager.bucket_name}/{self.s3_manager.upload_prefix}{csv_s3_key}"
+                try:
+                    json_to_excel(results, temp_excel_path)
 
-            finally:
-                os.unlink(temp_csv_path)
+                    with open(temp_excel_path, 'rb') as excel_file:
+                        excel_content = excel_file.read()
+                        excel_s3_key = f"{s3_base}/order_{order_id}_consolidated.xlsx"
+                        excel_upload_success = self.s3_manager.upload_file(excel_content, excel_s3_key)
+
+                        if excel_upload_success:
+                            excel_path = f"s3://{self.s3_manager.bucket_name}/{self.s3_manager.upload_prefix}{excel_s3_key}"
+
+                finally:
+                    os.unlink(temp_excel_path)
+
+                # Save consolidated CSV
+                with tempfile.NamedTemporaryFile(suffix='.csv', delete=False) as temp_csv:
+                    temp_csv_path = temp_csv.name
+
+                try:
+                    json_to_csv(results, temp_csv_path)
+
+                    with open(temp_csv_path, 'rb') as csv_file:
+                        csv_content = csv_file.read()
+                        csv_s3_key = f"{s3_base}/order_{order_id}_consolidated.csv"
+                        csv_upload_success = self.s3_manager.upload_file(csv_content, csv_s3_key)
+
+                        if csv_upload_success:
+                            csv_path = f"s3://{self.s3_manager.bucket_name}/{self.s3_manager.upload_prefix}{csv_s3_key}"
+
+                finally:
+                    os.unlink(temp_csv_path)
+            else:
+                # Local filesystem storage mode
+                base_dir = os.getenv("LOCAL_RESULT_JSON_DIR") or os.path.join(
+                    os.getenv("LOCAL_STORAGE_ROOT", "../storage"),
+                    "results",
+                    "json",
+                )
+                order_dir = os.path.join(base_dir, "orders", str(order_id // 1000), "consolidated")
+                os.makedirs(order_dir, exist_ok=True)
+
+                # Save JSON
+                json_content = json.dumps(results, indent=2, ensure_ascii=False)
+                local_json_path = os.path.join(order_dir, f"order_{order_id}_consolidated.json")
+                with open(local_json_path, "w", encoding="utf-8") as f:
+                    f.write(json_content)
+                consolidated_json_path = local_json_path
+                logger.info(f"✅ Saved consolidated JSON locally: {local_json_path}")
+
+                # Save Excel
+                excel_dir = os.path.join(
+                    os.getenv("LOCAL_STORAGE_ROOT", "../storage"),
+                    "results",
+                    "excel",
+                    "orders",
+                    str(order_id // 1000),
+                    "consolidated",
+                )
+                os.makedirs(excel_dir, exist_ok=True)
+                local_excel_path = os.path.join(excel_dir, f"order_{order_id}_consolidated.xlsx")
+                json_to_excel(results, local_excel_path)
+                excel_path = local_excel_path
+                logger.info(f"✅ Saved consolidated Excel locally: {local_excel_path}")
+
+                # Save CSV
+                csv_dir = os.path.join(
+                    os.getenv("LOCAL_STORAGE_ROOT", "../storage"),
+                    "results",
+                    "csv",
+                    "orders",
+                    str(order_id // 1000),
+                    "consolidated",
+                )
+                os.makedirs(csv_dir, exist_ok=True)
+                local_csv_path = os.path.join(csv_dir, f"order_{order_id}_consolidated.csv")
+                json_to_csv(results, local_csv_path)
+                csv_path = local_csv_path
+                logger.info(f"✅ Saved consolidated CSV locally: {local_csv_path}")
 
             # Update order with consolidated report paths
             with Session(engine) as db:
@@ -2234,7 +2699,7 @@ class OrderProcessor:
                     # Preserve existing final_report_paths and update consolidation results
                     current_paths = order.final_report_paths or {}
                     consolidation_paths = {
-                        'consolidated_json': f"s3://{self.s3_manager.bucket_name}/{self.s3_manager.upload_prefix}{json_s3_key}" if json_upload_success else None,
+                        'consolidated_json': consolidated_json_path,
                         'consolidated_excel': excel_path,
                         'consolidated_csv': csv_path
                     }
@@ -2280,10 +2745,6 @@ class OrderProcessor:
                 logger.error(f"Order {order_id} not found")
                 return
 
-            if order.status == OrderStatus.LOCKED:
-                logger.error(f"Order {order_id} is locked and cannot be processed for mapping")
-                return
-
             if order.status not in {OrderStatus.OCR_COMPLETED, OrderStatus.MAPPING}:
                 logger.warning(
                     f"Order {order_id} must be in OCR_COMPLETED or MAPPING status (current: {order.status})"
@@ -2316,7 +2777,6 @@ class OrderProcessor:
         item_failures: Dict[int, str] = {}
 
         with Session(engine) as db:
-            resolver = MappingConfigResolver(db)
             # Allow re-mapping for items that already have OCR results even if previous mapping failed
             items = db.query(OcrOrderItem).filter(
                 OcrOrderItem.order_id == order_id,
@@ -2336,26 +2796,9 @@ class OrderProcessor:
 
             for item in items:
                 try:
-                    resolved = resolver.resolve_for_item(
-                        company_id=item.company_id,
-                        doc_type_id=item.doc_type_id,
-                        item_type=item.item_type,
-                        current_config=item.mapping_config,
-                    )
-
-                    if resolved:
-                        item.mapping_config = resolved.config
-                        item.applied_template_id = resolved.template_id
-                        resolved_type = resolved.config.get("item_type")
-                        if resolved_type:
-                            item.item_type = OrderItemType(resolved_type)
-
-                    if not item.mapping_config:
-                        raise RuntimeError("Mapping configuration not defined for item")
-
-                    mapping_item_type = MappingItemType(
-                        item.mapping_config.get("item_type", item.item_type.value)
-                    )
+                    # Resolve effective mapping configuration (prefer company_doc_type_configs)
+                    item.mapping_config = self._resolve_mapping_config_for_item(db, item)
+                    mapping_item_type = MappingItemType(item.item_type.value)
 
                     logger.info(
                         "Processing mapping for order %s item %s (type=%s)",
@@ -2368,25 +2811,81 @@ class OrderProcessor:
 
                     if mapping_item_type == MappingItemType.SINGLE_SOURCE:
                         item_df = self._build_single_source_dataframe(item, records)
+                        master_path = item.mapping_config.get("master_csv_path")
+                        if not master_path:
+                            raise RuntimeError("master_csv_path missing from mapping configuration")
+
+                        master_df = self._get_master_csv_dataframe(master_path)
+
+                        merged_df = self._join_with_master_csv(
+                            item_df,
+                            master_df,
+                            item.mapping_config.get("external_join_keys", []),
+                            item.mapping_config.get("column_aliases"),
+                            item.mapping_config.get("join_normalize")
+                            or item.mapping_config.get("join_value_normalization"),
+                            item.mapping_config.get("merge_suffix"),
+                        )
                     else:
-                        internal_key = item.mapping_config.get("internal_join_key") if isinstance(item.mapping_config, dict) else None
-                        # Support per-attachment join keys; 'internal_key' acts as default if provided
-                        item_df = self._build_multi_source_dataframe(item, records, internal_key)
+                        # Multi-source: prefer two-step mapping when a CompanyDocTypeConfig
+                        # with multi_source_step1_config is available and the item has a
+                        # selected month Excel path. Otherwise, fall back to legacy single-
+                        # step multi-source -> master CSV join.
+                        cfg = (
+                            db.query(CompanyDocTypeConfig)
+                            .filter(
+                                CompanyDocTypeConfig.company_id == item.company_id,
+                                CompanyDocTypeConfig.doc_type_id == item.doc_type_id,
+                                CompanyDocTypeConfig.item_type == OrderItemType.MULTI_SOURCE.value,
+                                CompanyDocTypeConfig.active.is_(True),
+                            )
+                            .order_by(
+                                CompanyDocTypeConfig.priority.asc(),
+                                CompanyDocTypeConfig.config_id.asc(),
+                            )
+                            .first()
+                        )
 
-                    master_path = item.mapping_config.get("master_csv_path")
-                    if not master_path:
-                        raise RuntimeError("master_csv_path missing from mapping configuration")
+                        use_two_step = (
+                            cfg is not None
+                            and bool(cfg.multi_source_step1_config)
+                            and bool(getattr(item, "selected_month_excel_path", None))
+                        )
 
-                    master_df = self._get_master_csv_dataframe(master_path)
+                        if use_two_step:
+                            merged_df = self._process_multi_source_two_step(
+                                item=item,
+                                records=records,
+                                cfg=cfg,
+                            )
+                        else:
+                            internal_key = (
+                                item.mapping_config.get("internal_join_key")
+                                if isinstance(item.mapping_config, dict)
+                                else None
+                            )
+                            # Support per-attachment join keys; 'internal_key' acts as default if provided
+                            item_df = self._build_multi_source_dataframe(
+                                item, records, internal_key
+                            )
 
-                    merged_df = self._join_with_master_csv(
-                        item_df,
-                        master_df,
-                        item.mapping_config.get("external_join_keys", []),
-                        item.mapping_config.get("column_aliases"),
-                        item.mapping_config.get("join_normalize") or item.mapping_config.get("join_value_normalization"),
-                        item.mapping_config.get("merge_suffix"),
-                    )
+                            master_path = item.mapping_config.get("master_csv_path")
+                            if not master_path:
+                                raise RuntimeError(
+                                    "master_csv_path missing from mapping configuration"
+                                )
+
+                            master_df = self._get_master_csv_dataframe(master_path)
+
+                            merged_df = self._join_with_master_csv(
+                                item_df,
+                                master_df,
+                                item.mapping_config.get("external_join_keys", []),
+                                item.mapping_config.get("column_aliases"),
+                                item.mapping_config.get("join_normalize")
+                                or item.mapping_config.get("join_value_normalization"),
+                                item.mapping_config.get("merge_suffix"),
+                            )
 
                     mapped_path = self._persist_item_mapping_result(order_id, item, merged_df)
                     item.ocr_result_csv_path = mapped_path
@@ -2453,34 +2952,121 @@ class OrderProcessor:
                 s3_base = f"results/orders/{order_id // 1000}/consolidated"
                 csv_key = f"{s3_base}/order_{order_id}_mapped.csv"
                 csv_bytes = combined_df.to_csv(index=False).encode("utf-8")
-                upload_success = self.s3_manager.upload_file(csv_bytes, csv_key)
 
-                mapped_path = (
-                    f"s3://{self.s3_manager.bucket_name}/{self.s3_manager.upload_prefix}{csv_key}"
-                    if upload_success
-                    else None
-                )
+                mapped_path = None
+
+                if self.use_s3:
+                    # S3 storage
+                    upload_success = self.s3_manager.upload_file(csv_bytes, csv_key)
+                    if upload_success:
+                        mapped_path = f"s3://{self.s3_manager.bucket_name}/{self.s3_manager.upload_prefix}{csv_key}"
+                else:
+                    # Local filesystem storage
+                    base_dir = os.getenv("LOCAL_RESULT_CSV_DIR") or os.path.join(
+                        os.getenv("LOCAL_STORAGE_ROOT", "../storage"),
+                        "results",
+                        "csv",
+                    )
+                    order_dir = os.path.join(
+                        base_dir,
+                        "orders",
+                        str(order_id // 1000),
+                        "consolidated",
+                    )
+                    os.makedirs(order_dir, exist_ok=True)
+                    local_path = os.path.join(order_dir, f"order_{order_id}_mapped.csv")
+                    combined_df.to_csv(local_path, index=False, encoding="utf-8")
+                    mapped_path = local_path
+                    logger.info(f"✅ Saved order-level mapped CSV locally: {local_path}")
 
                 current_paths = order.final_report_paths or {}
                 if mapped_path:
                     current_paths['mapped_csv'] = mapped_path
 
-                # Attempt to generate Special CSV if template is configured on primary_doc_type
+                # Attempt to generate Special CSV based on item document types
                 special_csv_path = None
                 try:
-                    if order.primary_doc_type and order.primary_doc_type.template_json_path:
-                        template_path = order.primary_doc_type.template_json_path
-                        template_json = self.special_csv_generator.load_template_from_s3(template_path)
-                        self.special_csv_generator.validate_template(template_json)
-                        special_df = self.special_csv_generator.generate_special_csv(combined_df, template_json)
-                        # Upload special CSV
-                        special_key = f"{s3_base}/order_{order_id}_special.csv"
-                        special_csv_bytes = special_df.to_csv(index=False).encode('utf-8')
-                        if self.s3_manager.upload_file(special_csv_bytes, special_key):
-                            special_csv_path = f"s3://{self.s3_manager.bucket_name}/{self.s3_manager.upload_prefix}{special_key}"
-                            current_paths['special_csv'] = special_csv_path
+                    # Collect distinct doc_type_ids for successfully mapped items in this order
+                    distinct_doc_type_rows = (
+                        db.query(OcrOrderItem.doc_type_id)
+                        .filter(
+                            OcrOrderItem.order_id == order_id,
+                            OcrOrderItem.status == OrderItemStatus.COMPLETED,
+                            OcrOrderItem.ocr_result_csv_path.isnot(None),
+                        )
+                        .distinct()
+                        .all()
+                    )
+
+                    doc_type_ids = [row[0] for row in distinct_doc_type_rows if row[0] is not None]
+
+                    if len(doc_type_ids) == 1:
+                        # Single document type across mapped items – use its template if available
+                        doc_type = (
+                            db.query(DocumentType)
+                            .filter(DocumentType.doc_type_id == doc_type_ids[0])
+                            .first()
+                        )
+
+                        if doc_type and doc_type.template_json_path:
+                            template_path = doc_type.template_json_path
+                            template_json = self.special_csv_generator.load_template_from_s3(template_path)
+                            self.special_csv_generator.validate_template(template_json)
+                            special_df = self.special_csv_generator.generate_special_csv(
+                                combined_df,
+                                template_json,
+                            )
+
+                            # Upload special CSV
+                            special_key = f"{s3_base}/order_{order_id}_special.csv"
+                            special_csv_bytes = special_df.to_csv(index=False).encode("utf-8")
+
+                            special_csv_path = None
+
+                            if self.use_s3:
+                                # S3 storage
+                                if self.s3_manager.upload_file(special_csv_bytes, special_key):
+                                    special_csv_path = (
+                                        f"s3://{self.s3_manager.bucket_name}/"
+                                        f"{self.s3_manager.upload_prefix}{special_key}"
+                                    )
+                            else:
+                                # Local filesystem storage
+                                order_dir = os.path.join(
+                                    base_dir,
+                                    "orders",
+                                    str(order_id // 1000),
+                                    "consolidated",
+                                )
+                                os.makedirs(order_dir, exist_ok=True)
+                                local_special_path = os.path.join(order_dir, f"order_{order_id}_special.csv")
+                                special_df.to_csv(local_special_path, index=False, encoding="utf-8")
+                                special_csv_path = local_special_path
+                                logger.info(f"✅ Saved order-level special CSV locally: {local_special_path}")
+
+                            if special_csv_path:
+                                current_paths["special_csv"] = special_csv_path
+                        else:
+                            logger.info(
+                                "Special CSV skipped for order %s: no template_json_path for doc_type_id=%s",
+                                order_id,
+                                doc_type_ids[0] if doc_type_ids else None,
+                            )
+                    elif len(doc_type_ids) > 1:
+                        # Mixed document types – do not attempt special CSV
+                        logger.info(
+                            "Special CSV skipped for order %s: mixed doc_type_ids=%s",
+                            order_id,
+                            doc_type_ids,
+                        )
+                    else:
+                        # No successfully mapped items with doc_type_id
+                        logger.info(
+                            "Special CSV skipped for order %s: no eligible items with doc_type_id",
+                            order_id,
+                        )
                 except Exception as exc:
-                    logger.warning(f"Special CSV generation skipped for order {order_id}: {exc}")
+                    logger.warning("Special CSV generation skipped for order %s: %s", order_id, exc)
                 order.final_report_paths = current_paths
                 flag_modified(order, 'final_report_paths')
 

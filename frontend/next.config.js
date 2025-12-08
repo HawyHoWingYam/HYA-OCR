@@ -53,6 +53,11 @@ const rawApiHost =
 
 const apiHost = rawApiHost.replace(/\/$/, "");
 
+// Expose resolved API host to the browser so client-side fetches can hit backend directly
+if (!process.env.NEXT_PUBLIC_API_URL) {
+  process.env.NEXT_PUBLIC_API_URL = apiHost;
+}
+
 console.log("=== next.config.js Debug ===");
 console.log("NEXT_PUBLIC_API_URL:", process.env.NEXT_PUBLIC_API_URL);
 console.log("API_BASE_URL (env):", process.env.API_BASE_URL);

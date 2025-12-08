@@ -21,21 +21,131 @@ export interface DocumentType {
   updated_at: string;
 }
 
-export interface Config {
+export type MappingItemType = 'single_source' | 'multi_source';
+
+export interface CompanyDocTypeConfig {
   config_id: number;
   company_id: number;
-  company_name: string;
   doc_type_id: number;
-  type_name: string;
-  prompt_path: string;
-  schema_path: string;
+  item_type: MappingItemType;
+  company_name?: string | null;
+  company_code?: string | null;
+  doc_type_name?: string | null;
+  doc_type_code?: string | null;
+  prompt_path?: string | null;
+  schema_path?: string | null;
+  original_prompt_filename?: string | null;
+  original_schema_filename?: string | null;
+  storage_type: 'local' | 's3';
+  storage_metadata?: Record<string, any> | null;
+  master_csv_path?: string | null;
+  output_template_path?: string | null;
+  single_source_config?: Record<string, any> | null;
+  multi_source_step1_config?: Record<string, any> | null;
+  multi_source_step2_config?: Record<string, any> | null;
+  internal_join_key?: string | null;
+  attachment_sources?: Array<Record<string, any>> | null;
   active: boolean;
-  created_at: string;
-  updated_at: string;
+  priority: number;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export type ConfigFileKind = 'prompt' | 'schema' | 'master_csv' | 'output_template';
+
+export interface ConfigFileInfo {
+  config_id: number;
+  kind: ConfigFileKind;
+  field_name: string;
+  stored_path: string | null;
+  storage_type: 'local' | 's3';
+  exists: boolean;
+  size?: number | null;
+  last_modified?: string | null;
+}
+
+export interface ConfigFileUploadResponse {
+  config_id: number;
+  kind: ConfigFileKind;
+  stored_path: string;
+  storage_type: 'local' | 's3';
+  filename: string;
+  size: number;
+}
+
+export interface OneDriveEntry {
+  name: string;
+  path: string;
+  type: 'file' | 'folder';
+  size?: number | null;
+  last_modified?: string | null;
+}
+
+export interface OneDriveListingResponse {
+  path: string;
+  parent_path?: string | null;
+  entries: OneDriveEntry[];
+}
+
+// Mapping Configuration Types
+export interface JoinNormalizeConfig {
+  strip_non_digits?: boolean;
+  zfill?: number | Record<string, number>;
+  strip_invisible?: boolean;
+  nfkc?: boolean;
+  normalize_ws?: boolean;
+  lower?: boolean;
+  value_alias_map?: Record<string, string> | Record<string, Record<string, string>>;
+}
+
+export interface OutputMetaConfig {
+  [destColumn: string]: `ctx:${string}` | `col:${string}`;
+}
+
+export interface SingleSourceConfig {
+  master_csv_path?: string;
+  external_join_keys?: string[];
+  column_aliases?: Record<string, string>;
+  join_normalize?: JoinNormalizeConfig;
+  output_meta?: OutputMetaConfig;
+  merge_suffix?: string;
+}
+
+export interface MultiSourceStepConfig {
+  join_keys?: string[];
+  column_aliases?: Record<string, string>;
+  join_normalize?: JoinNormalizeConfig;
+  output_meta?: OutputMetaConfig;
+  merge_suffix?: string;
+}
+
+export interface AttachmentSource {
+  kind: 'onedrive';
+  path: string;
+  label?: string;
+  metadata?: Record<string, any>;
+  join_key?: string;
+  filename_contains?: string;
+}
+
+export interface MasterCsvPreview {
+  path: string;
+  headers: string[];
+  row_count: number;
+  sample?: Record<string, any>[];
+}
+
+export interface SchemaFieldInfo {
+  name: string;
+  type: string;
+  description?: string;
+  required: boolean;
 }
 
 // Base API URL - use Next.js proxy path to avoid CORS issues
-const API_BASE_URL = '/api';
+// Prefer explicit public API base if provided; otherwise fall back to Next proxy (/api).
+const API_BASE_URL =
+  (process.env.NEXT_PUBLIC_API_URL || '').replace(/\/$/, '') || '/api';
 
 // Enhanced error type for better error handling
 export interface ApiError extends Error {
@@ -151,25 +261,64 @@ export const documentTypesApi = {
     }),
 };
 
-// Configurations API
-export const configsApi = {
-  getAll: () => fetchApi<Config[]>('/configs'),
-  getById: (id: number) => fetchApi<Config>(`/configs/${id}`),
-  create: (data: Omit<Config, 'config_id' | 'created_at' | 'updated_at' | 'company_name' | 'type_name'>) =>
-    fetchApi<Config>('/configs', {
+// Unified OCR Configs API (company_doc_type_configs)
+export const ocrConfigsApi = {
+  getAll: (params: {
+    company_id?: number;
+    doc_type_id?: number;
+    item_type?: MappingItemType;
+    active?: boolean;
+    search?: string;
+    limit?: number;
+    offset?: number;
+  } = {}) => {
+    const search = new URLSearchParams();
+    if (params.company_id) search.append('company_id', String(params.company_id));
+    if (params.doc_type_id) search.append('doc_type_id', String(params.doc_type_id));
+    if (params.item_type) search.append('item_type', params.item_type);
+    if (typeof params.active === 'boolean') search.append('active', params.active ? 'true' : 'false');
+    if (params.search) search.append('search', params.search);
+    if (params.limit) search.append('limit', String(params.limit));
+    if (params.offset !== undefined) search.append('offset', String(params.offset));
+    const qs = search.toString();
+    const url = `/company-doc-type-configs${qs ? `?${qs}` : ''}`;
+    return fetchApi<CompanyDocTypeConfig[] | { data: CompanyDocTypeConfig[]; pagination: any }>(url);
+  },
+  create: (payload: Omit<CompanyDocTypeConfig, 'config_id' | 'company_name' | 'company_code' | 'doc_type_name' | 'doc_type_code' | 'created_at' | 'updated_at'>) =>
+    fetchApi<CompanyDocTypeConfig>('/company-doc-type-configs', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(data),
+      body: JSON.stringify(payload),
     }),
-  update: (id: number, data: Partial<Omit<Config, 'config_id' | 'company_id' | 'doc_type_id' | 'created_at' | 'updated_at' | 'company_name' | 'type_name'>>) =>
-    fetchApi<Config>(`/configs/${id}`, {
+  update: (id: number, data: Partial<Omit<CompanyDocTypeConfig, 'config_id' | 'company_id' | 'doc_type_id' | 'item_type' | 'company_name' | 'company_code' | 'doc_type_name' | 'doc_type_code' | 'created_at' | 'updated_at'>>) =>
+    fetchApi<CompanyDocTypeConfig>(`/company-doc-type-configs/${id}`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(data),
     }),
   delete: (id: number) =>
-    fetchApi<{ message: string }>(`/configs/${id}`, {
+    fetchApi<{ message: string }>(`/company-doc-type-configs/${id}`, {
       method: 'DELETE',
+    }),
+};
+
+export const configFilesApi = {
+  list: (configId: number) =>
+    fetchApi<ConfigFileInfo[]>(`/company-doc-type-configs/${configId}/config-files`),
+  upload: (configId: number, kind: ConfigFileKind, file: globalThis.File) => {
+    const formData = new FormData();
+    formData.append('kind', kind);
+    formData.append('file', file);
+    return fetchApi<ConfigFileUploadResponse>(`/company-doc-type-configs/${configId}/config-files/upload`, {
+      method: 'POST',
+      body: formData,
+    });
+  },
+  importFromOneDrive: (configId: number, payload: { kind: ConfigFileKind; onedrive_path: string }) =>
+    fetchApi<ConfigFileUploadResponse>(`/company-doc-type-configs/${configId}/config-files/from-onedrive`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
     }),
 };
 
@@ -186,6 +335,22 @@ export async function uploadFile(file: globalThis.File, path: string): Promise<s
 
   return res.file_path;
 }
+
+export const onedriveApi = {
+  listEntries: (
+    params: { path?: string; limit?: number; configId?: number } = {},
+  ): Promise<OneDriveListingResponse> => {
+    const search = new URLSearchParams();
+    if (params.path) search.append('path', params.path);
+    if (params.limit) search.append('limit', String(params.limit));
+    const query = search.toString();
+    const base = params.configId
+      ? `/company-doc-type-configs/${params.configId}/onedrive/listing`
+      : '/onedrive/listing';
+    const url = `${base}${query ? `?${query}` : ''}`;
+    return fetchApi<OneDriveListingResponse>(url);
+  },
+};
 
 // Dependency Management Interfaces
 export interface DependencyInfo {
@@ -262,10 +427,6 @@ export const dependencyApi = {
   // Get document type dependencies
   getDocumentTypeDependencies: (docTypeId: number): Promise<DependencyInfo> =>
     fetchApi<DependencyInfo>(`/document-types/${docTypeId}/dependencies`),
-  
-  // Get configuration dependencies
-  getConfigDependencies: (configId: number): Promise<DependencyInfo> =>
-    fetchApi<DependencyInfo>(`/configs/${configId}/dependencies`),
 };
 
 // Force Delete API - Deletes entities and all their dependencies
@@ -279,12 +440,6 @@ export const forceDeleteApi = {
   // Force delete document type and all its dependencies
   deleteDocumentTypeWithDependencies: (docTypeId: number): Promise<any> =>
     fetchApi(`/document-types/${docTypeId}/force-delete`, {
-      method: 'DELETE',
-    }),
-
-  // Force delete configuration and its related files
-  deleteConfigWithDependencies: (configId: number): Promise<any> =>
-    fetchApi(`/configs/${configId}/force-delete`, {
       method: 'DELETE',
     }),
 };
@@ -344,4 +499,22 @@ export const awbApi = {
     });
   },
 
+};
+
+export interface ScheduledExcelOption {
+  schedule_id: number;
+  schedule_name: string;
+  month_str: string;
+  output_excel_path: string;
+}
+
+export const ocrScheduledFilesApi = {
+  listOptions: (companyId: number, docTypeId: number, limit: number = 50) => {
+    const params = new URLSearchParams();
+    params.append('company_id', String(companyId));
+    params.append('doc_type_id', String(docTypeId));
+    if (limit) params.append('limit', String(limit));
+    const qs = params.toString();
+    return fetchApi<ScheduledExcelOption[]>(`/ocr-scheduled-files/options?${qs}`);
+  },
 };

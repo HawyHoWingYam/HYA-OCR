@@ -7,6 +7,9 @@ from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field, validator
 
+# Master CSV root path - all master CSV paths must start with this
+MASTER_CSV_ROOT = "HYA-OCR/Master Data"
+
 
 class MappingItemType(str, Enum):
     """Supported mapping modes."""
@@ -92,6 +95,9 @@ class BaseMappingConfig(BaseModel):
     def _validate_master_path(cls, value: str) -> str:  # pylint: disable=no-self-argument
         if not value:
             raise ValueError("master_csv_path is required")
+        value = value.strip()
+        if not (value.startswith(MASTER_CSV_ROOT + "/") or value == MASTER_CSV_ROOT):
+            raise ValueError(f"master_csv_path must start with '{MASTER_CSV_ROOT}'")
         return value
 
 

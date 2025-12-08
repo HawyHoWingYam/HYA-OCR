@@ -14,7 +14,7 @@ from pathlib import Path
 from .s3_storage import S3StorageManager, get_s3_manager
 from .company_file_manager import FileType
 from db.database import get_db
-from db.models import BatchJob, Company, DocumentType, CompanyDocumentConfig
+from db.models import BatchJob, Company, DocumentType, CompanyDocTypeConfig
 from sqlalchemy.orm import Session
 
 logger = logging.getLogger(__name__)

@@ -12,6 +12,9 @@ import asyncio
 import time
 import logging
 from functools import wraps
+import contextlib
+import uuid
+import hashlib
 
 # 導入配置管理器
 try:
@@ -23,6 +26,17 @@ except ImportError:
     logging.warning("Config loader not available, using fallback methods")
 
 logger = logging.getLogger(__name__)
+
+
+def get_gemini_timeout_seconds() -> int:
+    """Resolve Gemini API timeout; fall back to 300s if config unavailable."""
+    if not CONFIG_AVAILABLE:
+        return 300
+    try:
+        return config_loader.get_gemini_timeout_seconds()
+    except Exception as e:
+        logger.warning("GEMINI_API_TIMEOUT invalid or missing (%s); defaulting to 300s", e)
+        return 300
 
 
 def get_api_key_and_model() -> tuple[str, str]:
@@ -452,26 +466,105 @@ async def extract_text_from_image(
     status_updates["status"] = "processing"
     status_updates["started_at"] = start_time
 
+    timeout_seconds = get_gemini_timeout_seconds()
+
+    # Generate trace ID for correlation
+    trace_id = f"{uuid.uuid4().hex[:8]}"
+
+    # Get file metadata
+    file_size = os.path.getsize(image_path) if os.path.exists(image_path) else 0
+    image_width = processed_image.width if hasattr(processed_image, 'width') else 0
+    image_height = processed_image.height if hasattr(processed_image, 'height') else 0
+
+    # Log schema complexity
+    schema_field_count = len(response_schema.get("properties", {})) if response_schema else 0
+
+    async def _log_gemini_progress():
+        """Log progress every 30 seconds during API call."""
+        elapsed = 0
+        try:
+            while True:
+                await asyncio.sleep(30)
+                elapsed += 30
+                logger.info(
+                    "⏳ [%s] Gemini API call in progress - elapsed=%ss/%ss (%.0f%%)",
+                    trace_id,
+                    elapsed,
+                    timeout_seconds,
+                    (elapsed/timeout_seconds)*100,
+                )
+        except asyncio.CancelledError:
+            return
+
     try:
         # Update status
         status_updates["step"] = "calling_gemini_api"
-        print(f"Gemini API processing started at {start_time}")
-        # Make API request with proper structure for response schema
-
-        # Use asyncio.to_thread to run the blocking API call in a separate thread
-        response = await asyncio.to_thread(
-            model.generate_content,
-            contents=[enhanced_prompt, processed_image],
+        logger.info(
+            "🚀 [%s] Starting Gemini image API call - model=%s, timeout=%ss, file=%s, size=%d bytes, width=%d, height=%d, prompt_chars=%d, schema_fields=%d",
+            trace_id,
+            model_name,
+            timeout_seconds,
+            image_path,
+            file_size,
+            image_width,
+            image_height,
+            len(enhanced_prompt) if enhanced_prompt else 0,
+            schema_field_count,
         )
-        # Calculate processing time
+
+        progress_task = asyncio.create_task(_log_gemini_progress())
+
+        try:
+            response = await asyncio.wait_for(
+                asyncio.to_thread(
+                    model.generate_content,
+                    contents=[enhanced_prompt, processed_image],
+                ),
+                timeout=timeout_seconds,
+            )
+        except asyncio.TimeoutError:
+            processing_time = time.time() - start_time
+            status_updates["processing_time_seconds"] = processing_time
+            status_updates["status"] = "timeout"
+            status_updates["error_message"] = f"API call timed out after {timeout_seconds}s"
+
+            logger.error(
+                "⏰ [%s] Gemini image API call TIMED OUT - elapsed=%.2fs, timeout=%ss, model=%s, file=%s, prompt_chars=%d, schema_fields=%d",
+                trace_id,
+                processing_time,
+                timeout_seconds,
+                model_name,
+                image_path,
+                len(enhanced_prompt) if enhanced_prompt else 0,
+                schema_field_count,
+            )
+
+            return {
+                "text": f"Error: API call timed out after {timeout_seconds}s",
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "processing_time": processing_time,
+                "status_updates": status_updates,
+            }
+        finally:
+            progress_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await progress_task
+
+        # Success path
         processing_time = time.time() - start_time
         status_updates["processing_time_seconds"] = processing_time
         status_updates["status"] = "success"
 
-        print(f"Gemini API processing completed in {processing_time:.2f} seconds")
-        print(response.usage_metadata)
-        # print(response.text)
-        # Return both the text and token counts
+        logger.info("✅ [%s] Gemini image API call completed in %.2fs", trace_id, processing_time)
+        if hasattr(response, "usage_metadata"):
+            logger.info(
+                "📊 [%s] Token usage - input=%s, output=%s",
+                trace_id,
+                response.usage_metadata.prompt_token_count,
+                response.usage_metadata.candidates_token_count,
+            )
+
         return {
             "text": response.text,
             "input_tokens": response.usage_metadata.prompt_token_count,
@@ -479,8 +572,11 @@ async def extract_text_from_image(
             "processing_time": processing_time,
             "status_updates": status_updates,
         }
+    except asyncio.TimeoutError:
+        # Already handled above
+        pass
     except Exception as e:
-        print(f"Error generating content: {e}")
+        logger.error("Error generating content from image: %s", e)
         # Try a fallback approach without the schema if there's an error
         try:
             fallback_response = await asyncio.to_thread(
@@ -496,13 +592,79 @@ async def extract_text_from_image(
                 "output_tokens": 0,
             }
         except Exception as f_e:
-            print(f"Fallback also failed: {f_e}")
+            logger.error("Fallback also failed: %s", f_e)
             return {"text": f"Error: {e}", "input_tokens": 0, "output_tokens": 0}
+
+
+def _validate_pdf_file(pdf_data: bytes, trace_id: str) -> dict:
+    """
+    Validate PDF file and extract metadata for diagnostic logging.
+    Returns dict with: is_valid, page_count, is_encrypted, error_type, error_message, magic_bytes, file_size, content_hash
+    """
+    result = {
+        "is_valid": False,
+        "page_count": 0,
+        "is_encrypted": False,
+        "error_type": None,
+        "error_message": None,
+        "magic_bytes": pdf_data[:8].hex() if pdf_data else "empty",
+        "file_size": len(pdf_data) if pdf_data else 0,
+        "content_hash": hashlib.sha256(pdf_data).hexdigest()[:16] if pdf_data else "empty",
+    }
+
+    # Check magic bytes
+    if not pdf_data or len(pdf_data) < 8:
+        result["error_type"] = "EMPTY_OR_TOO_SMALL"
+        result["error_message"] = f"PDF data is empty or too small ({len(pdf_data) if pdf_data else 0} bytes)"
+        return result
+
+    if not pdf_data.startswith(b'%PDF-'):
+        result["error_type"] = "INVALID_MAGIC_BYTES"
+        result["error_message"] = f"File does not start with %PDF- magic bytes (got: {pdf_data[:8]})"
+        return result
+
+    try:
+        import PyPDF2
+        import io
+        pdf_reader = PyPDF2.PdfReader(io.BytesIO(pdf_data))
+        result["page_count"] = len(pdf_reader.pages)
+        result["is_encrypted"] = pdf_reader.is_encrypted
+
+        if result["is_encrypted"]:
+            # Try empty password decrypt
+            try:
+                pdf_reader.decrypt("")
+                result["error_type"] = "ENCRYPTED_EMPTY_PASSWORD_OK"
+            except Exception:
+                result["error_type"] = "ENCRYPTED_CANNOT_DECRYPT"
+                result["error_message"] = "PDF is encrypted and cannot be decrypted with empty password"
+                return result
+
+        if result["page_count"] == 0:
+            result["error_type"] = "ZERO_PAGES"
+            result["error_message"] = "PDF has 0 pages"
+            return result
+
+        # Try to get first page dimensions as additional validation
+        try:
+            first_page = pdf_reader.pages[0]
+            if hasattr(first_page, 'mediabox'):
+                result["first_page_size"] = f"{first_page.mediabox.width}x{first_page.mediabox.height}"
+        except Exception:
+            pass
+
+        result["is_valid"] = True
+        return result
+
+    except Exception as e:
+        result["error_type"] = type(e).__name__
+        result["error_message"] = str(e)
+        return result
 
 
 @api_error_handler
 async def extract_text_from_pdf(
-    pdf_path, enhanced_prompt, response_schema=None, api_key=None, model_name=None
+    pdf_path, enhanced_prompt, response_schema=None, api_key=None, model_name=None, context=None
 ):
     """
     Extract text directly from PDF using Gemini API (async version with retry).
@@ -541,28 +703,164 @@ async def extract_text_from_pdf(
     status_updates["status"] = "processing"
     status_updates["started_at"] = start_time
 
+    timeout_seconds = get_gemini_timeout_seconds()
+
+    # Generate trace ID for correlation
+    trace_id = f"{uuid.uuid4().hex[:8]}"
+
+    # Extract context for correlation
+    ctx = context or {}
+    order_id = ctx.get("order_id", "unknown")
+    item_id = ctx.get("item_id", "unknown")
+    file_id = ctx.get("file_id", "unknown")
+    filename = ctx.get("filename", "unknown")
+
+    # Get PDF metadata with diagnostic validation
+    pdf_size = len(pdf_data)
+    pdf_validation = _validate_pdf_file(pdf_data, trace_id)
+    pdf_page_count = pdf_validation["page_count"]
+
+    if pdf_validation["is_valid"]:
+        logger.info(
+            "📄 [%s] PDF metadata - valid=True, pages=%d, encrypted=%s, size=%d bytes, hash=%s, first_page=%s",
+            trace_id,
+            pdf_validation["page_count"],
+            pdf_validation["is_encrypted"],
+            pdf_validation["file_size"],
+            pdf_validation["content_hash"],
+            pdf_validation.get("first_page_size", "unknown"),
+        )
+    else:
+        logger.error(
+            "❌ [%s] PDF VALIDATION FAILED - error_type=%s, error_message=%s, magic_bytes=%s, size=%d bytes, hash=%s",
+            trace_id,
+            pdf_validation["error_type"],
+            pdf_validation["error_message"],
+            pdf_validation["magic_bytes"],
+            pdf_validation["file_size"],
+            pdf_validation["content_hash"],
+        )
+
+    # Log schema complexity
+    schema_field_count = len(response_schema.get("properties", {})) if response_schema else 0
+
+    # Pre-flight validation - fail fast for invalid PDFs
+    if pdf_page_count == 0:
+        error_time = time.time() - start_time
+        status_updates["processing_time_seconds"] = error_time
+        status_updates["status"] = "invalid_pdf"
+        status_updates["error_message"] = f"PDF has 0 pages - cannot process"
+        status_updates["trace_id"] = trace_id
+
+        logger.error(
+            "🚫 [%s] ABORTING Gemini call - PDF has 0 pages, file=%s, size=%d bytes, error_type=%s",
+            trace_id,
+            pdf_path,
+            pdf_size,
+            pdf_validation.get("error_type", "unknown"),
+        )
+
+        return {
+            "text": "Error: PDF has 0 pages - file may be corrupt or invalid",
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "processing_time": error_time,
+            "status_updates": status_updates,
+        }
+
+    async def _log_gemini_progress():
+        """Log progress every 30 seconds during API call."""
+        elapsed = 0
+        try:
+            while True:
+                await asyncio.sleep(30)
+                elapsed += 30
+                logger.info(
+                    "⏳ [%s] Gemini API call in progress - elapsed=%ss/%ss (%.0f%%)",
+                    trace_id,
+                    elapsed,
+                    timeout_seconds,
+                    (elapsed/timeout_seconds)*100,
+                )
+        except asyncio.CancelledError:
+            return
+
     try:
         # Update status
         status_updates["step"] = "calling_gemini_api"
-        print(f"Gemini API processing started at {start_time}")
-        # Make API request with PDF
-        response = await asyncio.to_thread(
-            model.generate_content,
-            contents=[
-                enhanced_prompt,
-                {"mime_type": "application/pdf", "data": pdf_data},
-            ],
+        logger.info(
+            "🚀 [%s] Starting Gemini PDF API call - order=%s, item=%s, file=%s, model=%s, timeout=%ss, size=%d bytes, pages=%d, prompt_chars=%d, schema_fields=%d",
+            trace_id,
+            order_id,
+            item_id,
+            file_id,
+            model_name,
+            timeout_seconds,
+            pdf_size,
+            pdf_page_count,
+            len(enhanced_prompt) if enhanced_prompt else 0,
+            schema_field_count,
         )
 
-        # Calculate processing time
+        progress_task = asyncio.create_task(_log_gemini_progress())
+
+        try:
+            response = await asyncio.wait_for(
+                asyncio.to_thread(
+                    model.generate_content,
+                    contents=[
+                        enhanced_prompt,
+                        {"mime_type": "application/pdf", "data": pdf_data},
+                    ],
+                ),
+                timeout=timeout_seconds,
+            )
+        except asyncio.TimeoutError:
+            processing_time = time.time() - start_time
+            status_updates["processing_time_seconds"] = processing_time
+            status_updates["status"] = "timeout"
+            status_updates["error_message"] = f"API call timed out after {timeout_seconds}s"
+
+            logger.error(
+                "⏰ [%s] Gemini PDF API call TIMED OUT - order=%s, item=%s, file=%s, elapsed=%.2fs, timeout=%ss, model=%s, pages=%d, prompt_chars=%d, schema_fields=%d",
+                trace_id,
+                order_id,
+                item_id,
+                file_id,
+                processing_time,
+                timeout_seconds,
+                model_name,
+                pdf_page_count,
+                len(enhanced_prompt) if enhanced_prompt else 0,
+                schema_field_count,
+            )
+
+            return {
+                "text": f"Error: API call timed out after {timeout_seconds}s",
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "processing_time": processing_time,
+                "status_updates": status_updates,
+            }
+        finally:
+            progress_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await progress_task
+
+        # Success path
         processing_time = time.time() - start_time
         status_updates["processing_time_seconds"] = processing_time
         status_updates["status"] = "success"
 
-        print(f"Gemini API processing completed in {processing_time:.2f} seconds")
-        print(response.usage_metadata)
-        # print(response.text)
-        # Return both the text, token counts and timing metrics
+        logger.info("✅ [%s] Gemini PDF API call completed in %.2fs", trace_id, processing_time)
+        if hasattr(response, "usage_metadata"):
+            logger.info(
+                "📊 [%s] Token usage - input=%s, output=%s",
+                trace_id,
+                response.usage_metadata.prompt_token_count,
+                response.usage_metadata.candidates_token_count,
+            )
+
         return {
             "text": response.text,
             "input_tokens": response.usage_metadata.prompt_token_count,
@@ -570,6 +868,9 @@ async def extract_text_from_pdf(
             "processing_time": processing_time,
             "status_updates": status_updates,
         }
+    except asyncio.TimeoutError:
+        # Already handled above
+        pass
     except Exception as e:
         # Calculate time until error
         error_time = time.time() - start_time
@@ -577,7 +878,7 @@ async def extract_text_from_pdf(
         status_updates["status"] = "error"
         status_updates["error_message"] = str(e)
 
-        print(f"Error generating content from PDF after {error_time:.2f} seconds: {e}")
+        logger.error("Error generating content from PDF after %.2fs: %s", error_time, e)
 
         # Try a fallback approach without the schema if there's an error
         try:
@@ -601,8 +902,10 @@ async def extract_text_from_pdf(
             status_updates["total_processing_time_seconds"] = total_time
             status_updates["status"] = "success_with_fallback"
 
-            print(
-                f"Fallback succeeded in {fallback_time:.2f} seconds (total: {total_time:.2f}s)"
+            logger.info(
+                "Fallback succeeded in %.2fs seconds (total: %.2fs)",
+                fallback_time,
+                total_time,
             )
 
             return {
@@ -628,7 +931,7 @@ async def extract_text_from_pdf(
             status_updates["status"] = "failed"
             status_updates["fallback_error"] = str(f_e)
 
-            print(f"PDF processing fallback also failed after {total_time:.2f}s: {f_e}")
+            logger.error("PDF processing fallback also failed after %.2fs: %s", total_time, f_e)
 
             return {
                 "text": f"Error: {e}",

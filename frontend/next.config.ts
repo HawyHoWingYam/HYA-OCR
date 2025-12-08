@@ -56,6 +56,11 @@ const rawApiBase =
 
 const apiBase = rawApiBase.replace(/\/$/, "");
 
+// Expose resolved API base to the browser so client-side fetches can hit backend directly
+if (!process.env.NEXT_PUBLIC_API_URL) {
+  process.env.NEXT_PUBLIC_API_URL = apiBase;
+}
+
 // Debug logging for build diagnostics
 console.log("=== Next.js Config Debug ===");
 console.log("NEXT_PUBLIC_API_URL:", process.env.NEXT_PUBLIC_API_URL);

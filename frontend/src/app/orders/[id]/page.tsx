@@ -1,9 +1,9 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useMemo } from 'react';
 import { useRouter, useParams } from 'next/navigation';
 import Link from 'next/link';
-import { DocumentType } from '@/lib/api';
+import { DocumentType, ScheduledExcelOption, ocrScheduledFilesApi } from '@/lib/api';
 import { applyOrderUpdateToOrder } from '@/lib/orderUpdateHelpers';
 
 interface Company {
@@ -77,7 +77,7 @@ interface OrderItem {
   ocr_result_json_path: string | null;
   ocr_result_csv_path: string | null;
   mapping_config?: ItemMappingConfig | null;
-  applied_template_id?: number | null;
+  selected_month_excel_path?: string | null;
   processing_started_at: string | null;
   processing_completed_at: string | null;
   processing_time_seconds: number | null;
@@ -96,10 +96,6 @@ interface Order {
   total_attachments: number;
   completed_attachments: number;
   failed_attachments: number;
-  mapping_file_path?: string | null;
-  mapping_keys?: string[] | null;
-  primary_doc_type_id: number | null;
-  primary_doc_type: PrimaryDocTypeInfo | null;
   final_report_paths: OrderFinalReportPaths | null;
   error_message: string | null;
   items: OrderItem[];
@@ -107,7 +103,6 @@ interface Order {
     item_id: number;
     item_type: string | null;
     has_mapping_config: boolean;
-    applied_template_id?: number | null;
   }>;
   created_at: string;
   updated_at: string;
@@ -176,11 +171,6 @@ export default function OrderDetailsPage() {
   // const [orderLevelSuggestions, setOrderLevelSuggestions] = useState<any[]>([]);
   // const [loadingOrderSuggestions, setLoadingOrderSuggestions] = useState(false);
 
-  // Order Management State
-  const [isLockingOrder, setIsLockingOrder] = useState(false);
-  const [isUnlockingOrder, setIsUnlockingOrder] = useState(false);
-  const [isRestartingOcr, setIsRestartingOcr] = useState(false);
-  const [isRestartingMapping, setIsRestartingMapping] = useState(false);
   // Auto-refresh watcher when background processing is running
   const [isWatchingProcessing, setIsWatchingProcessing] = useState(false);
   const processingPollRef = { current: null as any };
@@ -203,6 +193,14 @@ export default function OrderDetailsPage() {
   // Primary JSON deep-flattened headers preview
   const [primaryPreview, setPrimaryPreview] = useState<string[] | null>(null);
   const [isPreviewingPrimary, setIsPreviewingPrimary] = useState(false);
+
+  // Cached schedule month Excel options per item
+  const [monthExcelOptions, setMonthExcelOptions] = useState<{
+    [itemId: number]: ScheduledExcelOption[];
+  }>({});
+  const [loadingMonthOptions, setLoadingMonthOptions] = useState<{ [itemId: number]: boolean }>(
+    {},
+  );
 
   useEffect(() => {
     loadOrder();
@@ -468,6 +466,16 @@ export default function OrderDetailsPage() {
   const replacePrimaryAndAttachments = async (item: OrderItem, files: FileList) => {
     if (!files || files.length === 0) return;
 
+    // Confirm if replacing files on completed/failed items
+    if (item.status === 'COMPLETED' || item.status === 'FAILED') {
+      const confirmed = window.confirm(
+        'This item has already been processed. Replacing files will clear existing OCR results and reset the item to PENDING status. Continue?'
+      );
+      if (!confirmed) {
+        return;
+      }
+    }
+
     setUploadingFiles(prev => ({ ...prev, [item.item_id]: true }));
 
     try {
@@ -650,6 +658,29 @@ export default function OrderDetailsPage() {
   // Return all headers for join-key selection so users can choose any column
   const getJoinKeyOptions = (): string[] => {
     return csvHeaders;
+  };
+
+  const loadMonthExcelOptionsForItem = async (item: OrderItem) => {
+    if (!item.company_id || !item.doc_type_id) return;
+    setLoadingMonthOptions((prev) => ({ ...prev, [item.item_id]: true }));
+    setError('');
+    try {
+      const options = await ocrScheduledFilesApi.listOptions(
+        item.company_id,
+        item.doc_type_id,
+        50,
+      );
+      setMonthExcelOptions((prev) => ({ ...prev, [item.item_id]: options }));
+    } catch (err) {
+      console.error('Error loading month Excel options:', err);
+      setError(
+        err instanceof Error
+          ? err.message
+          : 'Failed to load schedule month Excel options',
+      );
+    } finally {
+      setLoadingMonthOptions((prev) => ({ ...prev, [item.item_id]: false }));
+    }
   };
 
   const attachAwbMonth = async (itemId: number) => {
@@ -1006,6 +1037,28 @@ export default function OrderDetailsPage() {
     }
   };
 
+  const updateItemBasic = async (item: OrderItem, updates: { item_name?: string; selected_month_excel_path?: string | null }) => {
+    try {
+      const response = await fetch(`/api/orders/${orderId}/items/${item.item_id}`, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(updates),
+      });
+
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({}));
+        throw new Error(errorData.detail || 'Failed to update order item');
+      }
+
+      await loadOrder();
+    } catch (error) {
+      console.error('Error updating order item:', error);
+      setError(error instanceof Error ? error.message : 'Failed to update order item');
+    }
+  };
+
   const downloadItemResult = async (
     itemId: number,
     format: 'json' | 'csv',
@@ -1228,121 +1281,6 @@ export default function OrderDetailsPage() {
     }
   };
 
-  // Order Management Functions
-  const lockOrder = async () => {
-    if (!window.confirm('Are you sure you want to lock this order? Locked orders cannot be modified.')) {
-      return;
-    }
-
-    setIsLockingOrder(true);
-    setError('');
-    try {
-      const response = await fetch(`/api/orders/${orderId}/lock`, {
-        method: 'POST',
-      });
-
-      if (!response.ok) {
-        const errorData = await response.json();
-        throw new Error(errorData.detail || 'Failed to lock order');
-      }
-
-      setError('✅ Order locked successfully');
-      setTimeout(() => setError(''), 3000);
-      loadOrder();
-    } catch (error) {
-      console.error('Error locking order:', error);
-      setError(error instanceof Error ? error.message : 'Failed to lock order');
-    } finally {
-      setIsLockingOrder(false);
-    }
-  };
-
-  const unlockOrder = async () => {
-    if (!window.confirm('Are you sure you want to unlock this order? This will allow modifications again.')) {
-      return;
-    }
-
-    setIsUnlockingOrder(true);
-    setError('');
-    try {
-      const response = await fetch(`/api/orders/${orderId}/unlock`, {
-        method: 'POST',
-      });
-
-      if (!response.ok) {
-        const errorData = await response.json();
-        throw new Error(errorData.detail || 'Failed to unlock order');
-      }
-
-      setError('✅ Order unlocked successfully');
-      setTimeout(() => setError(''), 3000);
-      loadOrder();
-    } catch (error) {
-      console.error('Error unlocking order:', error);
-      setError(error instanceof Error ? error.message : 'Failed to unlock order');
-    } finally {
-      setIsUnlockingOrder(false);
-    }
-  };
-
-  const restartOcr = async () => {
-    if (!window.confirm('Are you sure you want to restart OCR processing? This will reprocess all items and overwrite existing OCR results.')) {
-      return;
-    }
-
-    setIsRestartingOcr(true);
-    setError('');
-    try {
-      const response = await fetch(`/api/orders/${orderId}/restart-ocr`, {
-        method: 'POST',
-      });
-
-      if (!response.ok) {
-        const errorData = await response.json();
-        throw new Error(errorData.detail || 'Failed to restart OCR processing');
-      }
-
-      setError('✅ OCR processing restarted successfully');
-      setTimeout(() => setError(''), 3000);
-      loadOrder();
-      startProcessingWebSocket();
-    } catch (error) {
-      console.error('Error restarting OCR:', error);
-      setError(error instanceof Error ? error.message : 'Failed to restart OCR processing');
-    } finally {
-      setIsRestartingOcr(false);
-    }
-  };
-
-  const restartMapping = async () => {
-    if (!window.confirm('Are you sure you want to restart mapping processing? This will reprocess mapping with current configuration.')) {
-      return;
-    }
-
-    setIsRestartingMapping(true);
-    setError('');
-    try {
-      const response = await fetch(`/api/orders/${orderId}/restart-mapping`, {
-        method: 'POST',
-      });
-
-      if (!response.ok) {
-        const errorData = await response.json();
-        throw new Error(errorData.detail || 'Failed to restart mapping processing');
-      }
-
-      setError('✅ Mapping processing restarted successfully');
-      setTimeout(() => setError(''), 3000);
-      loadOrder();
-      startProcessingWebSocket();
-    } catch (error) {
-      console.error('Error restarting mapping:', error);
-      setError(error instanceof Error ? error.message : 'Failed to restart mapping processing');
-    } finally {
-      setIsRestartingMapping(false);
-    }
-  };
-
   const getStatusColor = (status: string) => {
     switch (status) {
       case 'DRAFT':
@@ -1379,6 +1317,19 @@ export default function OrderDetailsPage() {
     }
   };
 
+  // Check if any item has mapping configured (must be before early returns for React Hooks)
+  const hasAnyMappingConfig = useMemo(() => {
+    // Guard against null/undefined order
+    if (!order) return false;
+
+    // Check item_mapping_summary first (more efficient)
+    if (order.item_mapping_summary?.some(s => s.has_mapping_config)) {
+      return true;
+    }
+    // Fallback to checking items array
+    return order.items?.some(item => !!item.mapping_config) || false;
+  }, [order?.item_mapping_summary, order?.items]);
+
   if (isLoading) {
     return (
       <div className="container mx-auto px-4 py-8">
@@ -1395,35 +1346,14 @@ export default function OrderDetailsPage() {
     );
   }
 
-  // Helper functions to determine processing state
-  const hasDoneOcr = (status: string) => {
-    return status === 'OCR_COMPLETED' || status === 'MAPPING' || status === 'COMPLETED' || status === 'FAILED';
-  };
-
-  const hasDoneMapping = (status: string) => {
-    return status === 'COMPLETED' || status === 'FAILED';
-  };
-
-  const isLocked = order.status === 'LOCKED';
-  const canEdit = order.status === 'DRAFT' && !isLocked;
-  const canSubmit = order.status === 'DRAFT' && order.total_items > 0 && !isLocked;
-  const canStartOcrOnly = order.status === 'DRAFT' && order.total_items > 0 && !isLocked;
-  const canStartFullProcess = order.status === 'DRAFT' && order.total_items > 0 && !isLocked;
-  const canStartMapping = hasDoneOcr(order.status) && !isLocked && order.items.length > 0 && !hasDoneMapping(order.status);
-  const canConfigureMapping = (order.status === 'DRAFT' || order.status === 'OCR_COMPLETED' || order.status === 'COMPLETED' || order.status === 'MAPPING') && !isLocked;
-  const canLock = !isLocked && (order.status === 'COMPLETED' || order.status === 'OCR_COMPLETED' || order.status === 'FAILED');
-  const canUnlock = isLocked;
-  const canRestartOcr = !isLocked && hasDoneOcr(order.status);
-  const remapItemCount = (order as any).remap_item_count ?? 0;
-  const canRemap = (order as any).can_remap !== false; // default true if field absent
-  const canRestartMapping = !isLocked && hasDoneMapping(order.status) && canRemap;
-
-  const remapDisableReason = () => {
-    if (isLocked) return 'Order is locked';
-    if (!hasDoneMapping(order.status)) return 'Mapping not attempted yet; use Start Mapping';
-    if (!canRemap) return '缺少 OCR 结果，请先 Re‑OCR';
-    return 'Restart mapping processing with current configuration';
-  };
+  // Mapping-based button visibility (no status checks)
+  const canEdit = order.status === 'DRAFT';
+  const canModifyFiles = order.status !== 'PROCESSING';
+  const canSubmit = order.status === 'DRAFT' && order.total_items > 0;
+  const canStartOcrOnly = !hasAnyMappingConfig && order.total_items > 0;
+  const canStartFullProcess = hasAnyMappingConfig && order.total_items > 0;
+  const canStartMapping = hasAnyMappingConfig && order.items.length > 0;
+  const canConfigureMapping = order.status === 'DRAFT' || order.status === 'OCR_COMPLETED' || order.status === 'COMPLETED' || order.status === 'MAPPING';
 
   return (
     <div className="container mx-auto px-4 py-8">
@@ -1444,51 +1374,6 @@ export default function OrderDetailsPage() {
           </span>
         </div>
         <div className="flex items-center gap-3">
-          {/* Lock/Unlock Order Button */}
-          {canLock && (
-            <button
-              onClick={lockOrder}
-              disabled={isLockingOrder}
-              className="bg-orange-600 hover:bg-orange-700 disabled:bg-gray-400 text-white py-2 px-4 rounded font-medium"
-              title="Lock this order to prevent modifications"
-            >
-              {isLockingOrder ? '🔒 Locking...' : '🔒 Lock Order'}
-            </button>
-          )}
-          {canUnlock && (
-            <button
-              onClick={unlockOrder}
-              disabled={isUnlockingOrder}
-              className="bg-green-600 hover:bg-green-700 disabled:bg-gray-400 text-white py-2 px-4 rounded font-medium"
-              title="Unlock this order to allow modifications"
-            >
-              {isUnlockingOrder ? '🔓 Unlocking...' : '🔓 Unlock Order'}
-            </button>
-          )}
-
-          {/* Restart Buttons - Only show when unlocked */}
-          {canRestartOcr && (
-            <button
-              onClick={restartOcr}
-              disabled={isRestartingOcr}
-              className="bg-yellow-600 hover:bg-yellow-700 disabled:bg-gray-400 text-white py-2 px-4 rounded font-medium"
-              title="Restart OCR processing for all items"
-            >
-              {isRestartingOcr ? '🔄 Restarting OCR...' : '🔄 Re-OCR'}
-            </button>
-          )}
-          {hasDoneMapping(order.status) && (
-            <button
-              onClick={restartMapping}
-              disabled={isRestartingMapping}
-              className={`text-white py-2 px-4 rounded font-medium ${canRestartMapping ? 'bg-indigo-600 hover:bg-indigo-700' : 'bg-gray-400 cursor-not-allowed'}`}
-              title={remapDisableReason()}
-              {...(!canRestartMapping ? { onClick: undefined } : {})}
-            >
-              {isRestartingMapping ? '🔄 Restarting Mapping...' : '🔄 Re-Mapping'}
-            </button>
-          )}
-
           {/* Processing Buttons - Only show when unlocked */}
           {canStartOcrOnly && (
             <button
@@ -1520,24 +1405,6 @@ export default function OrderDetailsPage() {
           )}
         </div>
       </div>
-
-      {order.primary_doc_type && (
-        <div className="mb-6 text-sm text-gray-600">
-          Primary Document Type:{' '}
-          <span className="font-medium text-gray-900">
-            {order.primary_doc_type.type_name} ({order.primary_doc_type.type_code})
-          </span>
-          {order.primary_doc_type.template_json_path ? (
-            <span className="ml-2 text-xs text-green-600">
-              Template configured
-              {order.primary_doc_type.template_version ? ` (v${order.primary_doc_type.template_version})` : ''}
-            </span>
-          ) : (
-            <span className="ml-2 text-xs text-gray-500">No template uploaded</span>
-          )}
-          <span className="ml-4 text-xs text-gray-600">Remappable Items: <span className="font-medium text-gray-900">{remapItemCount}</span></span>
-        </div>
-      )}
 
       {error && (
         <div className={`border-l-4 p-4 mb-6 ${
@@ -1638,33 +1505,7 @@ export default function OrderDetailsPage() {
           </div>
         </div>
 
-        <div className="mt-6 grid gap-4 md:grid-cols-2">
-          <div>
-            <div className="text-sm text-gray-500">Primary Document Type</div>
-            <div className="mt-1 text-base font-medium text-gray-900">
-              {order.primary_doc_type
-                ? `${order.primary_doc_type.type_name} (${order.primary_doc_type.type_code})`
-                : 'Not selected'}
-            </div>
-            {order.primary_doc_type ? (
-              order.primary_doc_type.template_json_path ? (
-                <div className="mt-1 text-xs text-green-600">
-                  Template configured
-                  {order.primary_doc_type.template_version
-                    ? ` (v${order.primary_doc_type.template_version})`
-                    : ''}
-                </div>
-              ) : (
-                <div className="mt-1 text-xs text-gray-500">
-                  No template uploaded; special CSV export will be skipped.
-                </div>
-              )
-            ) : (
-              <div className="mt-1 text-xs text-gray-500">
-                Select a primary document type when creating an order to enable template-driven outputs.
-              </div>
-            )}
-          </div>
+        <div className="mt-6">
           <div>
             <div className="text-sm text-gray-500">Special CSV</div>
             <div className="mt-1 text-base font-medium text-gray-900">
@@ -1676,9 +1517,7 @@ export default function OrderDetailsPage() {
               </div>
             ) : (
               <div className="mt-1 text-xs text-gray-500">
-                {order.primary_doc_type?.template_json_path
-                  ? 'Special CSV will become available after mapping completes.'
-                  : 'Upload a template for the primary document type to produce a special CSV.'}
+                Special CSV will be generated automatically after mapping completes if a template is configured for the document type.
               </div>
             )}
           </div>
@@ -1761,7 +1600,7 @@ export default function OrderDetailsPage() {
                               </div>
                             </>
                           )}
-                          {canEdit && (
+                          {canModifyFiles && (
                             <>
                               <button
                                 onClick={() => {
@@ -1784,7 +1623,11 @@ export default function OrderDetailsPage() {
                               </button>
                               <button
                                 onClick={() => {
-                                  if (window.confirm('Delete primary file?')) {
+                                  let message = 'Delete primary file?';
+                                  if (item.status === 'COMPLETED' || item.status === 'FAILED') {
+                                    message = 'This item has already been processed. Deleting the primary file will clear existing OCR results and reset the item to PENDING status. Continue?';
+                                  }
+                                  if (window.confirm(message)) {
                                     deletePrimaryFile(item.item_id);
                                   }
                                 }}
@@ -1799,7 +1642,7 @@ export default function OrderDetailsPage() {
                       </div>
                     </div>
                   ) : (
-                    canEdit && (
+                    canModifyFiles && (
                       <div className="border-b pb-3">
                         <h4 className="font-medium text-gray-700 mb-2">📄 Primary File</h4>
                         <button
@@ -1872,7 +1715,7 @@ export default function OrderDetailsPage() {
                                         </div>
                                       </>
                                     )}
-                                    {canEdit && (
+                                    {canModifyFiles && (
                                       <button
                                         onClick={() => deleteFile(item.item_id, file.file_id, file.filename)}
                                         disabled={deletingFiles[deleteKey]}
@@ -1942,17 +1785,102 @@ export default function OrderDetailsPage() {
                             </div>
                           )}
                         </div>
-                      ) : (
+                          ) : (
                         <div className="text-xs text-gray-500 mt-1">
                           No saved mapping configuration. Defaults will be applied if available.
                         </div>
                       )}
-                      {item.applied_template_id && (
-                        <div className="text-xs text-blue-600 mt-1">
-                          Inherits Template #{item.applied_template_id}
-                        </div>
-                      )}
                     </div>
+
+                    {item.item_type === 'multi_source' && (
+                      <div className="mt-2 text-xs text-gray-700 space-y-1">
+                        <div className="font-medium">
+                          Schedule Month Excel (YYYYMM.xlsx)
+                        </div>
+                        <div className="text-[11px] text-gray-500">
+                          Use the OneDrive path of the monthly Excel generated by the OCR
+                          Schedule (matches the <code>output_excel_path</code> shown under
+                          <Link
+                            href="/ocr-schedules"
+                            className="ml-1 text-blue-600 hover:text-blue-800 underline"
+                          >
+                            OCR Schedules
+                          </Link>
+                          ).
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <span className="text-gray-500">Path:</span>
+                          <span className="truncate max-w-xs">
+                            {item.selected_month_excel_path || '—'}
+                          </span>
+                        </div>
+                        {canModifyFiles && (
+                          <>
+                            <div className="flex items-center gap-2 mt-1">
+                              <input
+                                type="text"
+                                defaultValue={item.selected_month_excel_path || ''}
+                                onBlur={(e) =>
+                                  updateItemBasic(item, {
+                                    selected_month_excel_path:
+                                      e.target.value.trim() || null,
+                                  })
+                                }
+                                className="flex-1 border border-gray-300 rounded px-2 py-1 text-xs"
+                                placeholder="e.g. HYA-OCR/Output/OCS/202501.xlsx"
+                              />
+                              <span className="text-gray-400 text-[11px]">
+                                Blur to save
+                              </span>
+                            </div>
+                            <div className="mt-1 flex items-center gap-2">
+                              <button
+                                type="button"
+                                onClick={() => loadMonthExcelOptionsForItem(item)}
+                                disabled={loadingMonthOptions[item.item_id]}
+                                className="px-3 py-1 text-[11px] bg-gray-700 text-white rounded disabled:bg-gray-400"
+                              >
+                                {loadingMonthOptions[item.item_id]
+                                  ? 'Loading from schedules…'
+                                  : 'Load from schedules'}
+                              </button>
+                              {monthExcelOptions[item.item_id] &&
+                                monthExcelOptions[item.item_id].length > 0 && (
+                                  <span className="text-[11px] text-gray-500">
+                                    {monthExcelOptions[item.item_id].length} options
+                                  </span>
+                                )}
+                            </div>
+                            {monthExcelOptions[item.item_id] &&
+                              monthExcelOptions[item.item_id].length > 0 && (
+                                <div className="mt-2 space-y-1 max-h-40 overflow-y-auto border border-gray-200 rounded p-2 bg-gray-50">
+                                  {monthExcelOptions[item.item_id].map((opt) => (
+                                    <button
+                                      key={`${opt.schedule_id}-${opt.month_str}-${opt.output_excel_path}`}
+                                      type="button"
+                                      onClick={() =>
+                                        updateItemBasic(item, {
+                                          selected_month_excel_path: opt.output_excel_path,
+                                        })
+                                      }
+                                      className="w-full text-left text-[11px] px-2 py-1 rounded hover:bg-blue-50"
+                                      title={opt.output_excel_path}
+                                    >
+                                      <span className="font-semibold">{opt.month_str}</span>
+                                      <span className="ml-1 text-gray-600">
+                                        — {opt.schedule_name}
+                                      </span>
+                                      <div className="truncate text-[10px] text-gray-500">
+                                        {opt.output_excel_path}
+                                      </div>
+                                    </button>
+                                  ))}
+                                </div>
+                              )}
+                          </>
+                        )}
+                      </div>
+                    )}
                     {canConfigureMapping && (
                       <button
                         onClick={() => openMappingModal(item)}
@@ -2231,13 +2159,6 @@ export default function OrderDetailsPage() {
             <h3 className="text-lg font-semibold mb-4">
               Configure Mapping – {mappingModalItem.item_name}
             </h3>
-            {mappingModalItem.applied_template_id && (
-              <div className="mb-4 text-xs text-blue-600">
-                {mappingForm.inherit_defaults
-                  ? `Will inherit template #${mappingModalItem.applied_template_id} (no overrides).`
-                  : `Currently applying template #${mappingModalItem.applied_template_id} with overrides below.`}
-              </div>
-            )}
             <div className="space-y-4">
               <div>
                 <span className="block text-sm font-medium text-gray-700 mb-2">Mapping Mode</span>

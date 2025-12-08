@@ -31,7 +31,32 @@ class PromptSchemaCache:
         self.cache: Dict[str, Dict] = {}
         self.max_size = max_size
         self.ttl = timedelta(minutes=ttl_minutes)
-        
+
+    def _get_cached_item(self, key: str) -> Optional[Union[str, dict]]:
+        """读取并校验缓存是否过期"""
+        cached_item = self.cache.get(key)
+        if not cached_item:
+            return None
+        if datetime.now() - cached_item["cached_at"] < self.ttl:
+            logger.debug(f"🟢 缓存命中: {key}")
+            return cached_item["content"]
+        del self.cache[key]
+        logger.debug(f"🔄 缓存过期，已删除: {key}")
+        return None
+
+    def _set_cached_item(self, key: str, content: Union[str, dict]):
+        """写入缓存，必要时驱逐最旧记录"""
+        if len(self.cache) >= self.max_size:
+            oldest_key = min(self.cache.keys(), key=lambda k: self.cache[k]["cached_at"])
+            del self.cache[oldest_key]
+            logger.debug(f"🗑️ 缓存已满，删除最旧项: {oldest_key}")
+
+        self.cache[key] = {
+            "content": content,
+            "cached_at": datetime.now()
+        }
+        logger.debug(f"💾 缓存已设置: {key}")
+
     def _generate_key(self, company_code: str, doc_type_code: str, file_type: str, filename: str) -> str:
         """生成缓存键"""
         return f"{company_code}:{doc_type_code}:{file_type}:{filename}"
@@ -39,35 +64,20 @@ class PromptSchemaCache:
     def get(self, company_code: str, doc_type_code: str, file_type: str, filename: str) -> Optional[Union[str, dict]]:
         """从缓存获取内容"""
         key = self._generate_key(company_code, doc_type_code, file_type, filename)
-        
-        if key in self.cache:
-            cached_item = self.cache[key]
-            # 检查是否过期
-            if datetime.now() - cached_item["cached_at"] < self.ttl:
-                logger.debug(f"🟢 缓存命中: {key}")
-                return cached_item["content"]
-            else:
-                # 过期，删除
-                del self.cache[key]
-                logger.debug(f"🔄 缓存过期，已删除: {key}")
-        
-        return None
+        return self._get_cached_item(key)
     
     def set(self, company_code: str, doc_type_code: str, file_type: str, filename: str, content: Union[str, dict]):
         """设置缓存内容"""
         key = self._generate_key(company_code, doc_type_code, file_type, filename)
-        
-        # 如果缓存已满，删除最旧的项目
-        if len(self.cache) >= self.max_size:
-            oldest_key = min(self.cache.keys(), key=lambda k: self.cache[k]["cached_at"])
-            del self.cache[oldest_key]
-            logger.debug(f"🗑️ 缓存已满，删除最旧项: {oldest_key}")
-        
-        self.cache[key] = {
-            "content": content,
-            "cached_at": datetime.now()
-        }
-        logger.debug(f"💾 缓存已设置: {key}")
+        self._set_cached_item(key, content)
+
+    def get_by_key(self, cache_key: str) -> Optional[Union[str, dict]]:
+        """直接通过自定义key读取缓存"""
+        return self._get_cached_item(cache_key)
+
+    def set_by_key(self, cache_key: str, content: Union[str, dict]):
+        """直接通过自定义key写入缓存"""
+        self._set_cached_item(cache_key, content)
     
     def invalidate(self, company_code: str = None, doc_type_code: str = None):
         """使缓存失效"""
@@ -309,37 +319,67 @@ class PromptSchemaManager:
         """
         从数据库获取公司文档配置的路径
         
-        Args:
-            company_code: 公司代码
-            doc_type_code: 文档类型代码
-            
-        Returns:
-            Tuple[Optional[str], Optional[str]]: (prompt_path, schema_path)
+        优先使用新的 company_doc_type_configs 表（按 company_code/doc_type_code
+        匹配 active 配置），若不存在则回退到 legacy 的 company_document_configs。
         """
         try:
             db = self._get_db_session()
             if db is None:
                 return None, None
-                
-            from db.models import Company, DocumentType, CompanyDocumentConfig
-            
-            # 查询配置
-            config = db.query(CompanyDocumentConfig).join(
-                Company, CompanyDocumentConfig.company_id == Company.company_id
-            ).join(
-                DocumentType, CompanyDocumentConfig.doc_type_id == DocumentType.doc_type_id
-            ).filter(
-                Company.company_code == company_code,
-                DocumentType.type_code == doc_type_code,
-                CompanyDocumentConfig.active == True
-            ).first()
-            
-            if config:
-                return config.prompt_path, config.schema_path
-            else:
-                logger.warning(f"⚠️ 未找到配置: {company_code}/{doc_type_code}")
-                return None, None
-                
+
+            from db.models import (
+                Company,
+                DocumentType,
+                CompanyDocTypeConfig,
+                OrderItemType,
+            )
+
+            # 优先尝试从 company_doc_type_configs 获取配置。
+            # 这里不区分 item_type，按优先级选一条最合适的记录：
+            # - active = True
+            # - priority 最小
+            # - 如有多个 item_type，按 SINGLE_SOURCE / MULTI_SOURCE 顺序作为 tie-breaking。
+            company = (
+                db.query(Company)
+                .filter(Company.company_code == company_code)
+                .first()
+            )
+            doc_type = (
+                db.query(DocumentType)
+                .filter(DocumentType.type_code == doc_type_code)
+                .first()
+            )
+
+            if company and doc_type:
+                query = (
+                    db.query(CompanyDocTypeConfig)
+                    .filter(
+                        CompanyDocTypeConfig.company_id == company.company_id,
+                        CompanyDocTypeConfig.doc_type_id == doc_type.doc_type_id,
+                        CompanyDocTypeConfig.active.is_(True),
+                    )
+                )
+                rows = query.all()
+                if rows:
+                    # 简单排序：按 priority，然后按 item_type（single_source 优先）
+                    def _sort_key(row):
+                        priority = row.priority or 100
+                        it = getattr(row, "item_type", "") or ""
+                        weight = 0
+                        if it == OrderItemType.SINGLE_SOURCE.value:
+                            weight = 0
+                        elif it == OrderItemType.MULTI_SOURCE.value:
+                            weight = 1
+                        else:
+                            weight = 2
+                        return (priority, weight, row.config_id)
+
+                    row = sorted(rows, key=_sort_key)[0]
+                    return row.prompt_path, row.schema_path
+
+            logger.warning(f"⚠️ 未找到配置: {company_code}/{doc_type_code}")
+            return None, None
+
         except Exception as e:
             logger.error(f"❌ 查询数据库配置失败: {e}")
             return None, None
@@ -373,6 +413,140 @@ class PromptSchemaManager:
         except Exception as e:
             logger.error(f"❌ 解析S3路径失败: {e}")
             return None
+
+    async def _read_prompt_from_path(self, prompt_path: str) -> Optional[str]:
+        """根据绝对路径（S3或本地）读取prompt内容"""
+        if not prompt_path:
+            return None
+
+        if prompt_path.startswith("s3://"):
+            if not self.s3_manager:
+                logger.warning(f"⚠️ 无法从S3读取prompt，S3管理器未启用: {prompt_path}")
+                return None
+            s3_key = self._extract_s3_key_from_path(prompt_path)
+            if not s3_key:
+                logger.warning(f"⚠️ 无法解析prompt的S3路径: {prompt_path}")
+                return None
+            content = await asyncio.get_event_loop().run_in_executor(
+                self.executor,
+                self.s3_manager.get_file_by_key,
+                s3_key,
+            )
+        else:
+            if not os.path.exists(prompt_path):
+                logger.warning(f"⚠️ Prompt路径不存在: {prompt_path}")
+                return None
+            try:
+                with open(prompt_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+            except Exception as e:
+                logger.error(f"❌ 读取本地prompt失败: {e}")
+                return None
+
+        if content is None:
+            return None
+
+        is_valid, message = self.validator.validate_prompt(content)
+        if not is_valid:
+            logger.warning(f"⚠️ Prompt验证失败: {message}")
+        return content
+
+    async def _read_schema_from_path(self, schema_path: str) -> Optional[dict]:
+        """根据绝对路径（S3或本地）读取schema内容"""
+        if not schema_path:
+            return None
+
+        if schema_path.startswith("s3://"):
+            if not self.s3_manager:
+                logger.warning(f"⚠️ 无法从S3读取schema，S3管理器未启用: {schema_path}")
+                return None
+            s3_key = self._extract_s3_key_from_path(schema_path)
+            if not s3_key:
+                logger.warning(f"⚠️ 无法解析schema的S3路径: {schema_path}")
+                return None
+            schema_data = await asyncio.get_event_loop().run_in_executor(
+                self.executor,
+                self.s3_manager.get_schema_by_key,
+                s3_key,
+            )
+        else:
+            if not os.path.exists(schema_path):
+                logger.warning(f"⚠️ Schema路径不存在: {schema_path}")
+                return None
+            try:
+                with open(schema_path, "r", encoding="utf-8") as f:
+                    raw = f.read()
+                schema_data = json.loads(raw)
+            except json.JSONDecodeError as e:
+                logger.error(f"❌ Schema JSON解析失败: {e}")
+                return None
+            except Exception as e:
+                logger.error(f"❌ 读取本地schema失败: {e}")
+                return None
+
+        if schema_data is None:
+            return None
+
+        is_valid, message = self.validator.validate_schema(schema_data)
+        if not is_valid:
+            logger.warning(f"⚠️ Schema验证失败: {message}")
+        return schema_data
+
+    async def _load_from_paths_internal(
+        self,
+        prompt_path: str,
+        schema_path: str,
+        cache_key: Optional[str] = None,
+    ) -> Tuple[Optional[str], Optional[dict]]:
+        """根据显式路径加载prompt/schema，并支持缓存"""
+        prompt_path = (prompt_path or "").strip()
+        schema_path = (schema_path or "").strip()
+        if not prompt_path or not schema_path:
+            raise ValueError("prompt_path and schema_path must be provided")
+
+        if self.cache and cache_key:
+            cached_bundle = self.cache.get_by_key(cache_key)
+            if isinstance(cached_bundle, dict):
+                cached_prompt = cached_bundle.get("prompt")
+                cached_schema = cached_bundle.get("schema")
+                if cached_prompt and cached_schema:
+                    logger.debug(f"🟢 配置缓存命中: {cache_key}")
+                    return cached_prompt, cached_schema
+
+        prompt_content = await self._read_prompt_from_path(prompt_path)
+        schema_data = await self._read_schema_from_path(schema_path)
+        if schema_data:
+            schema_data = clean_schema_for_gemini(schema_data)
+
+        if (
+            self.cache
+            and cache_key
+            and prompt_content
+            and schema_data
+        ):
+            self.cache.set_by_key(
+                cache_key,
+                {
+                    "prompt": prompt_content,
+                    "schema": schema_data,
+                },
+            )
+            logger.debug(f"💾 配置缓存已更新: {cache_key}")
+
+        return prompt_content, schema_data
+
+    @classmethod
+    async def load_from_paths(
+        cls,
+        prompt_path: str,
+        schema_path: str,
+        cache_key: Optional[str] = None,
+    ) -> Tuple[Optional[str], Optional[dict]]:
+        """
+        类方法：基于显式路径加载prompt/schema，复用全局管理器实例
+        """
+        manager = get_prompt_schema_manager()
+        return await manager._load_from_paths_internal(prompt_path, schema_path, cache_key)
     
     async def get_prompt(self, company_code: str, doc_type_code: str, filename: str = "prompt.txt") -> Optional[str]:
         """

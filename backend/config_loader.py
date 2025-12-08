@@ -100,6 +100,17 @@ class ConfigLoader:
             "environment": environment,
         }
 
+    def get_gemini_timeout_seconds(self) -> int:
+        """Get Gemini API timeout (seconds) from environment."""
+        timeout_str = self._require_env("GEMINI_API_TIMEOUT")
+        try:
+            timeout = int(timeout_str)
+        except ValueError:
+            raise ValueError("GEMINI_API_TIMEOUT must be an integer")
+        if timeout <= 0:
+            raise ValueError("GEMINI_API_TIMEOUT must be positive")
+        return timeout
+
     def get_prompt_schema_config(self) -> Dict[str, Any]:
         """獲取 prompt/schema 管理配置（僅環境變數）。
         最小化需求：強制聲明後端與必要參數，不做自動推斷。

@@ -1,7 +1,8 @@
 import os
+import re
 import shutil
 import logging
-from typing import Optional
+from typing import Optional, Union, BinaryIO
 from pathlib import Path
 from datetime import datetime
 import tempfile
@@ -622,3 +623,62 @@ def get_file_storage() -> FileStorageService:
         _file_storage_service = FileStorageService()
 
     return _file_storage_service
+
+
+class LocalFileStorage:
+    """Simple local filesystem helper used by config file utilities."""
+
+    def __init__(self, base_dir: Optional[str] = None):
+        root = base_dir or os.getenv("LOCAL_UPLOAD_DIR")
+        if not root:
+            raise ValueError("LOCAL_UPLOAD_DIR must be configured for LocalFileStorage")
+        self.base_dir = Path(root).expanduser().resolve()
+        self.base_dir.mkdir(parents=True, exist_ok=True)
+
+    def _resolve_path(self, relative_path: str) -> Path:
+        if not relative_path:
+            raise ValueError("relative_path is required")
+
+        if os.path.isabs(relative_path):
+            return Path(relative_path)
+
+        sanitized = re.sub(r"[\\]+", "/", relative_path.strip())
+        sanitized = sanitized.lstrip("/")
+        sanitized = re.sub(r"\.\.+", ".", sanitized)
+        target = (self.base_dir / sanitized).resolve()
+
+        if not str(target).startswith(str(self.base_dir)):
+            raise ValueError("Attempted path traversal outside LocalFileStorage base directory")
+
+        return target
+
+    def save_bytes(self, relative_path: str, content: Union[bytes, BinaryIO]) -> str:
+        path = self._resolve_path(relative_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        if hasattr(content, "read"):
+            data = content.read()
+        else:
+            data = content
+
+        with open(path, "wb") as output:
+            output.write(data)
+
+        return str(path)
+
+    def read_bytes(self, relative_path: str) -> Optional[bytes]:
+        path = self._resolve_path(relative_path)
+        if not path.exists():
+            return None
+        return path.read_bytes()
+
+    def exists(self, relative_path: str) -> bool:
+        path = self._resolve_path(relative_path)
+        return path.exists()
+
+    def delete(self, relative_path: str) -> bool:
+        path = self._resolve_path(relative_path)
+        if not path.exists():
+            return True
+        path.unlink()
+        return True

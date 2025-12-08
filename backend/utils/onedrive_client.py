@@ -3,6 +3,8 @@ import logging
 import os
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional
+
+import requests
 from O365 import Account
 from O365.drive import File as O365File, Folder as O365Folder
 
@@ -33,6 +35,8 @@ class OneDriveClient:
         self.client_secret = client_secret
         self.tenant_id = tenant_id
         self.target_user_upn = target_user_upn
+        self._graph_access_token: Optional[str] = None
+        self._graph_token_expires_at: Optional[datetime] = None
 
         if scopes is None:
             scopes = ['https://graph.microsoft.com/Files.ReadWrite.All']
@@ -88,6 +92,134 @@ class OneDriveClient:
             logger.error(f"❌ Failed to connect to OneDrive: {str(e)}")
             return False
 
+    def _get_graph_access_token(self) -> Optional[str]:
+        """Get or refresh an access token for direct Microsoft Graph REST calls."""
+        # Reuse the same app registration as the O365 client (client credentials flow).
+        if (
+            self._graph_access_token
+            and self._graph_token_expires_at
+            and datetime.now(timezone.utc) < self._graph_token_expires_at
+        ):
+            return self._graph_access_token
+
+        token_url = f"https://login.microsoftonline.com/{self.tenant_id}/oauth2/v2.0/token"
+        data = {
+            "grant_type": "client_credentials",
+            "client_id": self.client_id,
+            "client_secret": self.client_secret,
+            "scope": "https://graph.microsoft.com/.default",
+        }
+
+        try:
+            resp = requests.post(token_url, data=data, timeout=30)
+        except Exception as exc:
+            logger.error("❌ Failed to request Graph access token: %s", exc)
+            return None
+
+        if resp.status_code != 200:
+            logger.error(
+                "❌ Graph token request failed (%s): %s",
+                resp.status_code,
+                resp.text,
+            )
+            return None
+
+        try:
+            payload = resp.json()
+            access_token = payload.get("access_token")
+            expires_in = int(payload.get("expires_in", 3600))
+        except Exception as exc:
+            logger.error("❌ Failed to parse Graph token response: %s", exc)
+            return None
+
+        if not access_token:
+            logger.error("❌ Graph token response missing access_token")
+            return None
+
+        # Cache token with a small safety margin before expiry.
+        self._graph_access_token = access_token
+        self._graph_token_expires_at = datetime.now(timezone.utc) + timedelta(
+            seconds=max(expires_in - 60, 60)
+        )
+        return self._graph_access_token
+
+    def graph_request(
+        self,
+        method: str,
+        url: str,
+        session_id: Optional[str] = None,
+        max_retries: int = 3,
+        **kwargs,
+    ):
+        """Low-level helper to call Microsoft Graph with retries and throttling handling.
+
+        Args:
+            method: HTTP method (GET, POST, PATCH, etc.).
+            url: Either a full Graph URL or a relative path (e.g. "/me/drive/root:/file:/workbook/...").
+            session_id: Optional workbook session id to include in headers.
+            max_retries: Number of attempts on transient errors (429/503/network).
+            **kwargs: Passed directly to requests.request.
+
+        Returns:
+            requests.Response object.
+        """
+        token = self._get_graph_access_token()
+        if not token:
+            raise RuntimeError("Graph access token not available")
+
+        headers = kwargs.pop("headers", {}) or {}
+        headers.setdefault("Authorization", f"Bearer {token}")
+        headers.setdefault("Accept", "application/json")
+        if session_id:
+            headers.setdefault("workbook-session-id", session_id)
+
+        # Normalise relative URL into full Graph endpoint
+        if not url.startswith("http"):
+            base_url = "https://graph.microsoft.com/v1.0"
+            if not url.startswith("/"):
+                url = "/" + url
+            url = base_url + url
+
+        last_exc: Optional[Exception] = None
+        for attempt in range(max_retries):
+            try:
+                response = requests.request(method, url, headers=headers, **kwargs)
+            except Exception as exc:
+                last_exc = exc
+                logger.warning(
+                    "⚠️ Graph request %s %s failed on attempt %s/%s: %s",
+                    method,
+                    url,
+                    attempt + 1,
+                    max_retries,
+                    exc,
+                )
+                delay = 2 * (attempt + 1)
+            else:
+                if response.status_code in (429, 503):
+                    retry_after = response.headers.get("Retry-After")
+                    try:
+                        delay = float(retry_after) if retry_after is not None else 5 * (attempt + 1)
+                    except ValueError:
+                        delay = 5 * (attempt + 1)
+                    logger.info(
+                        "⏳ Graph throttling (%s) for %s; retrying in %.1f seconds",
+                        response.status_code,
+                        url,
+                        delay,
+                    )
+                else:
+                    return response
+
+            if attempt < max_retries - 1:
+                import time
+
+                time.sleep(delay)
+
+        if last_exc:
+            raise last_exc
+        raise RuntimeError(f"Graph request {method} {url} failed after {max_retries} attempts")
+
     def get_folder(self, folder_path: str) -> Optional[O365Folder]:
         """Get folder by path
 
@@ -104,22 +236,36 @@ class OneDriveClient:
         try:
             # Remove leading/trailing slashes
             folder_path = normalise_onedrive_path(folder_path or "")
-            if folder_path:
-                graph_path = f"/{folder_path}"
+
+            # Special-case root: some Graph / O365 combinations do not accept "root:/"
+            # and require using the dedicated root-folder API instead of a path of "/".
+            if not folder_path:
+                logger.debug("🔎 Resolving OneDrive root folder /")
+                try:
+                    # Prefer the explicit root helper if available
+                    if hasattr(self.drive, "get_root_folder"):
+                        folder = self.drive.get_root_folder()
+                    else:
+                        # Fallback: many O365 versions treat empty path as root
+                        folder = self.drive.get_item_by_path("")
+                except Exception as exc:
+                    logger.error(
+                        "❌ Graph API error while resolving root /: %s",
+                        exc,
+                    )
+                    raise
             else:
-                graph_path = "/"
-
-            logger.debug("🔎 Resolving OneDrive folder path %s", graph_path)
-
-            try:
-                folder = self.drive.get_item_by_path(graph_path)
-            except Exception as exc:
-                logger.error(
-                    "❌ Graph API error while resolving %s: %s",
-                    graph_path,
-                    exc,
-                )
-                raise
+                graph_path = f"/{folder_path}"
+                logger.debug("🔎 Resolving OneDrive folder path %s", graph_path)
+                try:
+                    folder = self.drive.get_item_by_path(graph_path)
+                except Exception as exc:
+                    logger.error(
+                        "❌ Graph API error while resolving %s: %s",
+                        graph_path,
+                        exc,
+                    )
+                    raise
 
             if folder and folder.is_folder:
                 logger.info(f"✅ Found folder: {folder_path}")
@@ -341,6 +487,56 @@ class OneDriveClient:
             created_month_filter=created_month_filter,
         )
 
+    def list_folders(
+        self,
+        parent_folder: O365Folder,
+        name_pattern: Optional[str] = None
+    ) -> List[O365Folder]:
+        """List child folders in a parent folder, optionally filtered by name pattern.
+
+        Args:
+            parent_folder: Parent folder to list children from
+            name_pattern: Optional regex pattern to filter folder names
+
+        Returns:
+            List of folder objects matching the pattern
+        """
+        if not parent_folder:
+            return []
+
+        try:
+            import re
+            matched_folders: List[O365Folder] = []
+            pattern_re = re.compile(name_pattern) if name_pattern else None
+
+            for item in parent_folder.get_items():
+                if not getattr(item, "is_folder", False):
+                    continue
+
+                folder_name = getattr(item, "name", "") or ""
+                if pattern_re:
+                    if not pattern_re.match(folder_name):
+                        logger.debug(
+                            "⊘ Skipping folder %s - does not match pattern %s",
+                            folder_name,
+                            name_pattern,
+                        )
+                        continue
+
+                matched_folders.append(item)
+                logger.debug("📁 Found folder: %s", folder_name)
+
+            logger.info(
+                "✅ Found %s folder(s) in parent folder%s",
+                len(matched_folders),
+                f" matching pattern '{name_pattern}'" if name_pattern else "",
+            )
+            return matched_folders
+
+        except Exception as e:
+            logger.error("❌ Error listing OneDrive folders: %s", e)
+            return []
+
     def download_file(self, file_item: O365File, local_path: str) -> bool:
         """Download file to local path
 
@@ -479,6 +675,73 @@ class OneDriveClient:
             return None
 
         return self.get_or_create_folder(parent_folder, child_name)
+
+    def create_workbook_session(
+        self,
+        file_path: str,
+        persist_changes: bool = True,
+    ) -> Optional[str]:
+        """Create a workbook session for the given Excel file on OneDrive.
+
+        Uses the /workbook/createSession Graph endpoint and returns the session id,
+        or None on failure.
+        """
+        normalized = normalise_onedrive_path(file_path)
+        url = f"/me/drive/root:/{normalized}:/workbook/createSession"
+
+        try:
+            response = self.graph_request(
+                "POST",
+                url,
+                json={"persistChanges": bool(persist_changes)},
+            )
+        except Exception as exc:
+            logger.error("❌ Failed to create workbook session for %s: %s", file_path, exc)
+            return None
+
+        if response.status_code not in (200, 201):
+            logger.error(
+                "❌ Workbook createSession failed for %s: %s %s",
+                file_path,
+                response.status_code,
+                response.text,
+            )
+            return None
+
+        try:
+            data = response.json()
+        except Exception as exc:
+            logger.error("❌ Failed to parse createSession response for %s: %s", file_path, exc)
+            return None
+
+        session_id = data.get("id")
+        if not session_id:
+            logger.error("❌ Workbook createSession response missing id for %s", file_path)
+            return None
+
+        logger.info("✅ Created workbook session for %s", file_path)
+        return session_id
+
+    def close_workbook_session(self, file_path: str, session_id: str) -> None:
+        """Close an existing workbook session for the given Excel file."""
+        normalized = normalise_onedrive_path(file_path)
+        url = f"/me/drive/root:/{normalized}:/workbook/closeSession"
+
+        try:
+            response = self.graph_request("POST", url, session_id=session_id)
+        except Exception as exc:
+            logger.warning("⚠️ Failed to close workbook session for %s: %s", file_path, exc)
+            return
+
+        if response.status_code not in (200, 204):
+            logger.warning(
+                "⚠️ Workbook closeSession returned %s for %s: %s",
+                response.status_code,
+                file_path,
+                response.text,
+            )
+        else:
+            logger.info("✅ Closed workbook session for %s", file_path)
 
     def close(self) -> None:
         """Close connection"""

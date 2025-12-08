@@ -5,3 +5,4 @@ backend/.venv/*
 backend/backend.env
 
 backend/venv/*
+storage/*

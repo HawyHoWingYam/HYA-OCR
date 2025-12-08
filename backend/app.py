@@ -13,7 +13,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse, Response, StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union, Literal, Tuple
+from enum import Enum
 import os
 import shutil
 import tempfile
@@ -23,9 +24,10 @@ from datetime import datetime, timedelta, timezone
 import json
 import logging
 import asyncio
-from sqlalchemy import func
+from sqlalchemy import func, or_
 import time
 import re
+from botocore.exceptions import ClientError
 
 # Optional APScheduler imports with graceful fallback
 try:
@@ -45,7 +47,7 @@ from db.models import (
     Base,
     Company,
     DocumentType,
-    CompanyDocumentConfig,
+    CompanyDocTypeConfig,
     ProcessingJob,
     File as DBFile,
     DocumentFile,
@@ -58,8 +60,6 @@ from db.models import (
     OrderStatus,
     OrderItemStatus,
     OneDriveSync,
-    MappingTemplate,
-    CompanyDocMappingDefault,
     OrderItemType,
     OcrSchedule,
     OcrScheduledFile,
@@ -67,11 +67,12 @@ from db.models import (
     ScheduleMode,
     ScheduledFileStatus,
     ScheduleRunStatus,
+    StorageType,
 )
 from main import extract_text_from_image, extract_text_from_pdf
 from utils.excel_converter import json_to_excel, json_to_csv
 from utils.s3_storage import get_s3_manager, is_s3_enabled
-from utils.file_storage import get_file_storage
+from utils.file_storage import get_file_storage, LocalFileStorage
 from utils.template_service import (
     build_template_object_name,
     collect_computed_expressions,
@@ -91,17 +92,19 @@ from utils.order_processor import (
     OrderProcessor,
 )
 from utils.mapping_config import (
+    MASTER_CSV_ROOT,
     MappingItemType,
     normalise_mapping_config,
     normalise_mapping_override,
 )
-from utils.mapping_config_resolver import MappingConfigResolver
+from utils.company_doc_type_config_resolver import CompanyDocTypeConfigResolver
 from utils.order_stats import compute_order_attachment_stats
 from utils.onedrive_client import (
     verify_onedrive_connection,
     build_client_from_env,
     join_onedrive_path,
     normalise_onedrive_path,
+    OneDriveClient,
 )
 from utils.ocr_schedule_runner import (
     DEFAULT_HISTORY_SUBFOLDER,
@@ -1756,579 +1759,6 @@ def migrate_document_type_jobs(
         )
 
 
-# Configuration API endpoints
-@app.get("/configs", response_model=List[dict])
-def get_configurations(db: Session = Depends(get_db)):
-    configs = db.query(CompanyDocumentConfig).all()
-    return [
-        {
-            "config_id": config.config_id,
-            "company_id": config.company_id,
-            "company_name": config.company.company_name if config.company else None,
-            "doc_type_id": config.doc_type_id,
-            "type_name": (
-                config.document_type.type_name if config.document_type else None
-            ),
-            "prompt_path": config.prompt_path,
-            "schema_path": config.schema_path,
-            "active": config.active,
-            "created_at": config.created_at.isoformat(),
-            "updated_at": config.updated_at.isoformat(),
-        }
-        for config in configs
-    ]
-
-
-@app.post("/configs", response_model=dict)
-def create_configuration(config_data: dict, db: Session = Depends(get_db)):
-    # Check if company and document type exist
-    company = (
-        db.query(Company)
-        .filter(Company.company_id == config_data["company_id"])
-        .first()
-    )
-    if not company:
-        raise HTTPException(status_code=404, detail="Company not found")
-
-    doc_type = (
-        db.query(DocumentType)
-        .filter(DocumentType.doc_type_id == config_data["doc_type_id"])
-        .first()
-    )
-    if not doc_type:
-        raise HTTPException(status_code=404, detail="Document type not found")
-
-    # Check if config already exists
-    existing_config = (
-        db.query(CompanyDocumentConfig)
-        .filter(
-            CompanyDocumentConfig.company_id == config_data["company_id"],
-            CompanyDocumentConfig.doc_type_id == config_data["doc_type_id"],
-        )
-        .first()
-    )
-
-    if existing_config:
-        raise HTTPException(
-            status_code=400,
-            detail="Configuration already exists for this company and document type",
-        )
-
-    config = CompanyDocumentConfig(
-        company_id=config_data["company_id"],
-        doc_type_id=config_data["doc_type_id"],
-        prompt_path=config_data.get("prompt_path"),  # Allow None for new configs
-        schema_path=config_data.get("schema_path"),  # Allow None for new configs
-        original_prompt_filename=config_data.get("original_prompt_filename"),
-        original_schema_filename=config_data.get("original_schema_filename"),
-        active=config_data.get("active", True),
-    )
-
-    db.add(config)
-    db.commit()
-    db.refresh(config)
-
-    return {
-        "config_id": config.config_id,
-        "company_id": config.company_id,
-        "company_name": config.company.company_name,
-        "doc_type_id": config.doc_type_id,
-        "type_name": config.document_type.type_name,
-        "prompt_path": config.prompt_path,
-        "schema_path": config.schema_path,
-        "active": config.active,
-        "created_at": config.created_at.isoformat(),
-        "updated_at": config.updated_at.isoformat(),
-    }
-
-
-@app.get("/configs/{config_id}", response_model=dict)
-def get_configuration(config_id: int, db: Session = Depends(get_db)):
-    config = (
-        db.query(CompanyDocumentConfig)
-        .filter(CompanyDocumentConfig.config_id == config_id)
-        .first()
-    )
-    if not config:
-        raise HTTPException(status_code=404, detail="Configuration not found")
-
-    return {
-        "config_id": config.config_id,
-        "company_id": config.company_id,
-        "company_name": config.company.company_name,
-        "doc_type_id": config.doc_type_id,
-        "type_name": config.document_type.type_name,
-        "prompt_path": config.prompt_path,
-        "schema_path": config.schema_path,
-        "active": config.active,
-        "created_at": config.created_at.isoformat(),
-        "updated_at": config.updated_at.isoformat(),
-    }
-
-
-@app.put("/configs/{config_id}", response_model=dict)
-def update_configuration(
-    config_id: int, config_data: dict, db: Session = Depends(get_db)
-):
-    config = (
-        db.query(CompanyDocumentConfig)
-        .filter(CompanyDocumentConfig.config_id == config_id)
-        .first()
-    )
-    if not config:
-        raise HTTPException(status_code=404, detail="Configuration not found")
-
-    # Update only provided fields (support partial updates)
-    if "prompt_path" in config_data:
-        config.prompt_path = config_data["prompt_path"]
-    if "schema_path" in config_data:
-        config.schema_path = config_data["schema_path"]
-    if "original_prompt_filename" in config_data:
-        config.original_prompt_filename = config_data["original_prompt_filename"]
-    if "original_schema_filename" in config_data:
-        config.original_schema_filename = config_data["original_schema_filename"]
-    if "active" in config_data:
-        config.active = config_data["active"]
-
-    db.commit()
-    db.refresh(config)
-
-    return {
-        "config_id": config.config_id,
-        "company_id": config.company_id,
-        "company_name": config.company.company_name,
-        "doc_type_id": config.doc_type_id,
-        "type_name": config.document_type.type_name,
-        "prompt_path": config.prompt_path,
-        "schema_path": config.schema_path,
-        "active": config.active,
-        "created_at": config.created_at.isoformat(),
-        "updated_at": config.updated_at.isoformat(),
-    }
-
-
-@app.delete("/configs/{config_id}")
-def delete_configuration(config_id: int, db: Session = Depends(get_db)):
-    config = (
-        db.query(CompanyDocumentConfig)
-        .filter(CompanyDocumentConfig.config_id == config_id)
-        .first()
-    )
-    if not config:
-        raise HTTPException(status_code=404, detail="Configuration not found")
-
-    db.delete(config)
-    db.commit()
-
-    return {"message": "Configuration deleted successfully"}
-
-
-# Configuration file download endpoint (S3-only)
-@app.get("/configs/{config_id}/download/{file_type}")
-def download_config_file(config_id: int, file_type: str, db: Session = Depends(get_db)):
-    """
-    Download prompt or schema file for a configuration (S3-only)
-    
-    Args:
-        config_id: Configuration ID
-        file_type: "prompt" or "schema"
-    """
-    # Validate file_type parameter
-    if file_type not in ["prompt", "schema"]:
-        raise HTTPException(status_code=400, detail="file_type must be 'prompt' or 'schema'")
-    
-    # Get configuration from database
-    config = (
-        db.query(CompanyDocumentConfig)
-        .filter(CompanyDocumentConfig.config_id == config_id)
-        .first()
-    )
-    if not config:
-        raise HTTPException(status_code=404, detail="Configuration not found")
-    
-    # Get company and document type for S3 path construction
-    company = config.company
-    doc_type = config.document_type
-    if not company or not doc_type:
-        raise HTTPException(status_code=500, detail="Configuration missing company or document type")
-    
-    logger.info(f"📥 S3-only download request - Config ID: {config_id}, Type: {file_type}, Company: {company.company_code}, DocType: {doc_type.type_code}")
-    compat_enabled = os.getenv('S3_READ_COMPAT_ENABLED', 'true').lower() == 'true'
-    
-    try:
-        # Always try S3 download first
-        s3_manager = get_s3_manager()
-        if not s3_manager:
-            raise HTTPException(status_code=500, detail="S3 storage not available - S3 is required for downloads")
-        
-        # Extract filename from stored path or use default
-        stored_path = config.prompt_path if file_type == "prompt" else config.schema_path
-        if stored_path and "/" in stored_path:
-            filename = stored_path.split("/")[-1]
-        else:
-            # Default filename based on type
-            filename = f"{file_type}.{'txt' if file_type == 'prompt' else 'json'}"
-        
-        # 🚀 SMART DYNAMIC FILE DISCOVERY - Multiple strategies for resilient file finding
-        file_content = None
-        successful_path = None
-        
-        # === PRIORITY STRATEGY: STORED DATABASE PATH (highest priority) ===
-        logger.info("🎯 Trying STORED database path first")
-        try:
-            if stored_path:
-                logger.info(f"📍 Found stored path in database: {stored_path}")
-                
-                # Use the new S3 manager method for direct path download
-                file_content = s3_manager.download_file_by_stored_path(stored_path)
-                
-                if file_content is not None:
-                    successful_path = stored_path
-                    
-                    # Get filename from path
-                    if "/" in stored_path:
-                        filename = stored_path.split("/")[-1]
-                    
-                    logger.info(f"✅ Downloaded using STORED database path: {stored_path}")
-                    logger.info(f"📂 Download filename: {filename}")
-                else:
-                    logger.info(f"⚠️ Could not download from stored path: {stored_path}")
-            else:
-                logger.info("⚠️ No stored path in database, trying other strategies...")
-                
-        except Exception as e:
-            logger.warning(f"⚠️ STORED path download failed: {e}")
-        
-        # === STRATEGY 0: CLEAN PATH STRUCTURE (highest priority fallback) ===
-        if file_content is None:
-            logger.info("🎯 Trying CLEAN path structure with database-stored filename first")
-            try:
-                # Get original filename from database first
-                original_filename = None
-                if file_type == "prompt" and config.original_prompt_filename:
-                    original_filename = config.original_prompt_filename
-                elif file_type == "schema" and config.original_schema_filename:
-                    original_filename = config.original_schema_filename
-                
-                # Try with original filename from database
-                if original_filename:
-                    logger.info(f"📁 Using original filename from database: {original_filename}")
-                    
-                    # Construct clean S3 path: companies/{company_id}/{type}/{doc_type_id}/{config_id}/filename
-                    clean_s3_path = f"companies/{company.company_id}/{'prompts' if file_type == 'prompt' else 'schemas'}/{doc_type.doc_type_id}/{config_id}/{original_filename}"
-                    
-                    # Try to download directly using clean path
-                    if file_type == "prompt":
-                        file_content = s3_manager.download_prompt_by_id(
-                            company_id=company.company_id,
-                            doc_type_id=doc_type.doc_type_id,
-                            config_id=config_id,
-                            filename=original_filename
-                        )
-                    else:
-                        schema_data = s3_manager.download_schema_by_id(
-                            company_id=company.company_id,
-                            doc_type_id=doc_type.doc_type_id,
-                            config_id=config_id,
-                            filename=original_filename
-                        )
-                        if schema_data:
-                            file_content = json.dumps(schema_data, indent=2, ensure_ascii=False).encode('utf-8')
-                    
-                    if file_content is not None:
-                        successful_path = clean_s3_path
-                        filename = original_filename  # Use original filename for download
-                        logger.info(f"✅ Found using CLEAN path structure: {successful_path}")
-                        logger.info(f"📂 Download filename: {filename}")
-                    else:
-                        logger.info("⚠️ CLEAN path not found, trying fallback strategies...")
-                else:
-                    logger.info("⚠️ No original filename in database, trying fallback strategies...")
-                    
-            except Exception as e:
-                logger.info(f"⚠️ CLEAN path download failed: {e}")
-        
-        # === STRATEGY 1: CONFIG-SPECIFIC paths (most unique) ===
-        config_specific_paths = [
-            f"config_{config_id}",  # config_6, config_5 (unique per config)
-            f"company_{company.company_id}/doctype_{doc_type.doc_type_id}/config_{config_id}",  # company_1/doctype_11/config_6
-            f"c{company.company_id}/d{doc_type.doc_type_id}/cfg{config_id}",  # c1/d11/cfg6
-        ]
-        
-        # === STRATEGY 2: ID-based paths (stable) ===
-        id_based_paths = [
-            f"company_{company.company_id}/doctype_{doc_type.doc_type_id}",  # company_1/doctype_11
-            f"c{company.company_id}/d{doc_type.doc_type_id}",  # c1/d11 (shorter)
-            f"{company.company_id}_{doc_type.doc_type_id}",    # 1_11 (minimal)
-        ]
-        
-        # === STRATEGY 3: Current name-based paths (compat only) ===
-        name_based_paths = []
-        if compat_enabled:
-            # Company variants
-            company_variants = [
-                company.company_code if company.company_code else "unknown",
-                company.company_code.lower() if company.company_code else "unknown",
-                company.company_code.upper() if company.company_code else "unknown",
-                company.company_name.lower().replace(" ", "_") if company.company_name else "unknown",
-                "hana",  # Common fallback
-            ]
-
-            # Document type variants
-            doc_type_variants = [
-                doc_type.type_code if doc_type.type_code else "unknown",
-                doc_type.type_name if doc_type.type_name else "unknown",
-                # Handle common transformations
-                doc_type.type_code.replace("[Admin]", "[Finance]") if doc_type.type_code and "[Admin]" in doc_type.type_code else None,
-                doc_type.type_code.replace("[Finance]", "[Admin]") if doc_type.type_code and "[Finance]" in doc_type.type_code else None,
-                doc_type.type_code.replace("[Production]", "[Admin]") if doc_type.type_code and "[Production]" in doc_type.type_code else None,
-                # Remove prefixes and clean up
-                doc_type.type_code.replace("[Admin]_", "").replace("[Finance]_", "").replace("[Production]_", "") if doc_type.type_code else None,
-                # Common patterns
-                "[Finance]_hkbn_billing",  # Known working pattern
-                "hkbn_billing", "admin_hkbn_billing", "finance_hkbn_billing",
-            ]
-
-            # Remove None and duplicates
-            doc_type_variants = list(set([v for v in doc_type_variants if v]))
-
-            # Build all name-based combinations
-            for company_variant in set(company_variants):
-                for doc_type_variant in doc_type_variants:
-                    name_based_paths.append(f"{company_variant}/{doc_type_variant}")
-        
-        # === STRATEGY 4: Enhanced wildcard search in S3 with disambiguation ===
-        def try_wildcard_search():
-            if not compat_enabled:
-                return None, None
-            logger.info(f"🔍 Attempting enhanced wildcard search for config_id={config_id}")
-            # List all files and find matches by filename pattern
-            all_prompts = s3_manager.list_prompts() if file_type == "prompt" else []
-            all_schemas = s3_manager.list_schemas() if file_type == "schema" else []
-            all_files = all_prompts if file_type == "prompt" else all_schemas
-            
-            # Enhanced search terms with priority scoring
-            high_priority_terms = [
-                f"config_{config_id}",  # Highest priority: exact config match
-                f"cfg{config_id}",
-                str(config_id),
-            ]
-            
-            medium_priority_terms = [
-                f"{company.company_id}_{doc_type.doc_type_id}",
-                company.company_code.lower() if company.company_code else "",
-                doc_type.type_code.lower() if doc_type.type_code else "",
-            ]
-            
-            low_priority_terms = [
-                filename.replace('.txt', '').replace('.json', ''),
-                "hkbn", "billing",
-                company.company_name.lower() if company.company_name else "",
-                doc_type.type_name.lower().replace("[", "").replace("]", "") if doc_type.type_name else ""
-            ]
-            
-            # Find files with scoring system
-            scored_matches = []
-            
-            for file_info in all_files:
-                file_key = file_info['key'].lower()
-                score = 0
-                
-                # High priority matches (config-specific)
-                for term in high_priority_terms:
-                    if term and term.lower() in file_key:
-                        score += 100
-                        logger.info(f"🎯 HIGH PRIORITY match: {term} in {file_info['key']}")
-                
-                # Medium priority matches 
-                for term in medium_priority_terms:
-                    if term and term.lower() in file_key:
-                        score += 10
-                        logger.info(f"🔍 MEDIUM PRIORITY match: {term} in {file_info['key']}")
-                
-                # Low priority matches
-                for term in low_priority_terms:
-                    if term and term.lower() in file_key:
-                        score += 1
-                        logger.info(f"🔍 LOW PRIORITY match: {term} in {file_info['key']}")
-                
-                if score > 0:
-                    scored_matches.append((score, file_info))
-            
-            # Sort by score (highest first) and return best match
-            if scored_matches:
-                scored_matches.sort(key=lambda x: x[0], reverse=True)
-                best_score, best_file = scored_matches[0]
-                logger.info(f"🏆 Best match with score {best_score}: {best_file['key']}")
-                
-                # Extract company and doctype from the found path
-                path_parts = best_file['key'].split('/')
-                if len(path_parts) >= 2:
-                    found_company, found_doctype = path_parts[0], path_parts[1]
-                    found_filename = path_parts[-1]
-                    
-                    if file_type == "prompt":
-                        return s3_manager.download_prompt_raw(found_company, found_doctype, found_filename), f"{found_company}/{found_doctype}/{found_filename}"
-                    else:
-                        return s3_manager.download_schema_raw(found_company, found_doctype, found_filename), f"{found_company}/{found_doctype}/{found_filename}"
-            
-            logger.warning(f"❌ No matches found via wildcard search for config_id={config_id}")
-            return None, None
-        
-        # === EXECUTE SEARCH STRATEGIES ===
-        all_paths_to_try = config_specific_paths + id_based_paths + name_based_paths
-        
-        # Try all path combinations
-        for path in all_paths_to_try:
-            if file_content is not None:
-                break
-                
-            if '/' in path:
-                company_part, doc_type_part = path.split('/', 1)
-                logger.info(f"🔍 Trying path: {path}/{filename}")
-                
-                if file_type == "prompt":
-                    file_content = s3_manager.download_prompt_raw(company_part, doc_type_part, filename)
-                else:
-                    file_content = s3_manager.download_schema_raw(company_part, doc_type_part, filename)
-                
-                if file_content is not None:
-                    successful_path = f"{path}/{filename}"
-                    logger.info(f"✅ Found file at: {successful_path}")
-                    break
-        
-        # Try alternative filenames if primary filename fails - with unique identifiers
-        if file_content is None and compat_enabled:
-            alternative_filenames = [
-                # Config-specific filenames (most unique)
-                f"config_{config_id}_{file_type}.{'txt' if file_type == 'prompt' else 'json'}",  # config_6_prompt.txt
-                f"cfg{config_id}_{file_type}.{'txt' if file_type == 'prompt' else 'json'}",      # cfg6_prompt.txt
-                f"{config_id}_{file_type}.{'txt' if file_type == 'prompt' else 'json'}",        # 6_prompt.txt
-                
-                # Company+DocType+Config combinations
-                f"{company.company_id}_{doc_type.doc_type_id}_{config_id}_{file_type}.{'txt' if file_type == 'prompt' else 'json'}",  # 2_3_6_prompt.txt
-                f"c{company.company_id}_d{doc_type.doc_type_id}_cfg{config_id}_{file_type}.{'txt' if file_type == 'prompt' else 'json'}",  # c2_d3_cfg6_prompt.txt
-                
-                # Timestamp-based alternatives
-                f"{filename.split('.')[0]}_config_{config_id}.{'txt' if file_type == 'prompt' else 'json'}",  # invoice_prompt_config_6.txt
-                f"{config_id}_{filename}",  # 6_invoice_prompt.txt
-                
-                # Original alternatives
-                "prompt.txt" if file_type == "prompt" else "schema.json",
-                f"{company.company_id}_{doc_type.doc_type_id}_{file_type}.{'txt' if file_type == 'prompt' else 'json'}",
-                filename.replace(" ", "_").replace(".", "_").replace("_txt", ".txt").replace("_json", ".json"),
-            ]
-            
-            for alt_filename in alternative_filenames:
-                if file_content is not None:
-                    break
-                    
-                for path in all_paths_to_try:
-                    if file_content is not None:
-                        break
-                    
-                    if '/' in path:
-                        company_part, doc_type_part = path.split('/', 1)
-                        logger.info(f"🔍 Trying alternative: {path}/{alt_filename}")
-                        
-                        if file_type == "prompt":
-                            file_content = s3_manager.download_prompt_raw(company_part, doc_type_part, alt_filename)
-                        else:
-                            file_content = s3_manager.download_schema_raw(company_part, doc_type_part, alt_filename)
-                        
-                        if file_content is not None:
-                            filename = alt_filename
-                            successful_path = f"{path}/{alt_filename}"
-                            logger.info(f"✅ Found file with alternative name: {successful_path}")
-                            break
-        
-        # Last resort: wildcard search
-        if file_content is None and compat_enabled:
-            logger.info("🔍 Attempting wildcard search as last resort")
-            file_content, successful_path = try_wildcard_search()
-            if successful_path:
-                filename = successful_path.split('/')[-1]
-        
-        if file_content is None:
-            raise HTTPException(
-                status_code=404, 
-                detail=f"{file_type.title()} file not found in S3 for {company.company_code}/{doc_type.type_code}"
-            )
-        
-        # PRIORITY 1: Try to get original filename from database (most reliable)
-        original_filename = filename  # fallback to current filename
-        try:
-            if file_type == "prompt" and config.original_prompt_filename:
-                original_filename = config.original_prompt_filename
-                logger.info(f"📁 Using original filename from database: {original_filename}")
-            elif file_type == "schema" and config.original_schema_filename:
-                original_filename = config.original_schema_filename
-                logger.info(f"📁 Using original filename from database: {original_filename}")
-            else:
-                logger.info(f"⚠️ No original filename in database for {file_type}, trying S3 metadata")
-        except Exception as e:
-            logger.warning(f"⚠️ Failed to get original filename from database: {e}")
-        
-        # PRIORITY 2: Try to get original filename from S3 metadata (backup method)
-        # Only try S3 metadata if database didn't provide original filename
-        if (original_filename == filename and successful_path):
-            try:
-                # Normalise successful_path into a pure S3 key (no folder prefixing mistakes)
-                key_only = successful_path
-                if key_only.startswith('s3://'):
-                    parts = key_only[5:].split('/', 1)
-                    key_only = parts[1] if len(parts) == 2 else key_only
-
-                # When the key is ID-based (companies/...), query head_object directly
-                if key_only.startswith('companies/'):
-                    head = s3_manager.s3_client.head_object(Bucket=s3_manager.bucket_name, Key=key_only)
-                    metadata = head.get('Metadata', {})
-                else:
-                    # For legacy foldered keys (prompts/, schemas/, upload/, results/ ...)
-                    # get_file_info expects a key relative to the folder argument.
-                    folder_type = 'prompts' if file_type == 'prompt' else 'schemas'
-                    rel_key = key_only
-                    for prefix in (f'{folder_type}/', 'upload/', 'uploads/', 'results/', 'exports/'):
-                        if rel_key.startswith(prefix):
-                            rel_key = rel_key[len(prefix):]
-                            break
-                    info = s3_manager.get_file_info(rel_key, folder=folder_type)
-                    metadata = info.get('metadata', {}) if info else {}
-
-                if metadata and 'original_filename' in metadata:
-                    original_filename = metadata['original_filename']
-                    logger.info(f"📁 Retrieved original filename from S3 metadata: {original_filename}")
-                else:
-                    logger.info("⚠️ No original_filename in S3 metadata, using stored filename")
-            except Exception as e:
-                logger.warning(f"⚠️ Failed to retrieve original filename from S3 metadata: {e}")
-        
-        # Create temporary file for FileResponse
-        with tempfile.NamedTemporaryFile(delete=False, suffix=f"_{original_filename}") as temp_file:
-            # Ensure file_content is bytes for writing
-            if isinstance(file_content, str):
-                temp_file.write(file_content.encode('utf-8'))
-            else:
-                temp_file.write(file_content)
-            temp_file_path = temp_file.name
-        
-        # Determine content type
-        content_type = "text/plain" if file_type == "prompt" else "application/json"
-        
-        logger.info(f"✅ S3 file download successful: {company.company_code}/{doc_type.type_code}/{original_filename}")
-        return FileResponse(
-            path=temp_file_path,
-            filename=original_filename,
-            media_type=content_type
-        )
-    
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"❌ S3-only config file download failed: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to download {file_type} file from S3: {str(e)}")
-
-
 # File upload endpoint
 @app.post("/upload", response_model=dict)
 async def upload_file(file: UploadFile = File(...), path: str = Form(...)):
@@ -2501,8 +1931,8 @@ async def upload_file(file: UploadFile = File(...), path: str = Form(...)):
                 try:
                     db = next(get_db())
                     try:
-                        config = db.query(CompanyDocumentConfig).filter(
-                            CompanyDocumentConfig.config_id == config_id
+                        config = db.query(CompanyDocTypeConfig).filter(
+                            CompanyDocTypeConfig.config_id == config_id
                         ).first()
                         
                         if config:
@@ -3053,12 +2483,12 @@ def get_companies_for_document_type(doc_type_id: int, db: Session = Depends(get_
     companies_query = (
         db.query(Company)
         .join(
-            CompanyDocumentConfig,
-            Company.company_id == CompanyDocumentConfig.company_id,
+            CompanyDocTypeConfig,
+            Company.company_id == CompanyDocTypeConfig.company_id,
         )
         .filter(
-            CompanyDocumentConfig.doc_type_id == doc_type_id,
-            CompanyDocumentConfig.active,
+            CompanyDocTypeConfig.doc_type_id == doc_type_id,
+            CompanyDocTypeConfig.active,
             Company.active,
         )
         .all()
@@ -3414,89 +2844,6 @@ def force_delete_company(
             detail=f"Force delete failed: {str(e)}"
         )
 
-
-@app.delete("/configs/{config_id}/force-delete")
-def force_delete_config(
-    config_id: int,
-    db: Session = Depends(get_db)
-):
-    """強制刪除配置及其相關文件"""
-    try:
-        force_delete_manager = ForceDeleteManager(db)
-        result = force_delete_manager.force_delete_config(config_id)
-        return result
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except Exception as e:
-        logger.error(f"Force delete config failed: {str(e)}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Force delete failed: {str(e)}"
-        )
-
-
-# 為 Configurations 添加依賴檢查端點
-@app.get("/configs/{config_id}/dependencies")
-def get_config_dependencies(config_id: int, db: Session = Depends(get_db)):
-    """獲取配置的依賴信息"""
-    try:
-        from utils.dependency_checker import DependencyChecker
-        
-        # 獲取配置信息
-        config = db.query(CompanyDocumentConfig).filter(
-            CompanyDocumentConfig.config_id == config_id
-        ).first()
-        
-        if not config:
-            raise HTTPException(status_code=404, detail="Configuration not found")
-        
-        # 檢查是否有相關的處理任務（通過 company_id 和 doc_type_id）
-        processing_jobs_count = db.query(ProcessingJob).filter(
-            ProcessingJob.company_id == config.company_id,
-            ProcessingJob.doc_type_id == config.doc_type_id
-        ).count()
-        
-        batch_jobs_count = db.query(BatchJob).filter(
-            BatchJob.company_id == config.company_id,
-            BatchJob.doc_type_id == config.doc_type_id
-        ).count()
-        
-        s3_files_count = 0
-        if config.prompt_path and config.prompt_path.startswith('s3://'):
-            s3_files_count += 1
-        if config.schema_path and config.schema_path.startswith('s3://'):
-            s3_files_count += 1
-        
-        total_dependencies = processing_jobs_count + batch_jobs_count + s3_files_count
-        can_delete = total_dependencies == 0
-        
-        config_name = f"{config.company.company_name} - {config.document_type.type_name}"
-        
-        dependencies = {
-            "exists": True,
-            "config_name": config_name,
-            "can_delete": can_delete,
-            "total_dependencies": total_dependencies,
-            "dependencies": {
-                "processing_jobs": processing_jobs_count,
-                "batch_jobs": batch_jobs_count,
-                "s3_files": s3_files_count
-            },
-            "blocking_message": None if can_delete else f"Cannot delete configuration '{config_name}': {processing_jobs_count} processing job(s), {batch_jobs_count} batch job(s), {s3_files_count} S3 file(s) exist."
-        }
-        
-        return dependencies
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error checking config dependencies: {str(e)}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to check dependencies: {str(e)}"
-        )
-
-
 # ============================================================================
 # OCR ORDER SYSTEM ENDPOINTS
 # ============================================================================
@@ -3504,11 +2851,9 @@ def get_config_dependencies(config_id: int, db: Session = Depends(get_db)):
 # Pydantic models for OCR Order requests/responses
 class CreateOrderRequest(BaseModel):
     order_name: Optional[str] = None
-    primary_doc_type_id: Optional[int] = None
 
 class UpdateOrderRequest(BaseModel):
     order_name: Optional[str] = None
-    mapping_keys: Optional[List[str]] = None
 
 class CreateOrderItemRequest(BaseModel):
     company_id: int
@@ -3516,6 +2861,126 @@ class CreateOrderItemRequest(BaseModel):
     item_name: Optional[str] = None
     item_type: Optional[str] = None
     mapping_config: Optional[Dict[str, Any]] = None
+    selected_month_excel_path: Optional[str] = None
+
+
+class UpdateOrderItemRequest(BaseModel):
+    item_name: Optional[str] = None
+    selected_month_excel_path: Optional[str] = None
+
+
+class CompanyDocTypeConfigPayload(BaseModel):
+    company_id: int
+    doc_type_id: int
+    item_type: MappingItemType
+    prompt_path: Optional[str] = None
+    schema_path: Optional[str] = None
+    storage_type: Optional[StorageType] = None
+    storage_metadata: Optional[Dict[str, Any]] = None
+    master_csv_path: Optional[str] = None
+    output_template_path: Optional[str] = None
+    single_source_config: Optional[Dict[str, Any]] = None
+    multi_source_step1_config: Optional[Dict[str, Any]] = None
+    multi_source_step2_config: Optional[Dict[str, Any]] = None
+    internal_join_key: Optional[str] = None
+    attachment_sources: Optional[List[Dict[str, Any]]] = None
+    active: bool = True
+    priority: int = 100
+
+
+class CompanyDocTypeConfigUpdatePayload(BaseModel):
+    prompt_path: Optional[str] = None
+    schema_path: Optional[str] = None
+    storage_type: Optional[StorageType] = None
+    storage_metadata: Optional[Dict[str, Any]] = None
+    master_csv_path: Optional[str] = None
+    output_template_path: Optional[str] = None
+    single_source_config: Optional[Dict[str, Any]] = None
+    multi_source_step1_config: Optional[Dict[str, Any]] = None
+    multi_source_step2_config: Optional[Dict[str, Any]] = None
+    internal_join_key: Optional[str] = None
+    attachment_sources: Optional[List[Dict[str, Any]]] = None
+    active: Optional[bool] = None
+    priority: Optional[int] = None
+
+
+class CompanyDocTypeConfigResponse(BaseModel):
+    config_id: int
+    company_id: int
+    doc_type_id: int
+    item_type: MappingItemType
+    company_name: Optional[str]
+    company_code: Optional[str]
+    doc_type_name: Optional[str]
+    doc_type_code: Optional[str]
+    prompt_path: Optional[str]
+    schema_path: Optional[str]
+    storage_type: StorageType
+    storage_metadata: Optional[Dict[str, Any]]
+    master_csv_path: Optional[str]
+    output_template_path: Optional[str]
+    single_source_config: Optional[Dict[str, Any]]
+    multi_source_step1_config: Optional[Dict[str, Any]]
+    multi_source_step2_config: Optional[Dict[str, Any]]
+    internal_join_key: Optional[str]
+    attachment_sources: Optional[List[Dict[str, Any]]]
+    active: bool
+    priority: int
+    created_at: str
+    updated_at: str
+
+
+class ConfigFileKind(str, Enum):
+    prompt = "prompt"
+    schema = "schema"
+    master_csv = "master_csv"
+    output_template = "output_template"
+
+
+class ConfigFileUploadResponse(BaseModel):
+    config_id: int
+    kind: ConfigFileKind
+    stored_path: str
+    storage_type: StorageType
+    filename: str
+    size: int
+
+
+class ConfigFileInfo(BaseModel):
+    config_id: int
+    kind: ConfigFileKind
+    field_name: str
+    stored_path: Optional[str]
+    storage_type: StorageType
+    exists: bool
+    size: Optional[int] = None
+    last_modified: Optional[str] = None
+
+
+class OneDriveEntry(BaseModel):
+    name: str
+    path: str
+    type: Literal["file", "folder"]
+    size: Optional[int] = None
+    last_modified: Optional[str] = None
+
+
+class OneDriveListingResponse(BaseModel):
+    path: str
+    parent_path: Optional[str]
+    entries: List[OneDriveEntry]
+
+
+class ConfigFileFromOneDriveRequest(BaseModel):
+    kind: ConfigFileKind
+    onedrive_path: str
+
+
+class ScheduledExcelOptionResponse(BaseModel):
+    schedule_id: int
+    schedule_name: str
+    month_str: str
+    output_excel_path: str
 
 class OrderResponse(BaseModel):
     order_id: int
@@ -3527,10 +2992,6 @@ class OrderResponse(BaseModel):
     total_attachments: int
     completed_attachments: int
     failed_attachments: int
-    primary_doc_type_id: Optional[int]
-    primary_doc_type: Optional[dict]
-    mapping_file_path: Optional[str]
-    mapping_keys: Optional[List[str]]
     final_report_paths: Optional[dict]
     created_at: str
     updated_at: str
@@ -3558,7 +3019,7 @@ class OrderItemResponse(BaseModel):
     ocr_result_json_path: Optional[str]
     ocr_result_csv_path: Optional[str]
     mapping_config: Optional[Dict[str, Any]]
-    applied_template_id: Optional[int]
+    selected_month_excel_path: Optional[str]
     created_at: str
     updated_at: str
 
@@ -3569,141 +3030,25 @@ class MappingConfigUpdateRequest(BaseModel):
     inherit_defaults: bool = True
 
 
-class MappingTemplatePayload(BaseModel):
-    template_name: str
-    item_type: MappingItemType
-    config: Dict[str, Any]
-    company_id: Optional[int] = None
-    doc_type_id: Optional[int] = None
-    priority: Optional[int] = 100
-
-
-class MappingTemplateResponse(BaseModel):
-    template_id: int
-    template_name: str
-    item_type: MappingItemType
-    company_id: Optional[int]
-    doc_type_id: Optional[int]
-    priority: int
-    config: Dict[str, Any]
-    created_at: str
-    updated_at: str
-
-
-class MappingDefaultPayload(BaseModel):
-    company_id: int
-    doc_type_id: int
-    item_type: MappingItemType = MappingItemType.SINGLE_SOURCE
-    template_id: Optional[int] = None
-    config_override: Optional[Dict[str, Any]] = None
-
-
-class MappingDefaultResponse(BaseModel):
-    default_id: int
-    company_id: int
-    doc_type_id: int
-    item_type: MappingItemType
-    template_id: Optional[int]
-    config_override: Optional[Dict[str, Any]]
-    created_at: str
-    updated_at: str
-
-
-class MappingTemplateUpdatePayload(BaseModel):
-    template_name: Optional[str] = None
-    item_type: Optional[MappingItemType] = None
-    config: Optional[Dict[str, Any]] = None
-    company_id: Optional[int] = None
-    doc_type_id: Optional[int] = None
-    priority: Optional[int] = None
-
-
-class MappingDefaultUpdatePayload(BaseModel):
-    template_id: Optional[int] = None
-    config_override: Optional[Dict[str, Any]] = None
-
-
-def _serialize_primary_doc_type(doc_type: Optional[DocumentType]) -> Optional[dict]:
-    """Serialize primary document type details for API responses."""
-
-    if not doc_type:
-        return None
-
-    return {
-        "doc_type_id": doc_type.doc_type_id,
-        "type_name": doc_type.type_name,
-        "type_code": doc_type.type_code,
-        "template_json_path": doc_type.template_json_path,
-        "template_version": extract_template_version_from_path(doc_type.template_json_path),
-        "has_template": bool(doc_type.template_json_path),
-    }
-
-
-def _serialize_mapping_template(template: MappingTemplate) -> Dict[str, Any]:
-    item_type_value = template.item_type.value if isinstance(template.item_type, OrderItemType) else template.item_type
-    return {
-        "template_id": template.template_id,
-        "template_name": template.template_name,
-        "item_type": MappingItemType(item_type_value),
-        "company_id": template.company_id,
-        "doc_type_id": template.doc_type_id,
-        "priority": template.priority,
-        "config": template.config or {},
-        "created_at": template.created_at.isoformat() if template.created_at else None,
-        "updated_at": template.updated_at.isoformat() if template.updated_at else None,
-    }
-
-
-def _serialize_mapping_default(default: CompanyDocMappingDefault) -> Dict[str, Any]:
-    item_type_value = default.item_type.value if isinstance(default.item_type, OrderItemType) else default.item_type
-    return {
-        "default_id": default.default_id,
-        "company_id": default.company_id,
-        "doc_type_id": default.doc_type_id,
-        "item_type": MappingItemType(item_type_value),
-        "template_id": default.template_id,
-        "config_override": default.config_override or {},
-        "created_at": default.created_at.isoformat() if default.created_at else None,
-        "updated_at": default.updated_at.isoformat() if default.updated_at else None,
-    }
-
-
 @app.post("/orders", response_model=dict)
 def create_order(request: CreateOrderRequest, db: Session = Depends(get_db)):
     """Create a new OCR order"""
     try:
-        primary_doc_type = None
-        if request.primary_doc_type_id is not None:
-            primary_doc_type = (
-                db.query(DocumentType)
-                .filter(DocumentType.doc_type_id == request.primary_doc_type_id)
-                .first()
-            )
-            if not primary_doc_type:
-                raise HTTPException(status_code=400, detail="Primary document type not found")
-
         order = OcrOrder(
             order_name=request.order_name,
             status=OrderStatus.DRAFT,
-            primary_doc_type_id=primary_doc_type.doc_type_id if primary_doc_type else None,
         )
         db.add(order)
         db.commit()
         db.refresh(order)
 
-        logger.info(
-            "Created order %s with primary_doc_type_id=%s",
-            order.order_id,
-            order.primary_doc_type_id,
-        )
+        logger.info("Created order %s", order.order_id)
 
         return {
             "order_id": order.order_id,
             "order_name": order.order_name,
             "status": order.status.value,
-            "primary_doc_type_id": order.primary_doc_type_id,
-            "primary_doc_type": _serialize_primary_doc_type(primary_doc_type),
-            "message": "Order created successfully"
+            "message": "Order created successfully",
         }
     except Exception as e:
         db.rollback()
@@ -3740,7 +3085,6 @@ def list_orders(
                     "item_id": item.item_id,
                     "item_type": item.item_type.value if item.item_type else None,
                     "has_mapping_config": bool(item.mapping_config),
-                    "applied_template_id": item.applied_template_id,
                 }
                 for item in order.items
             ]
@@ -3748,16 +3092,12 @@ def list_orders(
                 "order_id": order.order_id,
                 "order_name": order.order_name,
                 "status": order.status.value,
-                "primary_doc_type_id": order.primary_doc_type_id,
-                "primary_doc_type": _serialize_primary_doc_type(order.primary_doc_type),
                 "total_items": order.total_items,
                 "completed_items": order.completed_items,
                 "failed_items": order.failed_items,
                 "total_attachments": attachment_stats["total_attachments"],
                 "completed_attachments": attachment_stats["completed_attachments"],
                 "failed_attachments": attachment_stats["failed_attachments"],
-                "mapping_file_path": order.mapping_file_path,
-                "mapping_keys": order.mapping_keys,
                 "final_report_paths": order.final_report_paths,
                 "item_mapping_summary": mapping_summary,
                 "created_at": order.created_at.isoformat(),
@@ -3847,7 +3187,7 @@ def get_order(order_id: int, db: Session = Depends(get_db)):
                 "ocr_result_json_path": item.ocr_result_json_path,
                 "ocr_result_csv_path": item.ocr_result_csv_path,
                 "mapping_config": item.mapping_config,
-                "applied_template_id": item.applied_template_id,
+                "selected_month_excel_path": item.selected_month_excel_path,
                 "processing_started_at": item.processing_started_at.isoformat() if item.processing_started_at else None,
                 "processing_completed_at": item.processing_completed_at.isoformat() if item.processing_completed_at else None,
                 "processing_time_seconds": item.processing_time_seconds,
@@ -3864,13 +3204,9 @@ def get_order(order_id: int, db: Session = Depends(get_db)):
             "order_id": order.order_id,
             "order_name": order.order_name,
             "status": order.status.value,
-            "primary_doc_type_id": order.primary_doc_type_id,
-            "primary_doc_type": _serialize_primary_doc_type(order.primary_doc_type),
             "total_items": order.total_items,
             "completed_items": order.completed_items,
             "failed_items": order.failed_items,
-            "mapping_file_path": order.mapping_file_path,
-            "mapping_keys": order.mapping_keys,
             "final_report_paths": order.final_report_paths,
             "error_message": order.error_message,
             "items": items_data,
@@ -3881,7 +3217,6 @@ def get_order(order_id: int, db: Session = Depends(get_db)):
                     "item_id": item.item_id,
                     "item_type": item.item_type.value if item.item_type else None,
                     "has_mapping_config": bool(item.mapping_config),
-                    "applied_template_id": item.applied_template_id,
                 }
                 for item in order.items
             ],
@@ -3912,27 +3247,6 @@ def update_order(order_id: int, request: UpdateOrderRequest, db: Session = Depen
                 raise HTTPException(status_code=400, detail="Can only update order name for orders in DRAFT status")
             order.order_name = request.order_name
 
-        if request.mapping_keys is not None:
-            if order.status not in [OrderStatus.DRAFT, OrderStatus.OCR_COMPLETED, OrderStatus.COMPLETED, OrderStatus.MAPPING]:
-                raise HTTPException(status_code=400, detail="Can only update mapping keys for orders in DRAFT, OCR_COMPLETED, COMPLETED, or MAPPING status")
-
-            # 保存旧的mapping_keys用于比较
-            old_mapping_keys = order.mapping_keys or []
-            new_mapping_keys = request.mapping_keys or []
-
-            # 更新mapping_keys
-            order.mapping_keys = request.mapping_keys
-
-            # 创建映射历史记录（如果映射键发生了变化）
-            if old_mapping_keys != new_mapping_keys:
-                create_mapping_history_on_update(
-                    db=db,
-                    order_id=order_id,
-                    new_mapping_keys=new_mapping_keys,
-                    operation_type="UPDATE",
-                    operation_reason="Manual update via API"
-                )
-
         order.updated_at = datetime.utcnow()
 
         db.commit()
@@ -3942,7 +3256,6 @@ def update_order(order_id: int, request: UpdateOrderRequest, db: Session = Depen
             "order_id": order.order_id,
             "order_name": order.order_name,
             "status": order.status.value,
-            "mapping_keys": order.mapping_keys,
             "message": "Order updated successfully"
         }
     except HTTPException:
@@ -4003,14 +3316,23 @@ def create_order_item(order_id: int, request: CreateOrderItemRequest, db: Sessio
         except ValueError:
             raise HTTPException(status_code=400, detail="Unsupported item_type")
 
-        # Try to pre-resolve mapping defaults for convenience, but do not hard-fail
-        # item creation if defaults are incomplete (e.g., missing master_csv_path).
-        # This defers strict validation to the mapping stage and allows users to
-        # add items first, then configure mapping.
-        resolver = MappingConfigResolver(db)
-        resolved_config = None
+        # Basic validation: selected_month_excel_path is only meaningful for multi_source items.
+        if request.selected_month_excel_path and item_type_enum != OrderItemType.MULTI_SOURCE:
+            raise HTTPException(
+                status_code=400,
+                detail="selected_month_excel_path is only supported for multi_source items",
+            )
+
+        # Try to pre-resolve mapping defaults from the new company_doc_type_configs
+        # table for convenience, but do not hard-fail item creation if defaults are
+        # incomplete (e.g., missing master_csv_path). This defers strict validation
+        # to the mapping stage and allows users to add items first, then configure
+        # mapping.
+        effective_config: Dict[str, Any] = {}
+
+        config_resolver = CompanyDocTypeConfigResolver(db)
         try:
-            resolved_config = resolver.resolve_for_item(
+            resolved_from_new = config_resolver.resolve_for_item(
                 company_id=request.company_id,
                 doc_type_id=request.doc_type_id,
                 item_type=item_type_enum,
@@ -4019,17 +3341,21 @@ def create_order_item(order_id: int, request: CreateOrderItemRequest, db: Sessio
         except ValueError as exc:
             # Be tolerant at item creation time; log and proceed with empty config
             logger.warning(
-                "Create item: mapping defaults invalid for company=%s doc_type=%s item_type=%s; deferring validation. Error=%s",
+                "Create item: company_doc_type_configs invalid for company=%s doc_type=%s item_type=%s; "
+                "deferring validation. Error=%s",
                 request.company_id,
                 request.doc_type_id,
                 item_type_enum.value,
                 str(exc),
             )
-            resolved_config = None
+            resolved_from_new = None
 
-        # Create order item
-        # Ensure mapping_config is a JSON object to satisfy DB CHECK constraints
-        effective_config = resolved_config.config if resolved_config else {}
+        if resolved_from_new is not None:
+            effective_config = resolved_from_new
+        # No legacy fallback: if there is no unified config, keep any user-provided
+        # mapping_config as-is and defer strict validation to the mapping stage.
+
+        # Create order item. Ensure mapping_config is a JSON object to satisfy DB constraints.
         item = OcrOrderItem(
             order_id=order_id,
             company_id=request.company_id,
@@ -4038,7 +3364,7 @@ def create_order_item(order_id: int, request: CreateOrderItemRequest, db: Sessio
             status=OrderItemStatus.PENDING,
             item_type=item_type_enum,
             mapping_config=effective_config,
-            applied_template_id=resolved_config.template_id if resolved_config else None,
+            selected_month_excel_path=request.selected_month_excel_path,
         )
 
         db.add(item)
@@ -4059,7 +3385,6 @@ def create_order_item(order_id: int, request: CreateOrderItemRequest, db: Sessio
             "status": item.status.value,
             "item_type": item.item_type.value,
             "mapping_config": item.mapping_config,
-            "applied_template_id": item.applied_template_id,
             "message": "Order item created successfully"
         }
     except HTTPException:
@@ -4151,6 +3476,78 @@ def delete_order_item(
         raise HTTPException(status_code=500, detail=f"Failed to delete order item: {str(e)}")
 
 
+@app.put("/orders/{order_id}/items/{item_id}", response_model=dict)
+def update_order_item(
+    order_id: int,
+    item_id: int,
+    request: UpdateOrderItemRequest,
+    db: Session = Depends(get_db),
+):
+    """Update basic fields of an order item (item_name, selected_month_excel_path).
+
+    Rules:
+    - Order must not be in PROCESSING (OCR running).
+    - selected_month_excel_path is only valid for multi_source items.
+    """
+    try:
+        order = db.query(OcrOrder).filter(OcrOrder.order_id == order_id).first()
+        if not order:
+            raise HTTPException(status_code=404, detail="Order not found")
+
+        if order.status == OrderStatus.PROCESSING:
+            raise HTTPException(status_code=400, detail="Cannot modify items while OCR processing is in progress")
+
+        item = (
+            db.query(OcrOrderItem)
+            .filter(
+                OcrOrderItem.item_id == item_id,
+                OcrOrderItem.order_id == order_id,
+            )
+            .first()
+        )
+        if not item:
+            raise HTTPException(status_code=404, detail="Order item not found")
+
+        # Update item_name if provided
+        if "item_name" in request.__fields_set__:
+            item.item_name = request.item_name
+
+        # Update selected_month_excel_path if provided
+        if "selected_month_excel_path" in request.__fields_set__:
+            # Only meaningful for multi_source items
+            if item.item_type != OrderItemType.MULTI_SOURCE and request.selected_month_excel_path:
+                raise HTTPException(
+                    status_code=400,
+                    detail="selected_month_excel_path is only supported for multi_source items",
+                )
+            item.selected_month_excel_path = request.selected_month_excel_path
+
+        item.updated_at = datetime.utcnow()
+        order.updated_at = datetime.utcnow()
+
+        db.commit()
+        db.refresh(item)
+
+        return {
+            "item_id": item.item_id,
+            "order_id": item.order_id,
+            "company_id": item.company_id,
+            "doc_type_id": item.doc_type_id,
+            "item_name": item.item_name,
+            "status": item.status.value,
+            "item_type": item.item_type.value if item.item_type else None,
+            "selected_month_excel_path": item.selected_month_excel_path,
+            "mapping_config": item.mapping_config,
+            "message": "Order item updated successfully",
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Failed to update order item {order_id}/{item_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to update order item: {str(e)}")
+
+
 @app.put("/orders/{order_id}/items/{item_id}/mapping-config", response_model=dict)
 def update_order_item_mapping_config(
     order_id: int,
@@ -4187,12 +3584,14 @@ def update_order_item_mapping_config(
 
         mapping_item_type = MappingItemType(item_type_enum.value)
 
-        resolver = MappingConfigResolver(db)
         payload_override = request.mapping_config or {}
 
         if request.inherit_defaults:
+            # Only unified company_doc_type_configs are used now; legacy mapping templates
+            # and defaults have been removed.
+            config_resolver = CompanyDocTypeConfigResolver(db)
             try:
-                resolved = resolver.resolve_for_item(
+                resolved_from_new = config_resolver.resolve_for_item(
                     company_id=item.company_id,
                     doc_type_id=item.doc_type_id,
                     item_type=item_type_enum,
@@ -4201,25 +3600,28 @@ def update_order_item_mapping_config(
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc))
 
-            if resolved is None:
-                raise HTTPException(status_code=400, detail="No defaults available for this item; provide mapping_config explicitly")
-
-            config_dict = resolved.config
-            applied_template_id = resolved.template_id
-            source = resolved.source
+            if resolved_from_new is not None:
+                config_dict = resolved_from_new
+                source = "company_doc_type_config"
+            else:
+                raise HTTPException(
+                    status_code=400,
+                    detail="No unified defaults available for this item; provide mapping_config explicitly or create a CompanyDocTypeConfig",
+                )
         else:
             if not payload_override:
-                raise HTTPException(status_code=400, detail="mapping_config payload is required when inherit_defaults is false")
+                raise HTTPException(
+                    status_code=400,
+                    detail="mapping_config payload is required when inherit_defaults is false",
+                )
             try:
                 config_dict = normalise_mapping_config(mapping_item_type, payload_override)
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc))
-            applied_template_id = item.applied_template_id
             source = "manual"
 
         item.item_type = item_type_enum
         item.mapping_config = config_dict
-        item.applied_template_id = applied_template_id
         item.updated_at = datetime.utcnow()
         order.updated_at = datetime.utcnow()
 
@@ -4231,7 +3633,6 @@ def update_order_item_mapping_config(
             "order_id": item.order_id,
             "item_type": item.item_type.value,
             "mapping_config": item.mapping_config,
-            "applied_template_id": item.applied_template_id,
             "source": source,
             "message": "Mapping configuration updated successfully",
         }
@@ -4242,257 +3643,6 @@ def update_order_item_mapping_config(
         logger.error(f"Failed to update mapping config for order {order_id} item {item_id}: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to update mapping configuration: {str(e)}")
 
-
-@app.post("/mapping/templates", response_model=MappingTemplateResponse)
-def create_mapping_template(payload: MappingTemplatePayload, db: Session = Depends(get_db)):
-    try:
-        item_type_enum = OrderItemType(payload.item_type.value)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-
-    try:
-        normalized_config = normalise_mapping_config(payload.item_type, payload.config)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-
-    template = MappingTemplate(
-        template_name=payload.template_name,
-        item_type=item_type_enum,
-        config=normalized_config,
-        company_id=payload.company_id,
-        doc_type_id=payload.doc_type_id,
-        priority=payload.priority or 100,
-    )
-
-    db.add(template)
-    db.commit()
-    db.refresh(template)
-
-    return _serialize_mapping_template(template)
-
-
-@app.get("/mapping/templates", response_model=List[MappingTemplateResponse])
-def list_mapping_templates(
-    company_id: Optional[int] = None,
-    doc_type_id: Optional[int] = None,
-    item_type: Optional[MappingItemType] = None,
-    db: Session = Depends(get_db),
-):
-    query = db.query(MappingTemplate)
-    if company_id is not None:
-        query = query.filter((MappingTemplate.company_id == company_id) | (MappingTemplate.company_id.is_(None)))
-    if doc_type_id is not None:
-        query = query.filter((MappingTemplate.doc_type_id == doc_type_id) | (MappingTemplate.doc_type_id.is_(None)))
-    if item_type is not None:
-        try:
-            item_type_enum = OrderItemType(item_type.value)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc))
-        query = query.filter(MappingTemplate.item_type == item_type_enum)
-
-    templates = query.order_by(MappingTemplate.priority.asc(), MappingTemplate.template_id.asc()).all()
-    return [_serialize_mapping_template(template) for template in templates]
-
-
-@app.put("/mapping/templates/{template_id}", response_model=MappingTemplateResponse)
-def update_mapping_template(
-    template_id: int,
-    payload: MappingTemplateUpdatePayload,
-    db: Session = Depends(get_db),
-):
-    template = db.query(MappingTemplate).filter(MappingTemplate.template_id == template_id).first()
-    if not template:
-        raise HTTPException(status_code=404, detail="Template not found")
-
-    if payload.template_name is not None:
-        template.template_name = payload.template_name
-
-    if payload.item_type is not None:
-        try:
-            template.item_type = OrderItemType(payload.item_type.value)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc))
-
-    if payload.company_id is not None:
-        template.company_id = payload.company_id
-    if payload.doc_type_id is not None:
-        template.doc_type_id = payload.doc_type_id
-    if payload.priority is not None:
-        template.priority = payload.priority
-
-    if payload.config is not None:
-        try:
-            mapping_item_type = MappingItemType(template.item_type.value if isinstance(template.item_type, OrderItemType) else template.item_type)
-            template.config = normalise_mapping_config(mapping_item_type, payload.config)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc))
-
-    template.updated_at = datetime.utcnow()
-
-    db.commit()
-    db.refresh(template)
-
-    return _serialize_mapping_template(template)
-
-
-@app.delete("/mapping/templates/{template_id}", response_model=dict)
-def delete_mapping_template(template_id: int, db: Session = Depends(get_db)):
-    template = db.query(MappingTemplate).filter(MappingTemplate.template_id == template_id).first()
-    if not template:
-        raise HTTPException(status_code=404, detail="Template not found")
-
-    if template.defaults:
-        raise HTTPException(status_code=400, detail="Cannot delete template that is referenced by defaults")
-
-    db.delete(template)
-    db.commit()
-
-    return {"message": "Template deleted successfully"}
-
-
-@app.post("/mapping/defaults", response_model=MappingDefaultResponse)
-def upsert_mapping_default(payload: MappingDefaultPayload, db: Session = Depends(get_db)):
-    try:
-        item_type_enum = OrderItemType(payload.item_type.value)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-
-    default_record = (
-        db.query(CompanyDocMappingDefault)
-        .filter(
-            CompanyDocMappingDefault.company_id == payload.company_id,
-            CompanyDocMappingDefault.doc_type_id == payload.doc_type_id,
-            CompanyDocMappingDefault.item_type == item_type_enum,
-        )
-        .first()
-    )
-
-    template = None
-    if payload.template_id is not None:
-        template = db.query(MappingTemplate).filter(MappingTemplate.template_id == payload.template_id).first()
-        if not template:
-            raise HTTPException(status_code=404, detail="Template not found")
-        if template.item_type != item_type_enum:
-            raise HTTPException(status_code=400, detail="Template item_type mismatch with default")
-
-    normalised_override = None
-    if payload.config_override is not None:
-        template_config: Optional[Dict[str, Any]] = None
-        if template and template.config:
-            template_config = template.config
-        elif (
-            default_record
-            and default_record.template
-            and default_record.template.config
-            and payload.template_id is None
-        ):
-            template_config = default_record.template.config
-
-        try:
-            normalised_override = normalise_mapping_override(
-                payload.item_type,
-                payload.config_override,
-                template_config=template_config,
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc))
-
-    if default_record:
-        default_record.template_id = payload.template_id
-        default_record.config_override = normalised_override
-        default_record.updated_at = datetime.utcnow()
-    else:
-        default_record = CompanyDocMappingDefault(
-            company_id=payload.company_id,
-            doc_type_id=payload.doc_type_id,
-            item_type=item_type_enum,
-            template_id=payload.template_id,
-            config_override=normalised_override,
-        )
-        db.add(default_record)
-
-    db.commit()
-    db.refresh(default_record)
-
-    return _serialize_mapping_default(default_record)
-
-
-@app.get("/mapping/defaults", response_model=List[MappingDefaultResponse])
-def list_mapping_defaults(
-    company_id: Optional[int] = None,
-    doc_type_id: Optional[int] = None,
-    item_type: Optional[MappingItemType] = None,
-    db: Session = Depends(get_db),
-):
-    query = db.query(CompanyDocMappingDefault)
-    if company_id is not None:
-        query = query.filter(CompanyDocMappingDefault.company_id == company_id)
-    if doc_type_id is not None:
-        query = query.filter(CompanyDocMappingDefault.doc_type_id == doc_type_id)
-    if item_type is not None:
-        try:
-            item_type_enum = OrderItemType(item_type.value)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc))
-        query = query.filter(CompanyDocMappingDefault.item_type == item_type_enum)
-
-    defaults = query.order_by(CompanyDocMappingDefault.company_id.asc(), CompanyDocMappingDefault.doc_type_id.asc()).all()
-    return [_serialize_mapping_default(default) for default in defaults]
-
-
-@app.get("/mapping/defaults/paged", response_model=dict)
-def list_mapping_defaults_paged(
-    company_id: Optional[int] = None,
-    doc_type_id: Optional[int] = None,
-    item_type: Optional[MappingItemType] = None,
-    limit: int = Query(10, ge=1, le=100),
-    offset: int = Query(0, ge=0),
-    db: Session = Depends(get_db),
-):
-    query = db.query(CompanyDocMappingDefault)
-    if company_id is not None:
-        query = query.filter(CompanyDocMappingDefault.company_id == company_id)
-    if doc_type_id is not None:
-        query = query.filter(CompanyDocMappingDefault.doc_type_id == doc_type_id)
-    if item_type is not None:
-        try:
-            item_type_enum = OrderItemType(item_type.value)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc))
-        query = query.filter(CompanyDocMappingDefault.item_type == item_type_enum)
-
-    total_count = query.count()
-    rows = (
-        query.order_by(CompanyDocMappingDefault.company_id.asc(), CompanyDocMappingDefault.doc_type_id.asc())
-        .offset(offset)
-        .limit(limit)
-        .all()
-    )
-    data = [_serialize_mapping_default(r) for r in rows]
-    total_pages = (total_count + limit - 1) // limit
-    return {
-        "data": data,
-        "pagination": {
-            "total_count": total_count,
-            "page_size": limit,
-            "current_page": (offset // limit) + 1,
-            "total_pages": total_pages,
-            "has_next": offset + limit < total_count,
-            "has_prev": offset > 0,
-        },
-    }
-
-
-@app.delete("/mapping/defaults/{default_id}", response_model=dict)
-def delete_mapping_default(default_id: int, db: Session = Depends(get_db)):
-    record = db.query(CompanyDocMappingDefault).filter(CompanyDocMappingDefault.default_id == default_id).first()
-    if not record:
-        raise HTTPException(status_code=404, detail="Default not found")
-
-    db.delete(record)
-    db.commit()
-
-    return {"message": "Default deleted successfully"}
 
 @app.post("/orders/{order_id}/submit", response_model=dict)
 def submit_order(order_id: int, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
@@ -4648,8 +3798,9 @@ def upload_primary_file_to_order_item(
         if not order:
             raise HTTPException(status_code=404, detail="Order not found")
 
-        if order.status != OrderStatus.DRAFT:
-            raise HTTPException(status_code=400, detail="Can only upload files to orders in DRAFT status")
+        # Allow uploads for orders that are not currently processing OCR
+        if order.status == OrderStatus.PROCESSING:
+            raise HTTPException(status_code=400, detail="Cannot upload files while OCR processing is in progress")
 
         item = db.query(OcrOrderItem).filter(
             OcrOrderItem.item_id == item_id,
@@ -4740,13 +3891,13 @@ def delete_primary_file_from_order_item(
 ):
     """Delete the primary file from an order item"""
     try:
-        # Verify order exists and is in DRAFT status
+        # Verify order exists and is in a modifiable status
         order = db.query(OcrOrder).filter(OcrOrder.order_id == order_id).first()
         if not order:
             raise HTTPException(status_code=404, detail="Order not found")
 
-        if order.status != OrderStatus.DRAFT:
-            raise HTTPException(status_code=400, detail="Can only delete files from orders in DRAFT status")
+        if order.status == OrderStatus.PROCESSING:
+            raise HTTPException(status_code=400, detail="Cannot delete files while OCR processing is in progress")
 
         # Verify item exists and belongs to the order
         item = db.query(OcrOrderItem).filter(
@@ -4772,6 +3923,25 @@ def delete_primary_file_from_order_item(
     except Exception as e:
         logger.error(f"Failed to delete primary file: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to delete primary file: {str(e)}")
+
+
+def recompute_order_item_stats(order_id: int, db: Session) -> None:
+    """Recompute order-level item counters based on current item statuses."""
+    order = db.query(OcrOrder).filter(OcrOrder.order_id == order_id).first()
+    if not order:
+        return
+
+    order.completed_items = db.query(OcrOrderItem).filter(
+        OcrOrderItem.order_id == order_id,
+        OcrOrderItem.status == OrderItemStatus.COMPLETED
+    ).count()
+
+    order.failed_items = db.query(OcrOrderItem).filter(
+        OcrOrderItem.order_id == order_id,
+        OcrOrderItem.status == OrderItemStatus.FAILED
+    ).count()
+
+    order.updated_at = datetime.utcnow()
 
 
 def _delete_primary_file_and_results(item: OcrOrderItem, db: Session):
@@ -4811,6 +3981,13 @@ def _delete_primary_file_and_results(item: OcrOrderItem, db: Session):
         item.ocr_result_csv_path = None
         item.updated_at = datetime.utcnow()
 
+        # Reset item status and timing fields
+        item.status = OrderItemStatus.PENDING
+        item.error_message = None
+        item.processing_started_at = None
+        item.processing_completed_at = None
+        item.processing_time_seconds = None
+
         # Delete S3 results if they exist (use stored paths)
         try:
             s3_manager = get_s3_manager()
@@ -4830,6 +4007,9 @@ def _delete_primary_file_and_results(item: OcrOrderItem, db: Session):
                         logger.warning(f"Failed to delete S3 CSV result {csv_result_path}: {e}")
         except Exception as e:
             logger.warning(f"Error deleting S3 results: {str(e)}")
+
+        # Recompute order-level counters after item status change
+        recompute_order_item_stats(item.order_id, db)
 
         db.commit()
 
@@ -4941,28 +4121,64 @@ def download_primary_file_json(
         if not item.primary_file_id:
             raise HTTPException(status_code=404, detail="Item has no primary file")
 
-        s3_manager = get_s3_manager()
-        if not s3_manager:
-            raise HTTPException(status_code=500, detail="S3 storage not available")
+        storage_backend = os.getenv("STORAGE_BACKEND", "").lower()
 
-        # Prefer per-file JSON for the primary file, consistent with attachment endpoints
-        stored_path = f"upload/results/orders/{item_id // 1000}/items/{item_id}/files/file_{item.primary_file_id}_result.json"
-        file_content = s3_manager.download_file_by_stored_path(stored_path)
+        if storage_backend == "s3":
+            s3_manager = get_s3_manager()
+            if not s3_manager:
+                raise HTTPException(status_code=500, detail="S3 storage not available")
 
-        # Fallback to legacy primary-only JSON if per-file JSON is missing (older jobs)
-        if not file_content:
-            if not item.ocr_result_json_path:
-                raise HTTPException(status_code=404, detail="Primary JSON result not found or not yet processed")
+            # Prefer per-file JSON for the primary file, consistent with attachment endpoints
+            stored_path = f"upload/results/orders/{item_id // 1000}/items/{item_id}/files/file_{item.primary_file_id}_result.json"
+            file_content = s3_manager.download_file_by_stored_path(stored_path)
 
-            file_content = s3_manager.download_file_by_stored_path(item.ocr_result_json_path)
-            stored_path = item.ocr_result_json_path
+            # Fallback to legacy primary-only JSON if per-file JSON is missing (older jobs)
+            if not file_content:
+                if not item.ocr_result_json_path:
+                    raise HTTPException(status_code=404, detail="Primary JSON result not found or not yet processed")
+
+                file_content = s3_manager.download_file_by_stored_path(item.ocr_result_json_path)
+                stored_path = item.ocr_result_json_path
+
+                if not file_content:
+                    raise HTTPException(status_code=404, detail="Primary JSON result not found or not yet processed")
+        else:
+            # Local / unified storage: read JSON for primary file
+            file_storage = get_file_storage()
+            base_dir = os.getenv("LOCAL_RESULT_JSON_DIR") or os.path.join(
+                os.getenv("LOCAL_STORAGE_ROOT", "../storage"),
+                "results",
+                "json",
+            )
+            primary_path = os.path.join(
+                base_dir,
+                "orders",
+                str(item_id // 1000),
+                "items",
+                str(item_id),
+                "files",
+                f"file_{item.primary_file_id}_result.json",
+            )
+
+            file_content = None
+            stored_path = None
+            for candidate in [primary_path, item.ocr_result_json_path]:
+                if not candidate:
+                    continue
+                try:
+                    content = file_storage.read_file(candidate)
+                except Exception:
+                    content = None
+                if content:
+                    file_content = content
+                    stored_path = candidate
+                    break
 
             if not file_content:
                 raise HTTPException(status_code=404, detail="Primary JSON result not found or not yet processed")
 
         # Create temporary file for download
         import tempfile
-        import os
 
         with tempfile.NamedTemporaryFile(delete=False, suffix=".json") as temp_file:
             temp_file.write(file_content)
@@ -4974,7 +4190,7 @@ def download_primary_file_json(
             filename=filename,
             media_type="application/json",
         )
-        response.headers["X-File-Source"] = "S3"
+        response.headers["X-File-Source"] = "S3" if storage_backend == "s3" else "local"
         response.headers["X-Result-Scope"] = "primary_file_only"
         response.headers["X-Result-Path"] = stored_path
         return response
@@ -5015,21 +4231,58 @@ def download_primary_file_csv(
         if not item.primary_file_id:
             raise HTTPException(status_code=404, detail="Item has no primary file")
 
-        s3_manager = get_s3_manager()
-        if not s3_manager:
-            raise HTTPException(status_code=500, detail="S3 storage not available")
+        storage_backend = os.getenv("STORAGE_BACKEND", "").lower()
 
-        # Prefer per-file JSON for the primary file, consistent with attachment endpoints
-        stored_path = f"upload/results/orders/{item_id // 1000}/items/{item_id}/files/file_{item.primary_file_id}_result.json"
-        file_content = s3_manager.download_file_by_stored_path(stored_path)
+        if storage_backend == "s3":
+            s3_manager = get_s3_manager()
+            if not s3_manager:
+                raise HTTPException(status_code=500, detail="S3 storage not available")
 
-        # Fallback to legacy primary-only JSON if per-file JSON is missing (older jobs)
-        if not file_content:
-            if not item.ocr_result_json_path:
-                raise HTTPException(status_code=404, detail="Primary JSON result not found or not yet processed")
+            # Prefer per-file JSON for the primary file, consistent with attachment endpoints
+            stored_path = f"upload/results/orders/{item_id // 1000}/items/{item_id}/files/file_{item.primary_file_id}_result.json"
+            file_content = s3_manager.download_file_by_stored_path(stored_path)
 
-            file_content = s3_manager.download_file_by_stored_path(item.ocr_result_json_path)
-            stored_path = item.ocr_result_json_path
+            # Fallback to legacy primary-only JSON if per-file JSON is missing (older jobs)
+            if not file_content:
+                if not item.ocr_result_json_path:
+                    raise HTTPException(status_code=404, detail="Primary JSON result not found or not yet processed")
+
+                file_content = s3_manager.download_file_by_stored_path(item.ocr_result_json_path)
+                stored_path = item.ocr_result_json_path
+
+                if not file_content:
+                    raise HTTPException(status_code=404, detail="Primary JSON result not found or not yet processed")
+        else:
+            # Local / unified storage: read JSON for primary file
+            file_storage = get_file_storage()
+            base_dir = os.getenv("LOCAL_RESULT_JSON_DIR") or os.path.join(
+                os.getenv("LOCAL_STORAGE_ROOT", "../storage"),
+                "results",
+                "json",
+            )
+            primary_path = os.path.join(
+                base_dir,
+                "orders",
+                str(item_id // 1000),
+                "items",
+                str(item_id),
+                "files",
+                f"file_{item.primary_file_id}_result.json",
+            )
+
+            file_content = None
+            stored_path = None
+            for candidate in [primary_path, item.ocr_result_json_path]:
+                if not candidate:
+                    continue
+                try:
+                    content = file_storage.read_file(candidate)
+                except Exception:
+                    content = None
+                if content:
+                    file_content = content
+                    stored_path = candidate
+                    break
 
             if not file_content:
                 raise HTTPException(status_code=404, detail="Primary JSON result not found or not yet processed")
@@ -5051,7 +4304,6 @@ def download_primary_file_csv(
 
         # Create temporary file for download
         import tempfile
-        import os
         filename = f"order_{order_id}_item_{item_id}_primary.csv"
         with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as temp_file:
             temp_file.write(file_content_with_bom)
@@ -5062,7 +4314,7 @@ def download_primary_file_csv(
             filename=filename,
             media_type="text/csv; charset=utf-8",
         )
-        response.headers["X-File-Source"] = "S3"
+        response.headers["X-File-Source"] = "S3" if storage_backend == "s3" else "local"
         response.headers["X-Result-Scope"] = "primary_file_only"
         response.headers["X-Result-Path"] = stored_path
         return response
@@ -5090,8 +4342,9 @@ def upload_attachment_files_to_order_item(
         if not order:
             raise HTTPException(status_code=404, detail="Order not found")
 
-        if order.status != OrderStatus.DRAFT:
-            raise HTTPException(status_code=400, detail="Can only upload files to orders in DRAFT status")
+        # Allow uploads for orders that are not currently processing OCR
+        if order.status == OrderStatus.PROCESSING:
+            raise HTTPException(status_code=400, detail="Cannot upload files while OCR processing is in progress")
 
         item = db.query(OcrOrderItem).filter(
             OcrOrderItem.item_id == item_id,
@@ -5246,13 +4499,13 @@ def delete_order_item_file(
 ):
     """Delete a specific file from an order item"""
     try:
-        # Verify order exists and is in DRAFT status
+        # Verify order exists and is in a modifiable status
         order = db.query(OcrOrder).filter(OcrOrder.order_id == order_id).first()
         if not order:
             raise HTTPException(status_code=404, detail="Order not found")
 
-        if order.status != OrderStatus.DRAFT:
-            raise HTTPException(status_code=400, detail="Can only delete files from orders in DRAFT status")
+        if order.status == OrderStatus.PROCESSING:
+            raise HTTPException(status_code=400, detail="Cannot delete files while OCR processing is in progress")
 
         # Verify item exists and belongs to the order
         item = db.query(OcrOrderItem).filter(
@@ -5551,6 +4804,11 @@ def preview_master_csv(path: str = Query(..., description="OneDrive path to mast
     Lightweight connectivity check used by the UI to help select join keys.
     """
     try:
+        # Validate master CSV path
+        path = path.strip()
+        if not (path.startswith(MASTER_CSV_ROOT + "/") or path == MASTER_CSV_ROOT):
+            raise HTTPException(status_code=400, detail=f"master_csv_path must start with '{MASTER_CSV_ROOT}'")
+
         processor = OrderProcessor()
         # Reuse internal helper to fetch DataFrame from OneDrive; raises on errors
         df = processor._get_master_csv_dataframe(path)  # pylint: disable=protected-access
@@ -5588,36 +4846,67 @@ def download_order_item_json(order_id: int, item_id: int, db: Session = Depends(
         if not item:
             raise HTTPException(status_code=404, detail="Order item not found")
 
-        # Use existing S3 download infrastructure
-        s3_manager = get_s3_manager()
-        if not s3_manager:
-            raise HTTPException(status_code=500, detail="S3 storage not available")
-
+        storage_backend = os.getenv("STORAGE_BACKEND", "").lower()
         file_content = None
 
-        # Prefer aggregated JSON (all files) if available for this item
-        try:
-            aggregated_key = f"results/orders/{item_id // 1000}/items/{item_id}/item_{item_id}_results.json"
-            aggregated_stored_path = f"{s3_manager.upload_prefix}{aggregated_key}"
-            file_content = s3_manager.download_file_by_stored_path(aggregated_stored_path)
-        except Exception as e:
-            logger.warning(f"Failed to load aggregated JSON for item {item_id}: {e}")
+        if storage_backend == "s3":
+            # Existing S3-based behaviour
+            s3_manager = get_s3_manager()
+            if not s3_manager:
+                raise HTTPException(status_code=500, detail="S3 storage not available")
 
-        # Fallback to legacy primary-only JSON if aggregated not found
-        if not file_content:
-            if not item.ocr_result_json_path:
-                raise HTTPException(status_code=404, detail="JSON result file not found for this item")
+            try:
+                aggregated_key = f"results/orders/{item_id // 1000}/items/{item_id}/item_{item_id}_results.json"
+                aggregated_stored_path = f"{s3_manager.upload_prefix}{aggregated_key}"
+                file_content = s3_manager.download_file_by_stored_path(aggregated_stored_path)
+            except Exception as e:
+                logger.warning(f"Failed to load aggregated JSON for item {item_id}: {e}")
 
-            file_content = s3_manager.download_file_by_stored_path(item.ocr_result_json_path)
+            # Fallback to legacy primary-only JSON if aggregated not found
             if not file_content:
-                raise HTTPException(status_code=404, detail=f"File not found in S3: {item.ocr_result_json_path}")
+                if not item.ocr_result_json_path:
+                    raise HTTPException(status_code=404, detail="JSON result file not found for this item")
+
+                file_content = s3_manager.download_file_by_stored_path(item.ocr_result_json_path)
+                if not file_content:
+                    raise HTTPException(status_code=404, detail=f"File not found in S3: {item.ocr_result_json_path}")
+        else:
+            # Local / unified storage: read from filesystem
+            file_storage = get_file_storage()
+            base_dir = os.getenv("LOCAL_RESULT_JSON_DIR") or os.path.join(
+                os.getenv("LOCAL_STORAGE_ROOT", "../storage"),
+                "results",
+                "json",
+            )
+            aggregated_path = os.path.join(
+                base_dir,
+                "orders",
+                str(item_id // 1000),
+                "items",
+                str(item_id),
+                f"item_{item_id}_results.json",
+            )
+
+            # Prefer aggregated JSON if present, else fall back to the stored path
+            for candidate in [aggregated_path, item.ocr_result_json_path]:
+                if not candidate:
+                    continue
+                try:
+                    content = file_storage.read_file(candidate)
+                except Exception:
+                    content = None
+                if content:
+                    file_content = content
+                    break
+
+            if not file_content:
+                raise HTTPException(status_code=404, detail="JSON result file not found for this item")
 
         # Generate filename for download (combined primary + attachments)
         filename = f"order_{order_id}_item_{item_id}_results.json"
 
         # Create temporary file to serve
         import tempfile
-        import os
         with tempfile.NamedTemporaryFile(delete=False, suffix=".json") as temp_file:
             temp_file.write(file_content)
             temp_file_path = temp_file.name
@@ -5629,7 +4918,7 @@ def download_order_item_json(order_id: int, item_id: int, db: Session = Depends(
             media_type="application/json",
         )
 
-        response.headers["X-File-Source"] = "S3"
+        response.headers["X-File-Source"] = "S3" if storage_backend == "s3" else "local"
         return response
 
     except HTTPException:
@@ -5659,29 +4948,62 @@ def download_order_item_csv(order_id: int, item_id: int, db: Session = Depends(g
         if not item:
             raise HTTPException(status_code=404, detail="Order item not found")
 
-        # Use existing S3 download infrastructure to get JSON
-        s3_manager = get_s3_manager()
-        if not s3_manager:
-            raise HTTPException(status_code=500, detail="S3 storage not available")
-
         json_content = None
 
-        # Prefer aggregated JSON (all files) if available for this item
-        try:
-            aggregated_key = f"results/orders/{item_id // 1000}/items/{item_id}/item_{item_id}_results.json"
-            aggregated_stored_path = f"{s3_manager.upload_prefix}{aggregated_key}"
-            json_content = s3_manager.download_file_by_stored_path(aggregated_stored_path)
-        except Exception as e:
-            logger.warning(f"Failed to load aggregated JSON for CSV of item {item_id}: {e}")
+        storage_backend = os.getenv("STORAGE_BACKEND", "").lower()
 
-        # Fallback to legacy primary-only JSON if aggregated not found
-        if not json_content:
-            if not item.ocr_result_json_path:
-                raise HTTPException(status_code=404, detail="JSON result file not found for this item")
+        if storage_backend == "s3":
+            # Use existing S3 download infrastructure to get JSON
+            s3_manager = get_s3_manager()
+            if not s3_manager:
+                raise HTTPException(status_code=500, detail="S3 storage not available")
 
-            json_content = s3_manager.download_file_by_stored_path(item.ocr_result_json_path)
+            # Prefer aggregated JSON (all files) if available for this item
+            try:
+                aggregated_key = f"results/orders/{item_id // 1000}/items/{item_id}/item_{item_id}_results.json"
+                aggregated_stored_path = f"{s3_manager.upload_prefix}{aggregated_key}"
+                json_content = s3_manager.download_file_by_stored_path(aggregated_stored_path)
+            except Exception as e:
+                logger.warning(f"Failed to load aggregated JSON for CSV of item {item_id}: {e}")
+
+            # Fallback to legacy primary-only JSON if aggregated not found
             if not json_content:
-                raise HTTPException(status_code=404, detail=f"JSON file not found in S3: {item.ocr_result_json_path}")
+                if not item.ocr_result_json_path:
+                    raise HTTPException(status_code=404, detail="JSON result file not found for this item")
+
+                json_content = s3_manager.download_file_by_stored_path(item.ocr_result_json_path)
+                if not json_content:
+                    raise HTTPException(status_code=404, detail=f"JSON file not found in S3: {item.ocr_result_json_path}")
+        else:
+            # Local / unified storage: read JSON from filesystem
+            file_storage = get_file_storage()
+            base_dir = os.getenv("LOCAL_RESULT_JSON_DIR") or os.path.join(
+                os.getenv("LOCAL_STORAGE_ROOT", "../storage"),
+                "results",
+                "json",
+            )
+            aggregated_path = os.path.join(
+                base_dir,
+                "orders",
+                str(item_id // 1000),
+                "items",
+                str(item_id),
+                f"item_{item_id}_results.json",
+            )
+
+            for candidate in [aggregated_path, item.ocr_result_json_path]:
+                if not candidate:
+                    continue
+                try:
+                    content = file_storage.read_file(candidate)
+                except Exception:
+                    content = None
+                if content:
+                    json_content = content
+                    break
+
+            if not json_content:
+                raise HTTPException(status_code=404, detail="JSON result file not found for this item")
 
         # Parse JSON content
         try:
@@ -5702,7 +5024,6 @@ def download_order_item_csv(order_id: int, item_id: int, db: Session = Depends(g
 
         # Create temporary file with UTF-8 BOM
         import tempfile
-        import os
         file_content_with_bom = b'\xef\xbb\xbf' + escaped_csv_content.encode('utf-8')
 
         with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as temp_file:
@@ -5755,14 +5076,21 @@ def get_primary_csv_headers(order_id: int, item_id: int, db: Session = Depends(g
             raise HTTPException(status_code=400, detail="Order item is not completed yet")
 
         # Always read from the PRIMARY JSON result to avoid polluted headers
-        s3_manager = get_s3_manager()
-        if not s3_manager:
-            raise HTTPException(status_code=500, detail="S3 storage not available")
-
         if not item.ocr_result_json_path:
             raise HTTPException(status_code=404, detail="Primary JSON result not found")
 
-        json_content = s3_manager.download_file_by_stored_path(item.ocr_result_json_path)
+        storage_backend = os.getenv("STORAGE_BACKEND", "").lower()
+
+        if storage_backend == "s3":
+            s3_manager = get_s3_manager()
+            if not s3_manager:
+                raise HTTPException(status_code=500, detail="S3 storage not available")
+
+            json_content = s3_manager.download_file_by_stored_path(item.ocr_result_json_path)
+        else:
+            file_storage = get_file_storage()
+            json_content = file_storage.read_file(item.ocr_result_json_path)
+
         if not json_content:
             raise HTTPException(status_code=404, detail="Primary JSON result not found")
 
@@ -5832,15 +5160,32 @@ def download_attachment_csv(order_id: int, item_id: int, file_id: int, db: Sessi
         if file_id == item.primary_file_id:
             raise HTTPException(status_code=400, detail="Use the item CSV download for primary file results. This endpoint is for attachments only.")
 
+        storage_backend = os.getenv("STORAGE_BACKEND", "").lower()
+
         # Build the stored path for attachment JSON
-        stored_path = f"upload/results/orders/{item_id // 1000}/items/{item_id}/files/file_{file_id}_result.json"
-
-        # Download JSON content from S3
-        s3_manager = get_s3_manager()
-        if not s3_manager:
-            raise HTTPException(status_code=500, detail="S3 storage not available")
-
-        file_content = s3_manager.download_file_by_stored_path(stored_path)
+        if storage_backend == "s3":
+            stored_path = f"upload/results/orders/{item_id // 1000}/items/{item_id}/files/file_{file_id}_result.json"
+            s3_manager = get_s3_manager()
+            if not s3_manager:
+                raise HTTPException(status_code=500, detail="S3 storage not available")
+            file_content = s3_manager.download_file_by_stored_path(stored_path)
+        else:
+            base_dir = os.getenv("LOCAL_RESULT_JSON_DIR") or os.path.join(
+                os.getenv("LOCAL_STORAGE_ROOT", "../storage"),
+                "results",
+                "json",
+            )
+            stored_path = os.path.join(
+                base_dir,
+                "orders",
+                str(item_id // 1000),
+                "items",
+                str(item_id),
+                "files",
+                f"file_{file_id}_result.json",
+            )
+            file_storage = get_file_storage()
+            file_content = file_storage.read_file(stored_path)
         if not file_content:
             raise HTTPException(status_code=404, detail="Attachment JSON result not found")
 
@@ -5873,7 +5218,7 @@ def download_attachment_csv(order_id: int, item_id: int, file_id: int, db: Sessi
             media_type="text/csv; charset=utf-8",
         )
 
-        response.headers["X-File-Source"] = "S3"
+        response.headers["X-File-Source"] = "S3" if storage_backend == "s3" else "local"
         return response
 
     except json.JSONDecodeError as e:
@@ -5921,11 +5266,18 @@ def merge_csv_by_join_key(
         if not item.ocr_result_json_path:
             raise HTTPException(status_code=404, detail="Primary JSON result not found")
 
-        s3_manager = get_s3_manager()
-        if not s3_manager:
-            raise HTTPException(status_code=500, detail="S3 storage not available")
+        storage_backend = os.getenv("STORAGE_BACKEND", "").lower()
 
-        primary_content = s3_manager.download_file_by_stored_path(item.ocr_result_json_path)
+        if storage_backend == "s3":
+            s3_manager = get_s3_manager()
+            if not s3_manager:
+                raise HTTPException(status_code=500, detail="S3 storage not available")
+
+            primary_content = s3_manager.download_file_by_stored_path(item.ocr_result_json_path)
+        else:
+            file_storage = get_file_storage()
+            primary_content = file_storage.read_file(item.ocr_result_json_path)
+
         if not primary_content:
             raise HTTPException(status_code=404, detail="Primary JSON result not found")
 
@@ -6011,7 +5363,24 @@ def merge_csv_by_join_key(
         for idx, file_link in enumerate(attachments):
             try:
                 attachment_path = f"upload/results/orders/{item_id // 1000}/items/{item_id}/files/file_{file_link.file_id}_result.json"
-                attachment_content = s3_manager.download_file_by_stored_path(attachment_path)
+                if storage_backend == "s3":
+                    attachment_content = s3_manager.download_file_by_stored_path(attachment_path)
+                else:
+                    base_dir = os.getenv("LOCAL_RESULT_JSON_DIR") or os.path.join(
+                        os.getenv("LOCAL_STORAGE_ROOT", "../storage"),
+                        "results",
+                        "json",
+                    )
+                    local_attachment_path = os.path.join(
+                        base_dir,
+                        "orders",
+                        str(item_id // 1000),
+                        "items",
+                        str(item_id),
+                        "files",
+                        f"file_{file_link.file_id}_result.json",
+                    )
+                    attachment_content = file_storage.read_file(local_attachment_path)
                 if attachment_content:
                     attachment_data = json.loads(attachment_content.decode('utf-8'))
                     join_config = _resolve_attachment_config(str(file_link.file_id), idx)
@@ -6646,230 +6015,32 @@ def download_order_mapped_excel(order_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=500, detail=f"Failed to download mapped Excel file: {str(e)}")
 
 
-# ========================================
-# 映射历史和版本管理 API 端点 (Phase 3.1)
-# ========================================
-
-@app.get("/orders/{order_id}/mapping-history")
-def get_mapping_history(
-    order_id: int,
-    item_id: Optional[int] = Query(None, description="Item ID for item-level history, omit for order-level"),
-    limit: int = Query(50, ge=1, le=200, description="Maximum number of records to return"),
-    db: Session = Depends(get_db)
-):
-    """获取映射历史记录"""
-    try:
-        from utils.mapping_history_manager import MappingHistoryManager
-
-        # 验证order是否存在
-        order = db.query(OcrOrder).filter(OcrOrder.order_id == order_id).first()
-        if not order:
-            raise HTTPException(status_code=404, detail="Order not found")
-
-        # 如果指定了item_id，验证item是否存在且属于该order
-        if item_id is not None:
-            item = db.query(OcrOrderItem).filter(
-                OcrOrderItem.item_id == item_id,
-                OcrOrderItem.order_id == order_id
-            ).first()
-            if not item:
-                raise HTTPException(status_code=404, detail="Order item not found")
-
-        history_manager = MappingHistoryManager(db)
-        history_records = history_manager.get_mapping_history(order_id, item_id, limit)
-
-        return {
-            "order_id": order_id,
-            "item_id": item_id,
-            "total_records": len(history_records),
-            "history": history_records
-        }
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Failed to get mapping history for order {order_id}: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to get mapping history: {str(e)}")
-
-
-@app.get("/orders/{order_id}/mapping-history/{version}")
-def get_mapping_version(
-    order_id: int,
-    version: int,
-    item_id: Optional[int] = Query(None, description="Item ID for item-level history, omit for order-level"),
-    db: Session = Depends(get_db)
-):
-    """获取特定版本的映射配置"""
-    try:
-        from utils.mapping_history_manager import MappingHistoryManager
-
-        # 验证order是否存在
-        order = db.query(OcrOrder).filter(OcrOrder.order_id == order_id).first()
-        if not order:
-            raise HTTPException(status_code=404, detail="Order not found")
-
-        history_manager = MappingHistoryManager(db)
-        version_data = history_manager.get_mapping_version(order_id, version, item_id)
-
-        if not version_data:
-            raise HTTPException(status_code=404, detail=f"Version {version} not found")
-
-        return version_data
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Failed to get mapping version {version} for order {order_id}: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to get mapping version: {str(e)}")
-
-
-@app.get("/orders/{order_id}/mapping-diff/{version1}/{version2}")
-def compare_mapping_versions(
-    order_id: int,
-    version1: int,
-    version2: int,
-    item_id: Optional[int] = Query(None, description="Item ID for item-level comparison, omit for order-level"),
-    db: Session = Depends(get_db)
-):
-    """比较两个版本的映射配置差异"""
-    try:
-        from utils.mapping_history_manager import MappingHistoryManager
-
-        # 验证order是否存在
-        order = db.query(OcrOrder).filter(OcrOrder.order_id == order_id).first()
-        if not order:
-            raise HTTPException(status_code=404, detail="Order not found")
-
-        history_manager = MappingHistoryManager(db)
-        diff_result = history_manager.compare_versions(order_id, version1, version2, item_id)
-
-        return diff_result
-
-    except HTTPException:
-        raise
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except Exception as e:
-        logger.error(f"Failed to compare versions {version1} and {version2} for order {order_id}: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to compare versions: {str(e)}")
-
-
-class MappingRollbackRequest(BaseModel):
-    target_version: int
-    rollback_reason: Optional[str] = None
-    created_by: Optional[str] = None
-
-
-@app.post("/orders/{order_id}/mapping-rollback")
-def rollback_mapping_to_version(
-    order_id: int,
-    request: MappingRollbackRequest,
-    item_id: Optional[int] = Query(None, description="Item ID for item-level rollback, omit for order-level"),
-    db: Session = Depends(get_db)
-):
-    """回滚映射配置到指定版本"""
-    try:
-        from utils.mapping_history_manager import MappingHistoryManager
-
-        # 验证order是否存在
-        order = db.query(OcrOrder).filter(OcrOrder.order_id == order_id).first()
-        if not order:
-            raise HTTPException(status_code=404, detail="Order not found")
-
-        # 验证order状态 - 只允许在特定状态下回滚
-        if order.status not in [OrderStatus.DRAFT, OrderStatus.OCR_COMPLETED, OrderStatus.COMPLETED, OrderStatus.MAPPING]:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Cannot rollback mapping in current order status: {order.status}"
-            )
-
-        history_manager = MappingHistoryManager(db)
-        success = history_manager.rollback_to_version(
-            order_id=order_id,
-            target_version=request.target_version,
-            item_id=item_id,
-            created_by=request.created_by,
-            rollback_reason=request.rollback_reason
-        )
-
-        if success:
-            # 刷新order数据
-            db.refresh(order)
-            return {
-                "success": True,
-                "message": f"Successfully rolled back to version {request.target_version}",
-                "current_mapping_keys": order.mapping_keys
-            }
-        else:
-            raise HTTPException(status_code=500, detail="Rollback operation failed")
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Failed to rollback order {order_id} to version {request.target_version}: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to rollback mapping: {str(e)}")
-
-
 # =============================================================================
 # Order Management APIs (Lock/Unlock, Restart OCR/Mapping)
 # =============================================================================
 
 @app.post("/orders/{order_id}/lock")
 def lock_order(order_id: int, db: Session = Depends(get_db)):
-    """Lock an order to prevent further modifications"""
-    try:
-        order = db.query(OcrOrder).filter(OcrOrder.order_id == order_id).first()
-        if not order:
-            raise HTTPException(status_code=404, detail="Order not found")
+    """Lock an order to prevent further modifications (DEPRECATED).
 
-        if order.status == OrderStatus.LOCKED:
-            return {"message": "Order is already locked", "status": "LOCKED"}
-
-        order.status = OrderStatus.LOCKED
-        order.updated_at = datetime.utcnow()
-        db.commit()
-
-        logger.info(f"Order {order_id} locked successfully")
-        return {"message": "Order locked successfully", "status": "LOCKED"}
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Failed to lock order {order_id}: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to lock order: {str(e)}")
+    This endpoint is deprecated and no longer supported. Order locking functionality has been removed.
+    """
+    raise HTTPException(
+        status_code=410,
+        detail="Order lock functionality has been removed. Orders can now be modified at any time except during processing."
+    )
 
 
 @app.post("/orders/{order_id}/unlock")
 def unlock_order(order_id: int, db: Session = Depends(get_db)):
-    """Unlock an order to allow modifications"""
-    try:
-        order = db.query(OcrOrder).filter(OcrOrder.order_id == order_id).first()
-        if not order:
-            raise HTTPException(status_code=404, detail="Order not found")
+    """Unlock an order to allow modifications (DEPRECATED).
 
-        if order.status != OrderStatus.LOCKED:
-            return {"message": "Order is not locked", "status": order.status.value}
-
-        # Determine appropriate status based on order completion
-        if order.completed_items == order.total_items and order.total_items > 0:
-            new_status = OrderStatus.COMPLETED
-        elif order.completed_items > 0:
-            new_status = OrderStatus.OCR_COMPLETED
-        else:
-            new_status = OrderStatus.DRAFT
-
-        order.status = new_status
-        order.updated_at = datetime.utcnow()
-        db.commit()
-
-        logger.info(f"Order {order_id} unlocked successfully, status set to {new_status.value}")
-        return {"message": "Order unlocked successfully", "status": new_status.value}
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Failed to unlock order {order_id}: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to unlock order: {str(e)}")
+    This endpoint is deprecated and no longer supported. Order locking functionality has been removed.
+    """
+    raise HTTPException(
+        status_code=410,
+        detail="Order lock functionality has been removed. Orders can now be modified at any time except during processing."
+    )
 
 
 @app.post("/orders/{order_id}/restart-ocr")
@@ -6879,9 +6050,6 @@ def restart_ocr_processing(order_id: int, db: Session = Depends(get_db)):
         order = db.query(OcrOrder).filter(OcrOrder.order_id == order_id).first()
         if not order:
             raise HTTPException(status_code=404, detail="Order not found")
-
-        if order.status == OrderStatus.LOCKED:
-            raise HTTPException(status_code=400, detail="Cannot restart OCR for locked order")
 
         # Reset order status and counters
         order.status = OrderStatus.PROCESSING
@@ -6937,9 +6105,6 @@ def restart_mapping_processing(order_id: int, db: Session = Depends(get_db)):
         if not order:
             raise HTTPException(status_code=404, detail="Order not found")
 
-        if order.status == OrderStatus.LOCKED:
-            raise HTTPException(status_code=400, detail="Cannot restart mapping for locked order")
-
         if order.status not in [OrderStatus.OCR_COMPLETED, OrderStatus.MAPPING, OrderStatus.COMPLETED, OrderStatus.FAILED]:
             raise HTTPException(
                 status_code=400,
@@ -6957,10 +6122,9 @@ def restart_mapping_processing(order_id: int, db: Session = Depends(get_db)):
         # Enhanced logging: Log order details before processing
         logger.info(f"🚀 Order {order_id} mapping processing restarted - Enhanced logging enabled")
         logger.info(
-            "   Order details: name='%s', status='%s', primary_doc_type_id=%s",
+            "   Order details: name='%s', status='%s'",
             order.order_name,
             order.status,
-            order.primary_doc_type_id,
         )
         logger.info("   Final reports before restart: %s", order.final_report_paths)
 
@@ -6969,12 +6133,6 @@ def restart_mapping_processing(order_id: int, db: Session = Depends(get_db)):
             OcrOrderItem.mapping_config.isnot(None)
         ).count()
         logger.info("   Items with stored mapping config: %s", item_config_count)
-
-        # Log template details if available
-        if order.primary_doc_type_id:
-            template_path = order.primary_doc_type.template_json_path if order.primary_doc_type else None
-            logger.info(f"   Template path: {template_path}")
-            logger.info(f"   Document type: {order.primary_doc_type.type_name if order.primary_doc_type else 'Unknown'}")
 
         # Trigger mapping processing
         from utils.order_processor import OrderProcessor
@@ -7010,216 +6168,711 @@ def restart_mapping_processing(order_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=500, detail=f"Failed to restart mapping: {str(e)}")
 
 
-@app.get("/orders/{order_id}/mapping-statistics")
-def get_mapping_statistics(
-    order_id: int,
-    item_id: Optional[int] = Query(None, description="Item ID for item-level statistics, omit for order-level"),
-    db: Session = Depends(get_db)
+# =============================================================================
+# Unified OCR Config API (CompanyDocTypeConfig)
+# =============================================================================
+
+
+def _serialize_company_doc_type_config(row: CompanyDocTypeConfig) -> Dict[str, Any]:
+    item_type_value = row.item_type
+    try:
+        item_type_enum = MappingItemType(item_type_value)
+    except Exception:
+        item_type_enum = MappingItemType.SINGLE_SOURCE
+
+    company = row.company if hasattr(row, "company") else None
+    doc_type = row.document_type if hasattr(row, "document_type") else None
+
+    return {
+        "config_id": row.config_id,
+        "company_id": row.company_id,
+        "doc_type_id": row.doc_type_id,
+        "item_type": item_type_enum,
+        "company_name": getattr(company, "company_name", None),
+        "company_code": getattr(company, "company_code", None),
+        "doc_type_name": getattr(doc_type, "type_name", None),
+        "doc_type_code": getattr(doc_type, "type_code", None),
+        "prompt_path": row.prompt_path,
+        "schema_path": row.schema_path,
+        "storage_type": row.storage_type,
+        "storage_metadata": row.storage_metadata,
+        "master_csv_path": row.master_csv_path,
+        "output_template_path": row.output_template_path,
+        "single_source_config": row.single_source_config,
+        "multi_source_step1_config": row.multi_source_step1_config,
+        "multi_source_step2_config": row.multi_source_step2_config,
+        "internal_join_key": row.internal_join_key,
+        "attachment_sources": row.attachment_sources,
+        "active": row.active,
+        "priority": row.priority,
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+        "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+    }
+
+
+@app.get("/company-doc-type-configs")
+@app.get("/api/company-doc-type-configs")
+def list_company_doc_type_configs(
+    company_id: Optional[int] = None,
+    doc_type_id: Optional[int] = None,
+    item_type: Optional[MappingItemType] = None,
+    active: Optional[bool] = None,
+    search: Optional[str] = Query(None, max_length=100),
+    limit: Optional[int] = Query(None, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
 ):
-    """获取映射历史统计信息"""
-    try:
-        from utils.mapping_history_manager import MappingHistoryManager
+    """List unified OCR configs (company_doc_type_configs) with optional filters and pagination."""
+    query = db.query(CompanyDocTypeConfig)
 
-        # 验证order是否存在
-        order = db.query(OcrOrder).filter(OcrOrder.order_id == order_id).first()
-        if not order:
-            raise HTTPException(status_code=404, detail="Order not found")
+    # Apply filters
+    if company_id is not None:
+        query = query.filter(CompanyDocTypeConfig.company_id == company_id)
+    if doc_type_id is not None:
+        query = query.filter(CompanyDocTypeConfig.doc_type_id == doc_type_id)
+    if item_type is not None:
+        query = query.filter(CompanyDocTypeConfig.item_type == item_type.value)
+    if active is not None:
+        query = query.filter(CompanyDocTypeConfig.active.is_(active))
 
-        history_manager = MappingHistoryManager(db)
-        statistics = history_manager.get_mapping_statistics(order_id, item_id)
+    # Apply search filter (company name and document type name only)
+    if search:
+        pattern = f"%{search.strip()}%"
+        query = (
+            query
+            .join(Company, Company.company_id == CompanyDocTypeConfig.company_id)
+            .join(DocumentType, DocumentType.doc_type_id == CompanyDocTypeConfig.doc_type_id)
+            .filter(or_(
+                Company.company_name.ilike(pattern),
+                DocumentType.type_name.ilike(pattern),
+            ))
+        )
 
-        return {
-            "order_id": order_id,
-            "item_id": item_id,
-            "statistics": statistics
+    # Get total count before pagination
+    total_count = query.count()
+
+    # Apply ordering
+    rows = query.order_by(
+        CompanyDocTypeConfig.company_id.asc(),
+        CompanyDocTypeConfig.doc_type_id.asc(),
+        CompanyDocTypeConfig.item_type.asc(),
+        CompanyDocTypeConfig.priority.asc(),
+        CompanyDocTypeConfig.config_id.asc(),
+    )
+
+    # Apply pagination if limit is provided
+    if limit is not None:
+        rows = rows.offset(offset).limit(limit)
+
+    rows = rows.all()
+
+    # If no pagination requested, return plain list (backward compatibility)
+    if limit is None:
+        return [_serialize_company_doc_type_config(r) for r in rows]
+
+    # Return paginated response
+    total_pages = (total_count + limit - 1) // limit
+    return {
+        "data": [_serialize_company_doc_type_config(r) for r in rows],
+        "pagination": {
+            "total_count": total_count,
+            "total_pages": total_pages,
+            "current_page": (offset // limit) + 1,
+            "page_size": limit,
+            "has_next": offset + limit < total_count,
+            "has_prev": offset > 0
         }
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Failed to get mapping statistics for order {order_id}: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to get mapping statistics: {str(e)}")
+    }
 
 
-# 映射键更新时自动创建历史记录的辅助函数
-def create_mapping_history_on_update(
-    db: Session,
-    order_id: int,
-    new_mapping_keys: List[str],
-    operation_type: str = "UPDATE",
-    item_id: Optional[int] = None,
-    operation_reason: Optional[str] = None,
-    created_by: Optional[str] = None
+@app.post("/company-doc-type-configs", response_model=CompanyDocTypeConfigResponse)
+@app.post("/api/company-doc-type-configs", response_model=CompanyDocTypeConfigResponse)
+def create_company_doc_type_config(
+    payload: CompanyDocTypeConfigPayload,
+    db: Session = Depends(get_db),
 ):
-    """在映射键更新时自动创建历史记录"""
+    """Create a new unified OCR config entry."""
     try:
-        from utils.mapping_history_manager import MappingHistoryManager, MappingOperation
+        item_type_enum = OrderItemType(payload.item_type.value)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
-        history_manager = MappingHistoryManager(db)
-
-        # 将字符串转换为MappingOperation枚举
-        if operation_type == "UPDATE":
-            op_type = MappingOperation.UPDATE
-        elif operation_type == "CREATE":
-            op_type = MappingOperation.CREATE
-        elif operation_type == "APPLY_RECOMMENDATION":
-            op_type = MappingOperation.APPLY_RECOMMENDATION
-        else:
-            op_type = MappingOperation.UPDATE
-
-        history_manager.create_mapping_version(
-            order_id=order_id,
-            mapping_keys=new_mapping_keys,
-            operation_type=op_type,
-            item_id=item_id,
-            operation_reason=operation_reason,
-            created_by=created_by
+    existing = (
+        db.query(CompanyDocTypeConfig)
+        .filter(
+            CompanyDocTypeConfig.company_id == payload.company_id,
+            CompanyDocTypeConfig.doc_type_id == payload.doc_type_id,
+            CompanyDocTypeConfig.item_type == item_type_enum.value,
+        )
+        .first()
+    )
+    if existing:
+        raise HTTPException(
+            status_code=400,
+            detail="Unified OCR config already exists for this company/document/item_type combination",
         )
 
-        logger.info(f"Created mapping history record for order {order_id}, operation: {operation_type}")
+    storage_type = payload.storage_type or StorageType.local
 
-    except Exception as e:
-        logger.error(f"Failed to create mapping history record: {str(e)}")
-        # 不抛出异常，避免影响主要的映射更新操作
+    row = CompanyDocTypeConfig(
+        company_id=payload.company_id,
+        doc_type_id=payload.doc_type_id,
+        item_type=item_type_enum.value,
+        prompt_path=payload.prompt_path,
+        schema_path=payload.schema_path,
+        storage_type=storage_type,
+        storage_metadata=payload.storage_metadata,
+        master_csv_path=payload.master_csv_path,
+        output_template_path=payload.output_template_path,
+        single_source_config=payload.single_source_config,
+        multi_source_step1_config=payload.multi_source_step1_config,
+        multi_source_step2_config=payload.multi_source_step2_config,
+        internal_join_key=payload.internal_join_key,
+        attachment_sources=payload.attachment_sources,
+        active=payload.active,
+        priority=payload.priority,
+    )
 
+    db.add(row)
+    db.commit()
+    db.refresh(row)
 
-# =======================
-# 批量映射管理 API 端点
-# =======================
-
-class BulkMappingPreviewRequest(BaseModel):
-    target_orders: Optional[List[int]] = None
-    new_mapping_keys: Optional[List[str]] = None
-    filter_criteria: Optional[dict] = None
-    operation_type: str = "update"
-
-
-class BulkMappingUpdateRequest(BaseModel):
-    target_orders: Optional[List[int]] = None
-    new_mapping_keys: Optional[List[str]] = None
-    filter_criteria: Optional[dict] = None
-    operation_type: str = "update"
-    operation_reason: Optional[str] = None
-    created_by: Optional[str] = None
-    confirm_changes: bool = False
-
-
-class BulkRollbackRequest(BaseModel):
-    target_orders: List[int]
-    target_version: Optional[int] = None
-    rollback_to_date: Optional[str] = None
-    created_by: Optional[str] = None
-    rollback_reason: Optional[str] = None
-    confirm_rollback: bool = False
+    return _serialize_company_doc_type_config(row)
 
 
-@app.post("/mapping/bulk/preview")
-async def preview_bulk_mapping_update(request: BulkMappingPreviewRequest, db: Session = Depends(get_db)):
-    """预览批量映射更新"""
-    try:
-        from utils.bulk_mapping_manager import BulkMappingManager
-
-        bulk_manager = BulkMappingManager(db)
-
-        preview_result = bulk_manager.preview_bulk_mapping_update(
-            target_orders=request.target_orders,
-            new_mapping_keys=request.new_mapping_keys,
-            filter_criteria=request.filter_criteria,
-            operation_type=request.operation_type
-        )
-
-        return {
-            "success": True,
-            "preview": {
-                "affected_orders": preview_result.affected_orders,
-                "summary": preview_result.summary,
-                "warnings": preview_result.warnings,
-                "errors": preview_result.errors
-            }
-        }
-
-    except Exception as e:
-        logger.error(f"Failed to preview bulk mapping update: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to preview bulk mapping update: {str(e)}")
+@app.get("/company-doc-type-configs/{config_id}", response_model=CompanyDocTypeConfigResponse)
+@app.get("/api/company-doc-type-configs/{config_id}", response_model=CompanyDocTypeConfigResponse)
+def get_company_doc_type_config(config_id: int, db: Session = Depends(get_db)):
+    """Get a single unified OCR config by ID."""
+    row = db.query(CompanyDocTypeConfig).filter(CompanyDocTypeConfig.config_id == config_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Unified OCR config not found")
+    return _serialize_company_doc_type_config(row)
 
 
-@app.post("/mapping/bulk/execute")
-async def execute_bulk_mapping_update(request: BulkMappingUpdateRequest, db: Session = Depends(get_db)):
-    """执行批量映射更新"""
-    try:
-        from utils.bulk_mapping_manager import BulkMappingManager
-
-        bulk_manager = BulkMappingManager(db)
-
-        result = bulk_manager.execute_bulk_mapping_update(
-            target_orders=request.target_orders,
-            new_mapping_keys=request.new_mapping_keys,
-            filter_criteria=request.filter_criteria,
-            operation_type=request.operation_type,
-            operation_reason=request.operation_reason,
-            created_by=request.created_by,
-            confirm_changes=request.confirm_changes
-        )
-
-        return result
-
-    except Exception as e:
-        logger.error(f"Failed to execute bulk mapping update: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to execute bulk mapping update: {str(e)}")
-
-
-@app.post("/mapping/bulk/rollback")
-async def bulk_rollback_orders(request: BulkRollbackRequest, db: Session = Depends(get_db)):
-    """批量回滚订单映射"""
-    try:
-        from utils.bulk_mapping_manager import BulkMappingManager
-
-        bulk_manager = BulkMappingManager(db)
-
-        result = bulk_manager.bulk_rollback_orders(
-            target_orders=request.target_orders,
-            target_version=request.target_version,
-            rollback_to_date=request.rollback_to_date,
-            created_by=request.created_by,
-            rollback_reason=request.rollback_reason,
-            confirm_rollback=request.confirm_rollback
-        )
-
-        return result
-
-    except Exception as e:
-        logger.error(f"Failed to execute bulk rollback: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to execute bulk rollback: {str(e)}")
-
-
-@app.get("/mapping/bulk/candidates")
-async def get_bulk_operation_candidates(
-    operation_type: str = Query("all", description="操作类型"),
-    include_completed_only: bool = Query(True, description="只包含已完成的订单"),
-    min_items: int = Query(1, description="最小项目数量"),
-    db: Session = Depends(get_db)
+@app.put("/company-doc-type-configs/{config_id}", response_model=CompanyDocTypeConfigResponse)
+@app.put("/api/company-doc-type-configs/{config_id}", response_model=CompanyDocTypeConfigResponse)
+def update_company_doc_type_config(
+    config_id: int,
+    payload: CompanyDocTypeConfigUpdatePayload,
+    db: Session = Depends(get_db),
 ):
-    """获取适合批量操作的订单候选列表"""
+    """Update fields of a unified OCR config."""
+    row = db.query(CompanyDocTypeConfig).filter(CompanyDocTypeConfig.config_id == config_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Unified OCR config not found")
+
+    update_data = payload.model_dump(exclude_unset=True)
+
+    for field, value in update_data.items():
+        setattr(row, field, value)
+
+    row.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(row)
+
+    return _serialize_company_doc_type_config(row)
+
+
+@app.delete("/company-doc-type-configs/{config_id}", response_model=dict)
+@app.delete("/api/company-doc-type-configs/{config_id}", response_model=dict)
+def delete_company_doc_type_config(config_id: int, db: Session = Depends(get_db)):
+    """Delete a unified OCR config entry."""
+    row = db.query(CompanyDocTypeConfig).filter(CompanyDocTypeConfig.config_id == config_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Unified OCR config not found")
+
+    db.delete(row)
+    db.commit()
+
+    return {"message": "Unified OCR config deleted successfully"}
+
+
+ConfigFieldDescriptor = Tuple[str, Literal["prompts", "schemas", "master_csv", "output_templates"]]
+_CONFIG_FILE_FIELD_MAP: Dict[ConfigFileKind, ConfigFieldDescriptor] = {
+    ConfigFileKind.prompt: ("prompt_path", "prompts"),
+    ConfigFileKind.schema: ("schema_path", "schemas"),
+    ConfigFileKind.master_csv: ("master_csv_path", "master_csv"),
+    ConfigFileKind.output_template: ("output_template_path", "output_templates"),
+}
+
+_config_local_storage: Optional[LocalFileStorage] = None
+
+
+def _get_config_record(db: Session, config_id: int) -> CompanyDocTypeConfig:
+    record = (
+        db.query(CompanyDocTypeConfig)
+        .filter(CompanyDocTypeConfig.config_id == config_id)
+        .first()
+    )
+    if not record:
+        raise HTTPException(status_code=404, detail="Unified OCR config not found")
+    return record
+
+
+def _get_local_config_storage() -> LocalFileStorage:
+    global _config_local_storage
+    if _config_local_storage is None:
+        try:
+            _config_local_storage = LocalFileStorage()
+        except ValueError as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return _config_local_storage
+
+
+def _safe_filename(candidate: Optional[str], *, fallback: str) -> str:
+    base = (candidate or "").strip() or fallback
+    sanitized = re.sub(r"[^A-Za-z0-9._-]+", "_", base)
+    sanitized = sanitized.strip("._") or fallback
+    return sanitized[:200]
+
+
+def _build_config_storage_key(
+    config: CompanyDocTypeConfig,
+    slug: str,
+    filename: str,
+) -> str:
+    return f"company-configs/{config.company_id}/{config.doc_type_id}/{config.config_id}/{slug}/{filename}"
+
+
+def _resolve_config_storage_type(config: CompanyDocTypeConfig) -> StorageType:
+    stored = getattr(config, "storage_type", StorageType.local)
+    if isinstance(stored, StorageType):
+        return stored
     try:
-        from utils.bulk_mapping_manager import BulkMappingManager
+        return StorageType(stored)
+    except Exception:
+        return StorageType.local
 
-        bulk_manager = BulkMappingManager(db)
 
-        candidates = bulk_manager.get_bulk_operation_candidates(
-            operation_type=operation_type,
-            include_completed_only=include_completed_only,
-            min_items=min_items
+def _store_config_file(
+    config: CompanyDocTypeConfig,
+    kind: ConfigFileKind,
+    filename: Optional[str],
+    data: bytes,
+    content_type: Optional[str],
+) -> Tuple[str, StorageType]:
+    field_name, slug = _CONFIG_FILE_FIELD_MAP[kind]
+    safe_name = _safe_filename(filename, fallback=f"{kind.value}_file")
+    relative_key = _build_config_storage_key(config, slug, safe_name)
+    storage_type = _resolve_config_storage_type(config)
+
+    if storage_type == StorageType.s3:
+        s3_manager = get_s3_manager()
+        if not s3_manager:
+            raise HTTPException(status_code=500, detail="S3 storage backend is not configured")
+        upload_ok = s3_manager.upload_file(
+            data,
+            relative_key,
+            content_type=content_type or "application/octet-stream",
         )
+        if not upload_ok:
+            raise HTTPException(status_code=500, detail="Failed to upload config file to S3")
+        stored_path = f"s3://{s3_manager.bucket_name}/{s3_manager.upload_prefix}{relative_key}"
+    else:
+        storage = _get_local_config_storage()
+        stored_path = storage.save_bytes(relative_key, data)
 
-        return {
-            "success": True,
-            "total_candidates": len(candidates),
-            "candidates": candidates
-        }
+    setattr(config, field_name, stored_path)
+    config.updated_at = datetime.utcnow()
+    return stored_path, storage_type
 
-    except Exception as e:
-        logger.error(f"Failed to get bulk operation candidates: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to get bulk operation candidates: {str(e)}")
+
+def _parse_s3_uri(uri: str) -> Tuple[str, str]:
+    payload = uri[5:]
+    parts = payload.split("/", 1)
+    if len(parts) != 2:
+        raise ValueError("Invalid S3 URI")
+    return parts[0], parts[1]
+
+
+def _config_file_exists_info(stored_path: Optional[str]) -> Tuple[bool, Optional[int], Optional[str]]:
+    if not stored_path:
+        return False, None, None
+
+    if stored_path.startswith("s3://"):
+        s3_manager = get_s3_manager()
+        if not s3_manager:
+            return False, None, None
+        try:
+            bucket, key = _parse_s3_uri(stored_path)
+        except ValueError:
+            return False, None, None
+
+        target_bucket = bucket or s3_manager.bucket_name
+        try:
+            response = s3_manager.s3_client.head_object(Bucket=target_bucket, Key=key)
+            size = response.get("ContentLength")
+            last_modified = response.get("LastModified")
+            last_modified_str = last_modified.isoformat() if last_modified else None
+            return True, size, last_modified_str
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") == "404":
+                return False, None, None
+            logger.warning("⚠️ Failed to inspect S3 config file %s: %s", stored_path, exc)
+            return False, None, None
+
+    try:
+        if os.path.exists(stored_path):
+            size = os.path.getsize(stored_path)
+            modified_ts = datetime.fromtimestamp(os.path.getmtime(stored_path), tz=timezone.utc)
+            return True, size, modified_ts.isoformat()
+    except Exception as exc:
+        logger.warning("⚠️ Failed to inspect local config file %s: %s", stored_path, exc)
+
+    return False, None, None
+
+
+def _build_config_file_info(
+    config: CompanyDocTypeConfig,
+    kind: ConfigFileKind,
+) -> ConfigFileInfo:
+    field_name, _ = _CONFIG_FILE_FIELD_MAP[kind]
+    stored_path = getattr(config, field_name, None)
+    exists, size, last_modified = _config_file_exists_info(stored_path)
+    storage_type = _resolve_config_storage_type(config)
+    return ConfigFileInfo(
+        config_id=config.config_id,
+        kind=kind,
+        field_name=field_name,
+        stored_path=stored_path,
+        storage_type=storage_type,
+        exists=exists,
+        size=size,
+        last_modified=last_modified,
+    )
+
+
+def _onedrive_enabled() -> bool:
+    return os.getenv("ONEDRIVE_SYNC_ENABLED", "false").lower() == "true"
+
+
+def _get_onedrive_client_or_error() -> OneDriveClient:
+    client = build_client_from_env()
+    if not client:
+        raise HTTPException(status_code=503, detail="OneDrive credentials are not configured")
+    if not client.connect():
+        raise HTTPException(status_code=502, detail="Failed to connect to OneDrive")
+    return client
+
+
+def _list_onedrive_directory(path: str, limit: int) -> OneDriveListingResponse:
+    normalized = normalise_onedrive_path(path or "")
+    client = _get_onedrive_client_or_error()
+    try:
+        folder = client.get_folder(normalized)
+        if not folder:
+            raise HTTPException(status_code=404, detail="OneDrive folder not found")
+
+        entries: List[OneDriveEntry] = []
+        count = 0
+        for item in folder.get_items():
+            entry_type: Literal["file", "folder"] = "folder" if getattr(item, "is_folder", False) else "file"
+            entry_name = getattr(item, "name", "") or ""
+            entry_path = join_onedrive_path(normalized, entry_name) if normalized else entry_name
+            entry_size = getattr(item, "size", None)
+            modified = getattr(item, "modified", None)
+            entries.append(
+                OneDriveEntry(
+                    name=entry_name,
+                    path=entry_path,
+                    type=entry_type,
+                    size=int(entry_size) if entry_size is not None else None,
+                    last_modified=modified.isoformat() if hasattr(modified, "isoformat") else None,
+                )
+            )
+            count += 1
+            if count >= limit:
+                break
+
+        parent_path = None
+        if normalized:
+            parent_parts = normalized.rstrip("/").split("/")[:-1]
+            parent_path = "/".join(parent_parts) if parent_parts else None
+
+        return OneDriveListingResponse(
+            path=normalized or "/",
+            parent_path=parent_path,
+            entries=entries,
+        )
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass
+
+
+@app.get(
+    "/company-doc-type-configs/{config_id}/config-files",
+    response_model=List[ConfigFileInfo],
+)
+@app.get(
+    "/api/company-doc-type-configs/{config_id}/config-files",
+    response_model=List[ConfigFileInfo],
+)
+def list_config_files(config_id: int, db: Session = Depends(get_db)):
+    """Return metadata for all config-managed files."""
+    config = _get_config_record(db, config_id)
+    return [_build_config_file_info(config, kind) for kind in ConfigFileKind]
+
+
+@app.get(
+    "/company-doc-type-configs/{config_id}/config-files/download",
+)
+@app.get(
+    "/api/company-doc-type-configs/{config_id}/config-files/download",
+)
+def download_config_file(
+    config_id: int,
+    kind: ConfigFileKind = Query(..., description="Target config file kind to download"),
+    db: Session = Depends(get_db),
+):
+    """Download a config-managed file or return parsed JSON for schemas."""
+    config = _get_config_record(db, config_id)
+    field_name, _ = _CONFIG_FILE_FIELD_MAP[kind]
+    stored_path = getattr(config, field_name, None)
+
+    if not stored_path:
+        raise HTTPException(status_code=404, detail="Config file not found for this OCR config")
+
+    file_bytes: Optional[bytes] = None
+
+    if stored_path.startswith("s3://"):
+        s3_manager = get_s3_manager()
+        if not s3_manager:
+            raise HTTPException(status_code=500, detail="S3 storage backend is not configured")
+        try:
+            file_bytes = s3_manager.download_file_by_stored_path(stored_path)
+        except Exception as exc:
+            logger.error("Failed to download config file %s from S3: %s", stored_path, exc)
+            raise HTTPException(status_code=500, detail="Failed to download config file from storage")
+    else:
+        try:
+            with open(stored_path, "rb") as fh:
+                file_bytes = fh.read()
+        except FileNotFoundError:
+            raise HTTPException(status_code=404, detail="Config file not found on storage")
+        except Exception as exc:
+            logger.error("Failed to read config file %s: %s", stored_path, exc)
+            raise HTTPException(status_code=500, detail="Failed to download config file from storage")
+
+    if not file_bytes:
+        raise HTTPException(status_code=404, detail="Config file is empty or missing")
+
+    filename = os.path.basename(stored_path) or f"{kind.value}.bin"
+
+    if kind == ConfigFileKind.schema:
+        try:
+            payload = json.loads(file_bytes.decode("utf-8"))
+        except Exception as exc:
+            logger.error("Failed to parse schema JSON for %s: %s", stored_path, exc)
+            raise HTTPException(status_code=500, detail="Failed to parse schema JSON")
+        return payload
+
+    media_type = "application/octet-stream"
+    lower_name = filename.lower()
+    if lower_name.endswith(".json"):
+        media_type = "application/json"
+    elif lower_name.endswith(".txt") or lower_name.endswith(".md"):
+        media_type = "text/plain"
+    elif lower_name.endswith(".yaml") or lower_name.endswith(".yml"):
+        media_type = "text/yaml"
+
+    return Response(
+        content=file_bytes,
+        media_type=media_type,
+        headers={
+            "Content-Disposition": f'attachment; filename=\"{filename}\"'
+        },
+    )
+
+
+@app.post(
+    "/company-doc-type-configs/{config_id}/config-files/upload",
+    response_model=ConfigFileUploadResponse,
+)
+@app.post(
+    "/api/company-doc-type-configs/{config_id}/config-files/upload",
+    response_model=ConfigFileUploadResponse,
+)
+async def upload_config_file(
+    config_id: int,
+    kind: ConfigFileKind = Form(..., description="Target config file kind"),
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+):
+    config = _get_config_record(db, config_id)
+    payload = await file.read()
+    if not payload:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty")
+
+    stored_path, storage_type = _store_config_file(
+        config,
+        kind,
+        file.filename,
+        payload,
+        content_type=file.content_type,
+    )
+    db.commit()
+    db.refresh(config)
+
+    return ConfigFileUploadResponse(
+        config_id=config_id,
+        kind=kind,
+        stored_path=stored_path,
+        storage_type=storage_type,
+        filename=file.filename or f"{kind.value}.bin",
+        size=len(payload),
+    )
+
+
+@app.post(
+    "/company-doc-type-configs/{config_id}/config-files/from-onedrive",
+    response_model=ConfigFileUploadResponse,
+)
+@app.post(
+    "/api/company-doc-type-configs/{config_id}/config-files/from-onedrive",
+    response_model=ConfigFileUploadResponse,
+)
+def import_config_file_from_onedrive(
+    config_id: int,
+    payload: ConfigFileFromOneDriveRequest,
+    db: Session = Depends(get_db),
+):
+    if not _onedrive_enabled():
+        raise HTTPException(status_code=503, detail="OneDrive integration is disabled")
+
+    config = _get_config_record(db, config_id)
+    normalized = normalise_onedrive_path(payload.onedrive_path)
+    if not normalized:
+        raise HTTPException(status_code=400, detail="OneDrive path is required")
+
+    client = _get_onedrive_client_or_error()
+    try:
+        file_bytes = client.download_file_content(normalized)
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass
+
+    if not file_bytes:
+        raise HTTPException(status_code=404, detail="Failed to download file from OneDrive")
+
+    filename = os.path.basename(normalized) or f"{payload.kind.value}.bin"
+    stored_path, storage_type = _store_config_file(
+        config,
+        payload.kind,
+        filename,
+        file_bytes,
+        content_type=None,
+    )
+    db.commit()
+    db.refresh(config)
+
+    return ConfigFileUploadResponse(
+        config_id=config_id,
+        kind=payload.kind,
+        stored_path=stored_path,
+        storage_type=storage_type,
+        filename=filename,
+        size=len(file_bytes),
+    )
+
+
+@app.get(
+    "/company-doc-type-configs/{config_id}/onedrive/listing",
+    response_model=OneDriveListingResponse,
+)
+@app.get(
+    "/api/company-doc-type-configs/{config_id}/onedrive/listing",
+    response_model=OneDriveListingResponse,
+)
+def list_onedrive_entries_for_config(
+    config_id: int,
+    path: str = Query("", description="OneDrive folder path to list"),
+    limit: int = Query(200, ge=1, le=500, description="Maximum entries to return"),
+    db: Session = Depends(get_db),
+):
+    """List OneDrive entries to help admins pick config files from shared folders."""
+    if not _onedrive_enabled():
+        raise HTTPException(status_code=503, detail="OneDrive integration is disabled")
+
+    _ = _get_config_record(db, config_id)  # Ensure config exists even if not otherwise used
+    return _list_onedrive_directory(path, limit)
+
+
+@app.get(
+    "/onedrive/listing",
+    response_model=OneDriveListingResponse,
+)
+def list_onedrive_entries(
+    path: str = Query("", description="OneDrive folder path to list"),
+    limit: int = Query(200, ge=1, le=500, description="Maximum entries to return"),
+):
+    """
+    List OneDrive entries without binding to a specific config.
+
+    Used by UI flows where a CompanyDocTypeConfig has not been created yet
+    (e.g. creating a new OCR config and browsing for a master CSV path).
+    """
+    if not _onedrive_enabled():
+        raise HTTPException(status_code=503, detail="OneDrive integration is disabled")
+
+    # For master data selection we treat the logical "root" of the browser
+    # as a fixed folder inside the drive, configured via environment variable.
+    # This lets the UI always start from HYA-OCR/Master Data instead of the
+    # actual OneDrive root.
+    base_root = os.getenv("ONEDRIVE_MASTER_DATA_ROOT", "").strip()
+    normalized_input = normalise_onedrive_path(path or "")
+    effective_path = normalized_input or base_root or ""
+
+    return _list_onedrive_directory(effective_path, limit)
+
+
+@app.get(
+    "/ocr-scheduled-files/options",
+    response_model=List[ScheduledExcelOptionResponse],
+)
+def list_scheduled_excel_options(
+    company_id: int = Query(..., description="Company ID linked to the schedule"),
+    doc_type_id: int = Query(..., description="Document type ID linked to the schedule"),
+    limit: int = Query(50, ge=1, le=200, description="Maximum number of options to return"),
+    db: Session = Depends(get_db),
+):
+    """Return recent monthly Excel outputs (YYYYMM.xlsx) for a given company + doc type.
+
+    Used by the Orders UI to let users pick the correct month Excel produced by OCR schedules.
+    """
+    query = (
+        db.query(OcrScheduledFile, OcrSchedule)
+        .join(OcrSchedule, OcrSchedule.schedule_id == OcrScheduledFile.schedule_id)
+        .filter(
+            OcrSchedule.company_id == company_id,
+            OcrSchedule.doc_type_id == doc_type_id,
+            OcrScheduledFile.output_excel_path.isnot(None),
+        )
+        .order_by(
+            OcrScheduledFile.month_str.desc(),
+            OcrScheduledFile.id.desc(),
+        )
+        .limit(limit)
+    )
+
+    rows = query.all()
+    results: List[ScheduledExcelOptionResponse] = []
+    for scheduled_file, schedule in rows:
+        if not scheduled_file.output_excel_path:
+            continue
+        results.append(
+            ScheduledExcelOptionResponse(
+                schedule_id=schedule.schedule_id,
+                schedule_name=schedule.name,
+                month_str=scheduled_file.month_str,
+                output_excel_path=scheduled_file.output_excel_path,
+            )
+        )
+    return results
 
 
 # =======================
@@ -7622,7 +7275,6 @@ async def process_monthly_awb(
         order = OcrOrder(
             order_name=f"AWB {month}",
             status=OrderStatus.DRAFT,
-            primary_doc_type_id=doc_type.doc_type_id
         )
         db.add(order)
         db.commit()

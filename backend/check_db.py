@@ -55,7 +55,7 @@ def check_tables_exist(database_url: str) -> bool:
         required_tables = [
             "companies",
             "document_types",
-            "company_document_configs",
+            "company_doc_type_configs",
             "processing_jobs",
             "batch_jobs",
             "files",
@@ -63,6 +63,8 @@ def check_tables_exist(database_url: str) -> bool:
             "api_usage",
             "users",
             "departments",
+            "ocr_orders",
+            "ocr_order_items",
         ]
 
         with engine.connect() as conn:

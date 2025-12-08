@@ -89,88 +89,10 @@ def _encode_database_url(database_url: str) -> str:
 
 
 def _ensure_mapping_schema(engine):
-    """Ensure mapping-related tables and columns match ORM expectations."""
+    """Ensure mapping-related columns match ORM expectations."""
     try:
         inspector = inspect(engine)
-
-        # Ensure mapping tables exist without importing ORM (avoids duplicate declarative definitions)
         dialect = engine.dialect.name
-
-        create_mapping_templates_sql = {
-            "postgresql": """
-                CREATE TABLE IF NOT EXISTS mapping_templates (
-                    template_id SERIAL PRIMARY KEY,
-                    template_name VARCHAR(255) NOT NULL,
-                    company_id INTEGER NULL,
-                    doc_type_id INTEGER NULL,
-                    item_type VARCHAR(32) NOT NULL DEFAULT 'single_source',
-                    config JSONB NOT NULL,
-                    priority INTEGER NOT NULL DEFAULT 100,
-                    created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW(),
-                    updated_at TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW()
-                )
-            """,
-            "sqlite": """
-                CREATE TABLE IF NOT EXISTS mapping_templates (
-                    template_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    template_name TEXT NOT NULL,
-                    company_id INTEGER NULL,
-                    doc_type_id INTEGER NULL,
-                    item_type TEXT NOT NULL DEFAULT 'single_source',
-                    config TEXT NOT NULL,
-                    priority INTEGER NOT NULL DEFAULT 100,
-                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TEXT DEFAULT CURRENT_TIMESTAMP
-                )
-            """,
-        }
-
-        create_mapping_defaults_sql = {
-            "postgresql": """
-                CREATE TABLE IF NOT EXISTS company_doc_mapping_defaults (
-                    default_id SERIAL PRIMARY KEY,
-                    company_id INTEGER NOT NULL,
-                    doc_type_id INTEGER NOT NULL,
-                    item_type VARCHAR(32) NOT NULL DEFAULT 'single_source',
-                    template_id INTEGER NULL REFERENCES mapping_templates(template_id) ON DELETE SET NULL,
-                    config_override JSONB NULL,
-                    created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW(),
-                    updated_at TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW(),
-                    UNIQUE (company_id, doc_type_id, item_type)
-                )
-            """,
-            "sqlite": """
-                CREATE TABLE IF NOT EXISTS company_doc_mapping_defaults (
-                    default_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    company_id INTEGER NOT NULL,
-                    doc_type_id INTEGER NOT NULL,
-                    item_type TEXT NOT NULL DEFAULT 'single_source',
-                    template_id INTEGER NULL,
-                    config_override TEXT NULL,
-                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE (company_id, doc_type_id, item_type)
-                )
-            """,
-        }
-
-        if not inspector.has_table("mapping_templates"):
-            ddl = create_mapping_templates_sql.get(dialect)
-            if ddl:
-                with engine.begin() as connection:
-                    connection.execute(text(ddl))
-                logger.info("Created mapping_templates table")
-            else:
-                logger.warning("Unsupported dialect '%s' for creating mapping_templates", dialect)
-
-        if not inspector.has_table("company_doc_mapping_defaults"):
-            ddl = create_mapping_defaults_sql.get(dialect)
-            if ddl:
-                with engine.begin() as connection:
-                    connection.execute(text(ddl))
-                logger.info("Created company_doc_mapping_defaults table")
-            else:
-                logger.warning("Unsupported dialect '%s' for creating mapping defaults", dialect)
 
         # Ensure new columns on ocr_order_items
         if inspector.has_table("ocr_order_items"):
@@ -187,13 +109,6 @@ def _ensure_mapping_schema(engine):
                     statements.append("ALTER TABLE ocr_order_items ADD COLUMN item_type VARCHAR(32)")
                     statements.append("UPDATE ocr_order_items SET item_type = 'single_source' WHERE item_type IS NULL")
 
-            if "applied_template_id" not in existing_columns:
-                statements.append("ALTER TABLE ocr_order_items ADD COLUMN applied_template_id INTEGER NULL")
-                if dialect == "postgresql":
-                    statements.append(
-                        "ALTER TABLE ocr_order_items ADD CONSTRAINT fk_order_items_template FOREIGN KEY (applied_template_id) REFERENCES mapping_templates(template_id) ON DELETE SET NULL"
-                    )
-
             if "mapping_config" not in existing_columns:
                 if dialect == "postgresql":
                     statements.append("ALTER TABLE ocr_order_items ADD COLUMN mapping_config JSONB NULL")
@@ -205,24 +120,6 @@ def _ensure_mapping_schema(engine):
                     for stmt in statements:
                         connection.execute(text(stmt))
                 logger.info("Ensured ocr_order_items mapping columns exist.")
-
-        if inspector.has_table("company_doc_mapping_defaults"):
-            default_columns = {col["name"] for col in inspector.get_columns("company_doc_mapping_defaults")}
-            statements = []
-
-            if "item_type" not in default_columns:
-                if dialect == "postgresql":
-                    statements.append("ALTER TABLE company_doc_mapping_defaults ADD COLUMN item_type VARCHAR(32) DEFAULT 'single_source'")
-                    statements.append("ALTER TABLE company_doc_mapping_defaults ALTER COLUMN item_type SET NOT NULL")
-                else:
-                    statements.append("ALTER TABLE company_doc_mapping_defaults ADD COLUMN item_type VARCHAR(32)")
-                    statements.append("UPDATE company_doc_mapping_defaults SET item_type = 'single_source' WHERE item_type IS NULL")
-
-            if statements:
-                with engine.begin() as connection:
-                    for stmt in statements:
-                        connection.execute(text(stmt))
-                logger.info("Ensured company_doc_mapping_defaults columns exist.")
 
         # Ensure api_usage table supports both legacy jobs and new order items
         if inspector.has_table("api_usage"):
