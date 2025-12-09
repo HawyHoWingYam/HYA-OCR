@@ -748,8 +748,11 @@ async def extract_text_from_pdf(
     if pdf_page_count == 0:
         error_time = time.time() - start_time
         status_updates["processing_time_seconds"] = error_time
-        status_updates["status"] = "invalid_pdf"
-        status_updates["error_message"] = f"PDF has 0 pages - cannot process"
+        # Use generic 'error' status so it passes DB constraints;
+        # keep a more specific error_code for diagnostics.
+        status_updates["status"] = "error"
+        status_updates["error_code"] = "invalid_pdf"
+        status_updates["error_message"] = "PDF has 0 pages - cannot process"
         status_updates["trace_id"] = trace_id
 
         logger.error(
@@ -924,11 +927,15 @@ async def extract_text_from_pdf(
                 "status_updates": status_updates,
             }
         except Exception as f_e:
+            # Fallback also failed – treat this as a generic API error so that
+            # it complies with the api_usage.status CHECK constraint
+            # (allowed values: success, error, success_with_fallback, timeout, rate_limited).
             fallback_error_time = time.time() - fallback_start
             total_time = time.time() - start_time
             status_updates["fallback_time_seconds"] = fallback_error_time
             status_updates["total_processing_time_seconds"] = total_time
-            status_updates["status"] = "failed"
+            status_updates["status"] = "error"
+            status_updates["error_code"] = "fallback_failed"
             status_updates["fallback_error"] = str(f_e)
 
             logger.error("PDF processing fallback also failed after %.2fs: %s", total_time, f_e)

@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback } from 'react';
+import { useCallback, useMemo, useState } from 'react';
 
 interface ColumnAliasEditorProps {
   value: Record<string, string>;
@@ -17,41 +17,60 @@ export default function ColumnAliasEditor({
   availableMasterColumns,
   disabled = false,
 }: ColumnAliasEditorProps) {
+  const [newOcrColumn, setNewOcrColumn] = useState('');
+  const [newMasterColumn, setNewMasterColumn] = useState('');
+
+  const masterOptions = useMemo(() => {
+    const set = new Set<string>();
+    availableMasterColumns.forEach(col => {
+      if (col) set.add(col);
+    });
+    Object.values(value).forEach(col => {
+      if (col) set.add(col);
+    });
+    return Array.from(set);
+  }, [availableMasterColumns, value]);
+
   const handleAddRow = useCallback(() => {
-    const newAliases = { ...value, '': '' };
+    const ocr = newOcrColumn.trim();
+    const master = newMasterColumn.trim();
+    if (!ocr || !master) {
+      return;
+    }
+    const newAliases = { ...value, [ocr]: master };
     onChange(newAliases);
-  }, [value, onChange]);
+    setNewOcrColumn('');
+    setNewMasterColumn('');
+  }, [newOcrColumn, newMasterColumn, value, onChange]);
 
   const handleUpdateRow = useCallback((oldOcr: string, newOcr: string, newMaster: string) => {
-    const newAliases = { ...value };
-    if (oldOcr !== newOcr) {
-      delete newAliases[oldOcr];
+    const next = { ...value };
+    if (oldOcr && oldOcr !== newOcr) {
+      delete next[oldOcr];
     }
-    if (newOcr) {
-      newAliases[newOcr] = newMaster;
+    const trimmedOcr = newOcr.trim();
+    if (trimmedOcr) {
+      next[trimmedOcr] = newMaster.trim();
     }
-    onChange(newAliases);
+    onChange(next);
   }, [value, onChange]);
 
   const handleRemoveRow = useCallback((ocrColumn: string) => {
-    const newAliases = { ...value };
-    delete newAliases[ocrColumn];
-    onChange(newAliases);
+    const next = { ...value };
+    delete next[ocrColumn];
+    onChange(next);
   }, [value, onChange]);
+
+  const availableOcrForNew = useMemo(
+    () => availableOcrColumns.filter(col => !(col in value)),
+    [availableOcrColumns, value],
+  );
+
+  const canAdd = !!newOcrColumn && !!newMasterColumn && !disabled;
 
   return (
     <div className="space-y-2">
-      <div className="flex items-center justify-between">
-        <label className="text-xs font-semibold text-gray-600">Column Aliases</label>
-        <button
-          type="button"
-          onClick={handleAddRow}
-          disabled={disabled}
-          className="text-xs text-blue-600 hover:text-blue-800"
-        >
-          + Add Alias
-        </button>
-      </div>
+      <label className="text-xs font-semibold text-gray-600">Column Aliases</label>
       <p className="text-xs text-gray-500">
         Map OCR output column names to master CSV column names for joining
       </p>
@@ -69,7 +88,7 @@ export default function ColumnAliasEditor({
             </thead>
             <tbody className="divide-y divide-gray-200">
               {Object.entries(value).map(([ocrCol, masterCol]) => (
-                <tr key={ocrCol || 'new'}>
+                <tr key={ocrCol}>
                   <td className="px-3 py-2">
                     <select
                       value={ocrCol}
@@ -88,11 +107,11 @@ export default function ColumnAliasEditor({
                     <select
                       value={masterCol}
                       onChange={(e) => handleUpdateRow(ocrCol, ocrCol, e.target.value)}
-                      disabled={disabled}
+                      disabled={disabled || masterOptions.length === 0}
                       className="w-full border border-gray-300 rounded px-2 py-1 text-sm"
                     >
                       <option value="">Select master column...</option>
-                      {availableMasterColumns.map(col => (
+                      {masterOptions.map(col => (
                         <option key={col} value={col}>{col}</option>
                       ))}
                     </select>
@@ -117,6 +136,40 @@ export default function ColumnAliasEditor({
           No column aliases configured. Add aliases if OCR column names differ from master CSV.
         </div>
       )}
+
+      <div className="flex items-center gap-2">
+        <select
+          value={newOcrColumn}
+          onChange={(e) => setNewOcrColumn(e.target.value)}
+          disabled={disabled || availableOcrForNew.length === 0}
+          className="flex-1 border border-gray-300 rounded px-2 py-1 text-sm"
+        >
+          <option value="">Select OCR column...</option>
+          {availableOcrForNew.map(col => (
+            <option key={col} value={col}>{col}</option>
+          ))}
+        </select>
+        <span className="text-gray-400">→</span>
+        <select
+          value={newMasterColumn}
+          onChange={(e) => setNewMasterColumn(e.target.value)}
+          disabled={disabled || masterOptions.length === 0}
+          className="flex-1 border border-gray-300 rounded px-2 py-1 text-sm"
+        >
+          <option value="">Select master column...</option>
+          {masterOptions.map(col => (
+            <option key={col} value={col}>{col}</option>
+          ))}
+        </select>
+        <button
+          type="button"
+          onClick={handleAddRow}
+          disabled={!canAdd}
+          className="text-xs text-blue-600 hover:text-blue-800 disabled:opacity-50 disabled:cursor-not-allowed"
+        >
+          + Add Alias
+        </button>
+      </div>
     </div>
   );
 }

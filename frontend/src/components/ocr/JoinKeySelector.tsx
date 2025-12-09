@@ -23,6 +23,8 @@ export default function JoinKeySelector({
   disabled = false,
   helpText,
 }: JoinKeySelectorProps) {
+  const hasMasterColumns = availableMasterColumns && availableMasterColumns.length > 0;
+
   const handleAddKey = useCallback((key: string) => {
     if (key && !value.includes(key)) {
       onChange([...value, key]);
@@ -30,7 +32,7 @@ export default function JoinKeySelector({
   }, [value, onChange]);
 
   const handleRemoveKey = useCallback((key: string) => {
-    onChange(value.filter(k => k !== key));
+      onChange(value.filter(k => k !== key));
   }, [value, onChange]);
 
   const getMasterColumnName = useCallback((ocrKey: string) => {
@@ -50,7 +52,7 @@ export default function JoinKeySelector({
       <div className="flex flex-wrap gap-2">
         {value.map((key) => {
           const masterCol = getMasterColumnName(key);
-          const inMaster = availableMasterColumns.includes(masterCol);
+          const inMaster = !hasMasterColumns || availableMasterColumns.includes(masterCol);
           return (
             <div
               key={key}
@@ -62,8 +64,13 @@ export default function JoinKeySelector({
               {key !== masterCol && (
                 <span className="text-xs opacity-75">→ {masterCol}</span>
               )}
-              {!inMaster && (
-                <span className="text-xs" title="Column not found in master CSV">⚠️</span>
+              {hasMasterColumns && !inMaster && (
+                <span
+                  className="text-xs"
+                  title="Column not found in master CSV preview"
+                >
+                  ⚠️
+                </span>
               )}
               <button
                 type="button"

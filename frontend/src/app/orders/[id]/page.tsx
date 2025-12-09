@@ -1137,13 +1137,32 @@ export default function OrderDetailsPage() {
   };
 
   const submitOrder = async () => {
+    if (!order) {
+      setError('Order not loaded');
+      return;
+    }
+
     try {
-      const response = await fetch(`/api/orders/${orderId}/submit`, {
+      // Choose appropriate backend endpoint based on current status:
+      // - DRAFT / FAILED: initial or retry submission via /submit
+      // - COMPLETED: restart full OCR + mapping via /restart-ocr
+      let endpoint: string | null = null;
+
+      if (order.status === 'DRAFT' || order.status === 'FAILED') {
+        endpoint = `/api/orders/${orderId}/submit`;
+      } else if (order.status === 'COMPLETED') {
+        endpoint = `/api/orders/${orderId}/restart-ocr`;
+      } else {
+        setError(`Order in ${order.status} status cannot start OCR & Mapping`);
+        return;
+      }
+
+      const response = await fetch(endpoint, {
         method: 'POST',
       });
 
       if (!response.ok) {
-        const errorData = await response.json();
+        const errorData = await response.json().catch(() => ({}));
         throw new Error(errorData.detail || 'Failed to submit order');
       }
 
@@ -1350,10 +1369,33 @@ export default function OrderDetailsPage() {
   const canEdit = order.status === 'DRAFT';
   const canModifyFiles = order.status !== 'PROCESSING';
   const canSubmit = order.status === 'DRAFT' && order.total_items > 0;
-  const canStartOcrOnly = !hasAnyMappingConfig && order.total_items > 0;
-  const canStartFullProcess = hasAnyMappingConfig && order.total_items > 0;
-  const canStartMapping = hasAnyMappingConfig && order.items.length > 0;
-  const canConfigureMapping = order.status === 'DRAFT' || order.status === 'OCR_COMPLETED' || order.status === 'COMPLETED' || order.status === 'MAPPING';
+  // OCR-only / OCR+Mapping follow backend rules:
+  // - Initial submit: DRAFT
+  // - Retry: FAILED
+  // - Completed orders: allow full restart via /restart-ocr
+  const canStartOcrOnly =
+    !hasAnyMappingConfig &&
+    order.total_items > 0 &&
+    (order.status === 'DRAFT' || order.status === 'FAILED');
+  const canStartFullProcess =
+    hasAnyMappingConfig &&
+    order.total_items > 0 &&
+    (order.status === 'DRAFT' ||
+      order.status === 'FAILED' ||
+      order.status === 'COMPLETED');
+  // Mapping-only is allowed when OCR is done or order previously failed
+  const canStartMapping =
+    hasAnyMappingConfig &&
+    order.items.length > 0 &&
+    (order.status === 'OCR_COMPLETED' ||
+      order.status === 'MAPPING' ||
+      order.status === 'COMPLETED' ||
+      order.status === 'FAILED');
+  const canConfigureMapping =
+    order.status === 'DRAFT' ||
+    order.status === 'OCR_COMPLETED' ||
+    order.status === 'MAPPING' ||
+    order.status === 'FAILED';
 
   return (
     <div className="container mx-auto px-4 py-8">

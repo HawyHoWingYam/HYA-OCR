@@ -556,7 +556,8 @@ class OrderProcessor:
 
         onedrive_cfg = (self.app_config or {}).get("onedrive", {}) if isinstance(self.app_config, dict) else {}
 
-        client_id = os.getenv("ONEDRIVE_CLIENT_ID") or onedrive_cfg.get("client_id")
+        # Prefer ONEDRIVE_APPLICATION_ID over deprecated ONEDRIVE_CLIENT_ID
+        client_id = os.getenv("ONEDRIVE_APPLICATION_ID") or os.getenv("ONEDRIVE_CLIENT_ID") or onedrive_cfg.get("client_id")
         client_secret = os.getenv("ONEDRIVE_CLIENT_SECRET") or onedrive_cfg.get("client_secret")
         tenant_id = os.getenv("ONEDRIVE_TENANT_ID") or onedrive_cfg.get("tenant_id")
         target_user = os.getenv("ONEDRIVE_TARGET_USER_UPN") or onedrive_cfg.get("target_user_upn")
@@ -2738,16 +2739,35 @@ class OrderProcessor:
 
 
     async def process_order_mapping_only(self, order_id: int):
-        """Process mapping for an order using per-item configurations."""
+        """Process mapping for an order using per-item configurations.
+
+        Note:
+        - Aligns accepted order statuses with the FastAPI endpoints
+          (`/orders/{order_id}/process-mapping` and `/orders/{order_id}/restart-mapping`),
+          i.e. allow mapping when the order is in OCR_COMPLETED, MAPPING,
+          COMPLETED or FAILED status.
+        - This enables re-mapping for already completed/failed orders when
+          they still have OCR results available.
+        """
         with Session(engine) as db:
             order = db.query(OcrOrder).filter(OcrOrder.order_id == order_id).first()
             if not order:
                 logger.error(f"Order {order_id} not found")
                 return
 
-            if order.status not in {OrderStatus.OCR_COMPLETED, OrderStatus.MAPPING}:
+            allowed_statuses = {
+                OrderStatus.OCR_COMPLETED,
+                OrderStatus.MAPPING,
+                OrderStatus.COMPLETED,
+                OrderStatus.FAILED,
+            }
+
+            if order.status not in allowed_statuses:
                 logger.warning(
-                    f"Order {order_id} must be in OCR_COMPLETED or MAPPING status (current: {order.status})"
+                    "Order %s must be in OCR_COMPLETED, MAPPING, COMPLETED or FAILED "
+                    "status for mapping-only processing (current: %s)",
+                    order_id,
+                    order.status,
                 )
                 return
 

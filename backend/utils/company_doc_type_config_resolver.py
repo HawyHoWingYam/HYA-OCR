@@ -135,6 +135,15 @@ class CompanyDocTypeConfigResolver:
         mapping_item_type = MappingItemType(item_type.value)
         base_payload: Dict[str, Any] = {}
 
+        # Defensive copy of current_config so we can safely normalise it before merge.
+        # In particular, treat an explicit empty list for external_join_keys as "no override"
+        # so that company-level defaults (e.g. ["service_number"]) are not accidentally
+        # disabled when the item UI sends [].
+        override_payload: Dict[str, Any] = dict(current_config or {})
+        ek = override_payload.get("external_join_keys")
+        if isinstance(ek, list) and not [k for k in ek if str(k).strip()]:
+            override_payload.pop("external_join_keys", None)
+
         if mapping_item_type == MappingItemType.SINGLE_SOURCE:
             # Start from stored single_source_config, then ensure master_csv_path is present
             base_payload = dict(row.single_source_config or {})
@@ -165,7 +174,7 @@ class CompanyDocTypeConfigResolver:
         else:  # pragma: no cover - guarded by enum
             return None
 
-        merged_payload = merge_mapping_configs(base_payload, current_config or {})
+        merged_payload = merge_mapping_configs(base_payload, override_payload)
 
         # normalise_mapping_config performs strict validation (master_csv_path presence,
         # join_normalize/output_meta structure, etc.) and returns a clean dict.

@@ -3573,8 +3573,11 @@ def update_order_item_mapping_config(
         if not item:
             raise HTTPException(status_code=404, detail="Order item not found")
 
-        if order.status not in [OrderStatus.DRAFT, OrderStatus.MAPPING, OrderStatus.OCR_COMPLETED]:
-            raise HTTPException(status_code=400, detail="Mapping configuration can only be updated during DRAFT, OCR_COMPLETED or MAPPING states")
+        if order.status not in [OrderStatus.DRAFT, OrderStatus.MAPPING, OrderStatus.OCR_COMPLETED, OrderStatus.FAILED]:
+            raise HTTPException(
+                status_code=400,
+                detail="Mapping configuration can only be updated during DRAFT, OCR_COMPLETED, MAPPING or FAILED states",
+            )
 
         requested_type = (request.item_type or item.item_type.value).lower()
         try:
@@ -3646,14 +3649,40 @@ def update_order_item_mapping_config(
 
 @app.post("/orders/{order_id}/submit", response_model=dict)
 def submit_order(order_id: int, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
-    """Submit order for processing"""
+    """Submit order for OCR + mapping processing.
+
+    Normal flow: DRAFT → PROCESSING → (OCR_COMPLETED/MAPPING/COMPLETED/FAILED).
+    When an order is in FAILED status (e.g. due to transient errors), allow a safe retry by
+    resetting item statuses back to PENDING before re‑submitting.
+    """
     try:
         order = db.query(OcrOrder).filter(OcrOrder.order_id == order_id).first()
         if not order:
             raise HTTPException(status_code=404, detail="Order not found")
 
-        if order.status != OrderStatus.DRAFT:
-            raise HTTPException(status_code=400, detail="Can only submit orders in DRAFT status")
+        # Allow new submissions from DRAFT, and retries from FAILED
+        if order.status not in [OrderStatus.DRAFT, OrderStatus.FAILED]:
+            raise HTTPException(
+                status_code=400,
+                detail="Can only submit orders in DRAFT or FAILED status",
+            )
+
+        # On retry from FAILED, reset items to PENDING so they will be reprocessed
+        if order.status == OrderStatus.FAILED:
+            items = (
+                db.query(OcrOrderItem)
+                .filter(OcrOrderItem.order_id == order_id)
+                .all()
+            )
+            for item in items:
+                item.status = OrderItemStatus.PENDING
+                item.processing_started_at = None
+                item.processing_completed_at = None
+                item.processing_time_seconds = None
+                item.error_message = None
+            order.completed_items = 0
+            order.failed_items = 0
+            order.error_message = None
 
         if order.total_items == 0:
             raise HTTPException(status_code=400, detail="Cannot submit order with no items")
@@ -3692,14 +3721,36 @@ def submit_order(order_id: int, background_tasks: BackgroundTasks, db: Session =
 
 @app.post("/orders/{order_id}/process-ocr-only", response_model=dict)
 def process_order_ocr_only(order_id: int, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
-    """Submit order for OCR-only processing (no mapping)"""
+    """Submit order for OCR-only processing (no mapping).
+
+    Supports both initial submission from DRAFT and retries from FAILED.
+    """
     try:
         order = db.query(OcrOrder).filter(OcrOrder.order_id == order_id).first()
         if not order:
             raise HTTPException(status_code=404, detail="Order not found")
 
-        if order.status != OrderStatus.DRAFT:
-            raise HTTPException(status_code=400, detail="Can only process orders in DRAFT status")
+        if order.status not in [OrderStatus.DRAFT, OrderStatus.FAILED]:
+            raise HTTPException(
+                status_code=400,
+                detail="Can only process orders in DRAFT or FAILED status",
+            )
+
+        if order.status == OrderStatus.FAILED:
+            items = (
+                db.query(OcrOrderItem)
+                .filter(OcrOrderItem.order_id == order_id)
+                .all()
+            )
+            for item in items:
+                item.status = OrderItemStatus.PENDING
+                item.processing_started_at = None
+                item.processing_completed_at = None
+                item.processing_time_seconds = None
+                item.error_message = None
+            order.completed_items = 0
+            order.failed_items = 0
+            order.error_message = None
 
         if order.total_items == 0:
             raise HTTPException(status_code=400, detail="Cannot process order with no items")
