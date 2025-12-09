@@ -103,18 +103,29 @@ export default function ColumnAliasEditor({
                     </select>
                   </td>
                   <td className="px-3 py-2 text-center text-gray-400">→</td>
-                  <td className="px-3 py-2">
-                    <select
-                      value={masterCol}
-                      onChange={(e) => handleUpdateRow(ocrCol, ocrCol, e.target.value)}
-                      disabled={disabled || masterOptions.length === 0}
-                      className="w-full border border-gray-300 rounded px-2 py-1 text-sm"
-                    >
-                      <option value="">Select master column...</option>
-                      {masterOptions.map(col => (
-                        <option key={col} value={col}>{col}</option>
-                      ))}
-                    </select>
+              <td className="px-3 py-2">
+                {masterOptions.length > 0 ? (
+                  <select
+                    value={masterCol}
+                    onChange={(e) => handleUpdateRow(ocrCol, ocrCol, e.target.value)}
+                    disabled={disabled}
+                    className="w-full border border-gray-300 rounded px-2 py-1 text-sm"
+                  >
+                    <option value="">Select master column...</option>
+                    {masterOptions.map(col => (
+                      <option key={col} value={col}>{col}</option>
+                    ))}
+                  </select>
+                ) : (
+                  <input
+                    type="text"
+                    value={masterCol}
+                    onChange={(e) => handleUpdateRow(ocrCol, ocrCol, e.target.value)}
+                    disabled={disabled}
+                    className="w-full border border-gray-300 rounded px-2 py-1 text-sm"
+                    placeholder="Enter master column name"
+                  />
+                )}
                   </td>
                   <td className="px-3 py-2">
                     <button
@@ -150,17 +161,28 @@ export default function ColumnAliasEditor({
           ))}
         </select>
         <span className="text-gray-400">→</span>
-        <select
-          value={newMasterColumn}
-          onChange={(e) => setNewMasterColumn(e.target.value)}
-          disabled={disabled || masterOptions.length === 0}
-          className="flex-1 border border-gray-300 rounded px-2 py-1 text-sm"
-        >
-          <option value="">Select master column...</option>
-          {masterOptions.map(col => (
-            <option key={col} value={col}>{col}</option>
-          ))}
-        </select>
+        {masterOptions.length > 0 ? (
+          <select
+            value={newMasterColumn}
+            onChange={(e) => setNewMasterColumn(e.target.value)}
+            disabled={disabled}
+            className="flex-1 border border-gray-300 rounded px-2 py-1 text-sm"
+          >
+            <option value="">Select master column...</option>
+            {masterOptions.map(col => (
+              <option key={col} value={col}>{col}</option>
+            ))}
+          </select>
+        ) : (
+          <input
+            type="text"
+            value={newMasterColumn}
+            onChange={(e) => setNewMasterColumn(e.target.value)}
+            disabled={disabled}
+            className="flex-1 border border-gray-300 rounded px-2 py-1 text-sm"
+            placeholder="Master column (free text)"
+          />
+        )}
         <button
           type="button"
           onClick={handleAddRow}

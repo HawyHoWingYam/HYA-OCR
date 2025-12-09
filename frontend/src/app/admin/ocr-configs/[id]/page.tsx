@@ -909,9 +909,9 @@ function EditOcrConfigPageContent() {
               <div className="space-y-4 bg-gray-50 p-4 rounded">
                 <h3 className="font-medium text-gray-700">Single Source Mapping</h3>
 
-                <JoinKeySelector
-                  label="External Join Keys"
-                  value={form.single_external_join_keys.split(',').filter(Boolean)}
+                  <JoinKeySelector
+                    label="External Join Keys"
+                    value={form.single_external_join_keys.split(',').filter(Boolean)}
                   onChange={(keys) => {
                     setForm(prev => ({
                       ...prev,
@@ -1020,7 +1020,7 @@ function EditOcrConfigPageContent() {
                         multi_step1_join_keys: keys.join(',')
                       }));
                     }}
-                    availableOcrColumns={[]}
+                    availableOcrColumns={schemaFieldNames}
                     availableMasterColumns={[]}
                     helpText="Join keys for OCR to month Excel mapping"
                   />
@@ -1040,7 +1040,7 @@ function EditOcrConfigPageContent() {
                           .join(',')
                       }));
                     }}
-                    availableOcrColumns={[]}
+                    availableOcrColumns={schemaFieldNames}
                     availableMasterColumns={[]}
                   />
                 </div>
@@ -1057,7 +1057,7 @@ function EditOcrConfigPageContent() {
                         multi_step2_join_keys: keys.join(',')
                       }));
                     }}
-                    availableOcrColumns={[]}
+                    availableOcrColumns={schemaFieldNames}
                     availableMasterColumns={csvPreview?.headers || []}
                     helpText="Join keys for month Excel to master CSV mapping"
                   />
@@ -1077,7 +1077,7 @@ function EditOcrConfigPageContent() {
                           .join(',')
                       }));
                     }}
-                    availableOcrColumns={[]}
+                    availableOcrColumns={schemaFieldNames}
                     availableMasterColumns={csvPreview?.headers || []}
                   />
 
